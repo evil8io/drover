@@ -415,3 +415,53 @@ func TestMergeSelector(t *testing.T) {
 		})
 	}
 }
+
+func TestFilterJSONAccept(t *testing.T) {
+	t.Parallel()
+	const kubectlTable = "application/json;as=Table;v=v1;g=meta.k8s.io," +
+		"application/json;as=Table;v=v1beta1;g=meta.k8s.io,application/json"
+	tests := []struct {
+		name   string
+		accept string
+		want   string
+	}{
+		{
+			name:   "empty",
+			accept: "",
+			want:   jsonContentType,
+		},
+		{
+			name:   "any type",
+			accept: "*/*",
+			want:   jsonContentType,
+		},
+		{
+			name:   "protobuf only",
+			accept: protobufContentType,
+			want:   jsonContentType,
+		},
+		{
+			name:   "protobuf and json",
+			accept: protobufContentType + ",application/json",
+			want:   jsonContentType,
+		},
+		{
+			name:   "cbor and json",
+			accept: "application/cbor-seq,application/json",
+			want:   jsonContentType,
+		},
+		{
+			name:   "kubectl table",
+			accept: kubectlTable,
+			want:   kubectlTable,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := filterJSONAccept(test.accept); got != test.want {
+				t.Errorf("filterJSONAccept(%q) = %q, want %q", test.accept, got, test.want)
+			}
+		})
+	}
+}
