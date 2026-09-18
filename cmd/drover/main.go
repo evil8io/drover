@@ -11,6 +11,7 @@ var version = "dev"
 var subcommands = map[string]func(args []string) int{
 	"namespace-filter": runNamespaceFilter,
 	"rotate-token":     runRotateToken,
+	"project-sync":     runProjectSync,
 }
 
 func main() {
@@ -47,4 +48,5 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "Subcommands:")
 	fmt.Fprintln(os.Stderr, "  namespace-filter   Filter the namespace list of a Rancher project member.")
 	fmt.Fprintln(os.Stderr, "  rotate-token       Renew the Rancher API token in a Secret.")
+	fmt.Fprintln(os.Stderr, "  project-sync       Copy labels and annotations of a Rancher project to its namespaces.")
 }

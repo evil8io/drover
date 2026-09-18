@@ -123,24 +123,10 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	}
 	cfg.logLevel = level
 
-	if upstream == "" {
-		return config{}, errors.New("-upstream is required")
-	}
-	target, err := url.Parse(upstream)
+	target, err := parseRancherURL("-upstream", upstream)
 	if err != nil {
-		return config{}, fmt.Errorf("-upstream: %w", err)
+		return config{}, err
 	}
-	if target.Scheme != "http" && target.Scheme != "https" {
-		return config{}, fmt.Errorf("-upstream scheme %q is not http or https", target.Scheme)
-	}
-	if target.Host == "" {
-		return config{}, errors.New("-upstream has no host")
-	}
-	if target.Path != "" && target.Path != "/" {
-		return config{}, fmt.Errorf("-upstream path %q is not empty", target.Path)
-	}
-	target.Path = ""
-	target.RawPath = ""
 	cfg.upstream = target
 
 	if cfg.tokenFile == "" {
@@ -156,18 +142,4 @@ func tokenFileReady(path string) bool {
 		return false
 	}
 	return len(bytes.TrimSpace(data)) > 0
-}
-
-func parseLevel(name string) (slog.Level, error) {
-	switch name {
-	case "debug":
-		return slog.LevelDebug, nil
-	case "info":
-		return slog.LevelInfo, nil
-	case "warn":
-		return slog.LevelWarn, nil
-	case "error":
-		return slog.LevelError, nil
-	}
-	return 0, fmt.Errorf("-log-level %q is not debug, info, warn or error", name)
 }

@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/evil8io/drover/internal/rancherclient"
 )
 
 const (
@@ -54,7 +56,7 @@ func (s *service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 	}
 	s.logger.DebugContext(req.Context(), "allowed namespaces", "cluster", cluster, "names", names)
 
-	token, err := readToken(s.tokenFile)
+	token, err := rancherclient.ReadToken(s.tokenFile)
 	if err != nil {
 		return s.statusError(req, start, result, err), nil
 	}
@@ -127,7 +129,7 @@ func (s *service) logList(ctx context.Context, start time.Time, result listResul
 		switch {
 		case errors.Is(result.err, context.Canceled):
 			level = slog.LevelDebug
-		case errors.Is(result.err, errTokenUnavailable):
+		case errors.Is(result.err, rancherclient.ErrTokenUnavailable):
 			level = slog.LevelWarn
 		default:
 			level = slog.LevelError
