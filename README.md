@@ -7,6 +7,7 @@ drover is a set of tenancy extensions for Rancher. It is one binary, with one su
 | Subcommand | Meaning |
 | --- | --- |
 | `namespace-filter` | A reverse proxy that answers the namespace list of a Rancher project member. |
+| `rotate-token` | A command that renews the API token of the Rancher service user in a Secret. |
 
 ## namespace-filter
 
@@ -76,6 +77,53 @@ A review log line has these fields: `cluster`, `outcome` (`passthrough`, `native
 The service never logs a token, a cookie, a header value, or a request body. It logs a namespace name at the `debug` level only.
 
 The service writes a `warn` line when the privileged list request gets a 403 error. The cause is a `cluster-owner` binding that the service user does not have.
+
+## rotate-token
+
+A command that renews the API token of the Rancher service user in a Kubernetes Secret.
+
+The command runs once: it reads the token from the Secret, and it asks Rancher for the expiry. A token that lasts longer than `--renew-before` is valid, and the run ends with no change. For a new token the command logs in as the service user, and it derives a token from that session. The login is a first step only, because Rancher ignores the TTL of a login token. Rancher also reduces a TTL above its own maximum without an error, so a different TTL in the answer gives a warning. Last, the command patches the Secret, deletes the tokens with the same description except the newest `--keep`, and ends the session with a logout.
+
+A CronJob is the normal caller, because most runs find a valid token and exit 0.
+
+### Configuration
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--rancher-url` | (required) | URL of Rancher. Use `http://` or `https://`. The path must be empty or `/`. |
+| `--rancher-ca-file` | | PEM bundle that verifies an `https` Rancher URL. |
+| `--credentials-dir` | (required) | Directory with the files `username` and `password` of the service user. |
+| `--token-secret` | (required) | `namespace/name` of the Secret with the API token. |
+| `--token-key` | `token` | Key of the token inside the Secret. |
+| `--ttl` | `48h` | Lifetime of a new token. Rancher reduces a value above `auth-token-max-ttl-minutes`. |
+| `--renew-before` | `24h` | Remaining lifetime that starts a rotation. The value must be shorter than `--ttl`. |
+| `--keep` | `2` | Number of tokens with the description to keep. The new token counts. |
+| `--description` | `drover rotate-token` | Description of the tokens of this command. It also selects the tokens to delete. |
+| `--kube-url` | (in-cluster) | Kubernetes API URL. The default comes from `KUBERNETES_SERVICE_HOST` and `KUBERNETES_SERVICE_PORT`. |
+| `--kube-service-account-dir` | `/var/run/secrets/kubernetes.io/serviceaccount` | Directory with the ServiceAccount token and `ca.crt`. |
+| `--log-level` | `info` | One of `debug`, `info`, `warn`, or `error`. |
+
+The exit code is 0 after a valid token and after a rotation, 1 after a failure, and 2 after a flag error.
+
+The command never deletes a token with another description, so a kubeconfig token of the service user stays.
+
+### Permissions
+
+The pod needs `get` and `patch` on the one token Secret:
+
+```yaml
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [drover-token]
+    verbs: [get, patch]
+```
+
+The Secret must exist before the first run. The command reads the ServiceAccount token for every request, because the kubelet replaces the file.
+
+### Logging
+
+The command writes JSON logs to stderr, one line per step. Each line has a `step` field and an `outcome` field. The command never logs a token, a token key, or the password.
 
 ## Development
 
