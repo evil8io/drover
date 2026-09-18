@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.0](https://github.com/evil8io/drover/compare/v0.5.0...v0.6.0) (2026-09-18)
+
+
+### Features
+
+* add telemetry and instrument the namespace filter ([#22](https://github.com/evil8io/drover/issues/22)) ([09b8e49](https://github.com/evil8io/drover/commit/09b8e494d66091ae7165b1797181732a028e8687))
+* add telemetry to project-sync and rotate-token ([#24](https://github.com/evil8io/drover/issues/24)) ([2b6b4cd](https://github.com/evil8io/drover/commit/2b6b4cd7ab188c87d5b0edbbdfa992c03f9112ba))
+
 ## [0.5.0](https://github.com/evil8io/drover/compare/v0.4.1...v0.5.0) (2026-09-18)
 
 
