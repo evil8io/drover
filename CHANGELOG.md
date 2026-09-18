@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/evil8io/drover/compare/v0.3.1...v0.3.2) (2026-09-18)
+
+
+### Bug Fixes
+
+* grant a namespace list review that names a namespace ([#14](https://github.com/evil8io/drover/issues/14)) ([defcdd2](https://github.com/evil8io/drover/commit/defcdd24a170f936a407c0a3fe11df584be08066))
+
 ## [0.3.1](https://github.com/evil8io/drover/compare/v0.3.0...v0.3.1) (2026-09-18)
 
 
