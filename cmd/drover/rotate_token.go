@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/evil8io/drover/internal/rotate"
+	"github.com/evil8io/drover/internal/telemetry"
 )
 
 const (
@@ -51,7 +52,7 @@ func runRotateToken(args []string) int {
 		return 2
 	}
 
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.logLevel}))
+	logger := slog.New(telemetry.NewLogHandler(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.logLevel})))
 
 	rancherClient, err := rotate.NewClient(cfg.rancherCAFile)
 	if err != nil {

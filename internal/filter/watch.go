@@ -107,14 +107,18 @@ func (r *watchRegistry) closeAll() int {
 // registry while the goroutine runs, so a drain can end the stream. The
 // goroutine ends, and closes upstream, in two cases: a read of upstream fails,
 // for example because ctx cancels, or a write to the pipe fails because the
-// reader closed it or a drain ended it.
-func filterWatchBody(ctx context.Context, upstream io.ReadCloser, allow func(name string, labels map[string]string) bool, logger *slog.Logger, registry *watchRegistry) io.ReadCloser {
+// reader closed it or a drain ended it. It raises drover.filter.watches.open
+// while the stream is open, and counts a dropped event on cluster in
+// drover.filter.events.dropped.
+func filterWatchBody(ctx context.Context, upstream io.ReadCloser, allow func(name string, labels map[string]string) bool, logger *slog.Logger, registry *watchRegistry, metrics *metrics, cluster string) io.ReadCloser {
 	reader, writer := io.Pipe()
 	registry.add(writer)
+	metrics.watchOpened(ctx)
 
 	go func() {
 		defer func() {
 			registry.remove(writer)
+			metrics.watchClosed(ctx)
 			_ = upstream.Close()
 		}()
 
@@ -133,6 +137,7 @@ func filterWatchBody(ctx context.Context, upstream io.ReadCloser, allow func(nam
 				case watchAdded, watchModified, watchDeleted:
 					pass = eventAllowed(event, allow)
 					if !pass {
+						metrics.eventDropped(ctx, cluster)
 						logger.DebugContext(ctx, "dropped a watch event", "kind", event.Object.Kind, "namespace", event.Object.Metadata.Name)
 					}
 				}

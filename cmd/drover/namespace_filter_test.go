@@ -37,7 +37,7 @@ func TestParseConfigErrors(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			if _, err := parseConfig(test.args, io.Discard); err == nil {
+			if _, err := parseConfig(test.args, io.Discard, noEnvironment); err == nil {
 				t.Errorf("parseConfig(%v) returned no error", test.args)
 			}
 		})
@@ -54,7 +54,7 @@ func TestParseConfigAcceptsAbsentTokenFile(t *testing.T) {
 		cfg, err := parseConfig([]string{
 			"--upstream", "https://rancher.example.com",
 			"--token-file", path,
-		}, io.Discard)
+		}, io.Discard, noEnvironment)
 		if err != nil {
 			t.Fatalf("parseConfig with token file %q: %v", path, err)
 		}
@@ -95,7 +95,11 @@ func TestParseConfigValid(t *testing.T) {
 		"--cache-ttl", "30s",
 		"--log-level", "debug",
 		"--shutdown-grace", "5s",
-	}, io.Discard)
+		"--otlp-endpoint", "collector:4317",
+		"--otlp-traces=false",
+		"--otlp-metrics=false",
+		"--service-name", "custom",
+	}, io.Discard, noEnvironment)
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
 	}
@@ -117,6 +121,21 @@ func TestParseConfigValid(t *testing.T) {
 	if cfg.shutdownGrace != 5*time.Second {
 		t.Errorf("shutdown grace = %s, want 5s", cfg.shutdownGrace)
 	}
+	if cfg.telemetry.Endpoint != "collector:4317" {
+		t.Errorf("otlp endpoint = %q, want collector:4317", cfg.telemetry.Endpoint)
+	}
+	if cfg.telemetry.Traces {
+		t.Error("otlp traces = true, want false")
+	}
+	if cfg.telemetry.Metrics {
+		t.Error("otlp metrics = true, want false")
+	}
+	if cfg.telemetry.ServiceName != "custom" {
+		t.Errorf("service name = %q, want custom", cfg.telemetry.ServiceName)
+	}
+	if cfg.telemetry.Version != version {
+		t.Errorf("telemetry version = %q, want %q", cfg.telemetry.Version, version)
+	}
 }
 
 func TestParseConfigShutdownGraceDefault(t *testing.T) {
@@ -126,11 +145,60 @@ func TestParseConfigShutdownGraceDefault(t *testing.T) {
 	cfg, err := parseConfig([]string{
 		"--upstream", "https://rancher.example.com",
 		"--token-file", token,
-	}, io.Discard)
+	}, io.Discard, noEnvironment)
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
 	}
 	if cfg.shutdownGrace != 20*time.Second {
 		t.Errorf("shutdown grace = %s, want 20s", cfg.shutdownGrace)
+	}
+}
+
+func TestParseConfigTelemetryDefaults(t *testing.T) {
+	t.Parallel()
+	token := tokenFile(t, "token\n")
+
+	cfg, err := parseConfig([]string{
+		"--upstream", "https://rancher.example.com",
+		"--token-file", token,
+	}, io.Discard, noEnvironment)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if cfg.telemetry.Endpoint != "" {
+		t.Errorf("otlp endpoint = %q, want empty", cfg.telemetry.Endpoint)
+	}
+	if !cfg.telemetry.Traces {
+		t.Error("otlp traces = false, want true")
+	}
+	if !cfg.telemetry.Metrics {
+		t.Error("otlp metrics = false, want true")
+	}
+	if cfg.telemetry.ServiceName != "drover" {
+		t.Errorf("service name = %q, want drover", cfg.telemetry.ServiceName)
+	}
+}
+
+func TestParseConfigTelemetryFromEnvironment(t *testing.T) {
+	t.Parallel()
+	token := tokenFile(t, "token\n")
+	environment := map[string]string{
+		"OTEL_EXPORTER_OTLP_ENDPOINT": "collector:4317",
+		"OTEL_SERVICE_NAME":           "custom",
+	}
+	getenv := func(name string) string { return environment[name] }
+
+	cfg, err := parseConfig([]string{
+		"--upstream", "https://rancher.example.com",
+		"--token-file", token,
+	}, io.Discard, getenv)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if cfg.telemetry.Endpoint != "collector:4317" {
+		t.Errorf("otlp endpoint = %q, want collector:4317", cfg.telemetry.Endpoint)
+	}
+	if cfg.telemetry.ServiceName != "custom" {
+		t.Errorf("service name = %q, want custom", cfg.telemetry.ServiceName)
 	}
 }

@@ -14,6 +14,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
+
 	"github.com/evil8io/drover/internal/rancherclient"
 )
 
@@ -34,6 +38,9 @@ type Config struct {
 	CacheTTL time.Duration
 	// Logger gets one line for each intercepted request. Nil selects slog.Default.
 	Logger *slog.Logger
+	// MeterProvider creates the meter of the filter metrics. Nil selects
+	// otel.GetMeterProvider().
+	MeterProvider metric.MeterProvider
 	// Now gives the time to the cache. Nil selects time.Now.
 	Now func() time.Time
 }
@@ -47,6 +54,8 @@ type Service struct {
 	base      http.RoundTripper
 	cache     *cache
 	proxy     *httputil.ReverseProxy
+	handler   http.Handler
+	metrics   *metrics
 
 	draining atomic.Bool
 	watches  *watchRegistry
@@ -94,14 +103,23 @@ func New(cfg Config) (*Service, error) {
 	if ttl == 0 {
 		ttl = defaultCacheTTL
 	}
+	meterProvider := cfg.MeterProvider
+	if meterProvider == nil {
+		meterProvider = otel.GetMeterProvider()
+	}
+	m, err := newMetrics(meterProvider)
+	if err != nil {
+		return nil, fmt.Errorf("build the filter metrics: %w", err)
+	}
 
 	svc := &Service{
 		upstream:  &upstream,
 		tokenFile: cfg.TokenFile,
 		logger:    logger,
 		now:       now,
-		base:      base,
+		base:      otelhttp.NewTransport(base, otelhttp.WithMeterProvider(meterProvider)),
 		cache:     newCache(ttl, now),
+		metrics:   m,
 		watches:   newWatchRegistry(),
 	}
 	svc.proxy = &httputil.ReverseProxy{
@@ -110,6 +128,12 @@ func New(cfg Config) (*Service, error) {
 		FlushInterval: -1,
 		ErrorHandler:  svc.handleError,
 	}
+	svc.handler = otelhttp.NewHandler(http.HandlerFunc(svc.serve), "namespace-filter",
+		otelhttp.WithMeterProvider(meterProvider),
+		otelhttp.WithFilter(func(r *http.Request) bool {
+			return r.URL.Path != "/healthz" && r.URL.Path != "/readyz"
+		}),
+	)
 
 	return svc, nil
 }
@@ -117,6 +141,11 @@ func New(cfg Config) (*Service, error) {
 // ServeHTTP answers GET /healthz and GET /readyz itself, and proxies every
 // other request to the upstream.
 func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.handler.ServeHTTP(w, r)
+}
+
+// serve is the traced entry point behind ServeHTTP.
+func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		switch r.URL.Path {
 		case "/healthz":
