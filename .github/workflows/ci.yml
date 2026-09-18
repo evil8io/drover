@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.image-vars.outputs.version }}
+      tags: ${{ steps.image-vars.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - run: test -z "$(gofmt -l .)"
+
+      - run: go vet ./...
+
+      - run: go test -race -count=1 ./...
+
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
+
+      # image.yml is a reusable-workflow call, so it cannot run a step of its
+      # own. Compute its version and tags here instead.
+      - id: image-vars
+        run: |
+          sha_short="${GITHUB_SHA:0:7}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            version="main-$sha_short"
+            tags=$'main\nsha-'"$sha_short"
+          else
+            version="pr-${{ github.event.pull_request.number }}"
+            tags="pr-${{ github.event.pull_request.number }}"
+          fi
+          {
+            echo "version=$version"
+            echo "tags<<TAGS_EOF"
+            echo "$tags"
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  image:
+    needs: go
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/image.yml
+    with:
+      push: ${{ github.event_name == 'push' }}
+      version: ${{ needs.go.outputs.version }}
+      tags: ${{ needs.go.outputs.tags }}
