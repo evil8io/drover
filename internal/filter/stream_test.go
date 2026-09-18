@@ -31,6 +31,11 @@ func TestListWatchStreams(t *testing.T) {
 	releaseOnce := sync.OnceFunc(func() { close(release) })
 	defer releaseOnce()
 
+	const (
+		added    = `{"type":"ADDED","object":{"metadata":{"name":"a"}}}` + "\n"
+		modified = `{"type":"MODIFIED","object":{"metadata":{"name":"a"}}}` + "\n"
+	)
+
 	h := newHarness(t, listUpstream(steveHandler("a"), func(w http.ResponseWriter, r *http.Request) {
 		flusher, ok := w.(http.Flusher)
 		if !ok {
@@ -39,10 +44,10 @@ func TestListWatchStreams(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, "{\"type\":\"ADDED\"}\n")
+		_, _ = io.WriteString(w, added)
 		flusher.Flush()
 		<-release
-		_, _ = io.WriteString(w, "{\"type\":\"MODIFIED\"}\n")
+		_, _ = io.WriteString(w, modified)
 		flusher.Flush()
 	}))
 
@@ -61,7 +66,7 @@ func TestListWatchStreams(t *testing.T) {
 		if got.err != nil {
 			t.Fatalf("read the first event: %v", got.err)
 		}
-		if got.line != "{\"type\":\"ADDED\"}\n" {
+		if got.line != added {
 			t.Fatalf("first event = %q, want the ADDED event", got.line)
 		}
 	case <-time.After(10 * time.Second):
@@ -75,19 +80,77 @@ func TestListWatchStreams(t *testing.T) {
 		if got.err != nil {
 			t.Fatalf("read the second event: %v", got.err)
 		}
-		if got.line != "{\"type\":\"MODIFIED\"}\n" {
+		if got.line != modified {
 			t.Errorf("second event = %q, want the MODIFIED event", got.line)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the second event did not arrive")
 	}
 
-	privileged := h.upstream.all()[2]
+	privileged := h.upstream.all()[3]
 	if got := privileged.query.Get("watch"); got != "true" {
 		t.Errorf("privileged watch = %q, want true", got)
 	}
-	if got := privileged.query.Get("labelSelector"); got != "kubernetes.io/metadata.name in (a)" {
-		t.Errorf("privileged labelSelector = %q", got)
+	if got := privileged.query.Get("labelSelector"); got != "" {
+		t.Errorf("privileged labelSelector = %q, want no selector", got)
+	}
+	if got := privileged.header.Get("Accept"); got != "application/json" {
+		t.Errorf("privileged Accept = %q, want application/json", got)
+	}
+}
+
+func TestWatchDropsDisallowedNamespace(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstream(steveHandler("a"), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"type":"ADDED","object":{"metadata":{"name":"a"}}}`+"\n")
+		_, _ = io.WriteString(w, `{"type":"ADDED","object":{"metadata":{"name":"z"}}}`+"\n")
+	}))
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, listPath+"?watch=true", nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	want := `{"type":"ADDED","object":{"metadata":{"name":"a"}}}` + "\n"
+	if string(body) != want {
+		t.Errorf("body = %q, want %q", body, want)
+	}
+}
+
+func TestWatchAllowsProjectMember(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstreamWithProjects(steveHandler("a"), projectsHandler("p-1"), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"type":"ADDED","object":{"metadata":{"name":"z","labels":{"field.cattle.io/projectId":"p-1"}}}}`+"\n")
+	}))
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, listPath+"?watch=true", nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	want := `{"type":"ADDED","object":{"metadata":{"name":"z","labels":{"field.cattle.io/projectId":"p-1"}}}}` + "\n"
+	if string(body) != want {
+		t.Errorf("body = %q, want %q", body, want)
+	}
+}
+
+func TestWatchPassesBookmark(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstream(steveHandler(), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"99"}}}`+"\n")
+	}))
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, listPath+"?watch=true", nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	want := `{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"99"}}}` + "\n"
+	if string(body) != want {
+		t.Errorf("body = %q, want %q", body, want)
 	}
 }
 
@@ -170,15 +233,15 @@ func TestListWatchWebsocketUpgrade(t *testing.T) {
 	}
 
 	requests := h.upstream.all()
-	if len(requests) != 3 {
-		t.Fatalf("upstream requests = %d, want 3", len(requests))
+	if len(requests) != 4 {
+		t.Fatalf("upstream requests = %d, want 4", len(requests))
 	}
-	privileged := requests[2]
+	privileged := requests[3]
 	if got := privileged.header.Get("Authorization"); got != serviceAuth {
 		t.Errorf("privileged Authorization = %q, want %q", got, serviceAuth)
 	}
-	if got := privileged.query.Get("labelSelector"); got != "kubernetes.io/metadata.name in (a)" {
-		t.Errorf("privileged labelSelector = %q", got)
+	if got := privileged.query.Get("labelSelector"); got != "" {
+		t.Errorf("privileged labelSelector = %q, want no selector", got)
 	}
 	if got := privileged.header.Get("Upgrade"); got != "websocket" {
 		t.Errorf("privileged Upgrade = %q, want websocket", got)

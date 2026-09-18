@@ -51,8 +51,8 @@ func TestListFiltersAfter403(t *testing.T) {
 	}
 
 	requests := h.upstream.all()
-	if len(requests) != 3 {
-		t.Fatalf("upstream requests = %d, want 3", len(requests))
+	if len(requests) != 4 {
+		t.Fatalf("upstream requests = %d, want 4", len(requests))
 	}
 
 	native := requests[0]
@@ -74,7 +74,15 @@ func TestListFiltersAfter403(t *testing.T) {
 		t.Errorf("allowed set Accept = %q, want application/json", steve.header.Get("Accept"))
 	}
 
-	privileged := requests[2]
+	projects := requests[2]
+	if projects.method != http.MethodGet || projects.path != projectsPath {
+		t.Errorf("project list request = %s %q, want GET %q", projects.method, projects.path, projectsPath)
+	}
+	if projects.header.Get("Authorization") != callerToken {
+		t.Errorf("project list Authorization = %q, want %q", projects.header.Get("Authorization"), callerToken)
+	}
+
+	privileged := requests[3]
 	if privileged.path != listPath {
 		t.Errorf("privileged path = %q, want %q", privileged.path, listPath)
 	}
@@ -101,7 +109,7 @@ func TestListMergesCallerSelector(t *testing.T) {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 
-	privileged := h.upstream.all()[2]
+	privileged := h.upstream.all()[3]
 	want := "team=x,kubernetes.io/metadata.name in (a,b)"
 	if got := privileged.query.Get("labelSelector"); got != want {
 		t.Errorf("labelSelector = %q, want %q", got, want)
@@ -117,7 +125,7 @@ func TestListEmptySet(t *testing.T) {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 
-	privileged := h.upstream.all()[2]
+	privileged := h.upstream.all()[3]
 	want := "kubernetes.io/metadata.name,!kubernetes.io/metadata.name"
 	if got := privileged.query.Get("labelSelector"); got != want {
 		t.Errorf("labelSelector = %q, want %q", got, want)
@@ -223,14 +231,14 @@ func TestListStevePagination(t *testing.T) {
 	}
 
 	requests := h.upstream.all()
-	if len(requests) != 4 {
-		t.Fatalf("upstream requests = %d, want 4", len(requests))
+	if len(requests) != 5 {
+		t.Fatalf("upstream requests = %d, want 5", len(requests))
 	}
 	if got := requests[2].query.Get("continue"); got != "t1" {
 		t.Errorf("second allowed set continue = %q, want t1", got)
 	}
 	want := "kubernetes.io/metadata.name in (a,b,c)"
-	if got := requests[3].query.Get("labelSelector"); got != want {
+	if got := requests[4].query.Get("labelSelector"); got != want {
 		t.Errorf("labelSelector = %q, want %q", got, want)
 	}
 }
@@ -272,6 +280,8 @@ func TestListCoalescesAllowedSetRequests(t *testing.T) {
 		case r.URL.Path == stevePath:
 			<-release
 			steveHandler("a")(w, r)
+		case r.URL.Path == projectsPath:
+			projectsHandler()(w, r)
 		case r.Header.Get("Authorization") == serviceAuth:
 			namespaceListHandler(w, r)
 		default:
@@ -330,10 +340,10 @@ func TestListCookieCaller(t *testing.T) {
 	if got := requests[1].header.Get("Authorization"); got != "" {
 		t.Errorf("allowed set Authorization = %q, want no header", got)
 	}
-	if got := requests[2].header.Get("Authorization"); got != serviceAuth {
+	if got := requests[3].header.Get("Authorization"); got != serviceAuth {
 		t.Errorf("privileged Authorization = %q, want %q", got, serviceAuth)
 	}
-	if _, ok := requests[2].header["Cookie"]; ok {
+	if _, ok := requests[3].header["Cookie"]; ok {
 		t.Error("the privileged request has a Cookie header")
 	}
 }
