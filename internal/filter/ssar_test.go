@@ -1,6 +1,7 @@
 package filter
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,15 +31,18 @@ func reviewUpstream(answer string) http.HandlerFunc {
 	}
 }
 
-func (h *harness) postReview(t *testing.T, body string, header http.Header) (*http.Response, []byte) {
+func (h *harness) postReview(t *testing.T, body []byte, header http.Header) (*http.Response, []byte) {
 	t.Helper()
-	all := http.Header{"Content-Type": []string{"application/json"}}
+	all := http.Header{}
 	for name, values := range header {
 		for _, value := range values {
 			all.Add(name, value)
 		}
 	}
-	return h.do(t, h.request(t, http.MethodPost, reviewPath, strings.NewReader(body), all))
+	if all.Get("Content-Type") == "" {
+		all.Set("Content-Type", jsonContentType)
+	}
+	return h.do(t, h.request(t, http.MethodPost, reviewPath, bytes.NewReader(body), all))
 }
 
 func TestReviewGrantsNamespaceList(t *testing.T) {
@@ -49,7 +53,7 @@ func TestReviewGrantsNamespaceList(t *testing.T) {
 			h := newHarness(t, reviewUpstream(deniedAnswer))
 
 			request := fmt.Sprintf(reviewTemplate, fmt.Sprintf(`"verb":%q,"resource":"namespaces"`, verb))
-			resp, body := h.postReview(t, request, nil)
+			resp, body := h.postReview(t, []byte(request), nil)
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("status = %d, want 200", resp.StatusCode)
 			}
@@ -106,7 +110,7 @@ func TestReviewKeepsAllowed(t *testing.T) {
 	h := newHarness(t, reviewUpstream(allowedAnswer))
 
 	request := fmt.Sprintf(reviewTemplate, `"verb":"list","resource":"namespaces"`)
-	resp, body := h.postReview(t, request, nil)
+	resp, body := h.postReview(t, []byte(request), nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
@@ -115,37 +119,106 @@ func TestReviewKeepsAllowed(t *testing.T) {
 	}
 }
 
+func TestReviewGrantsProtobufNamespaceList(t *testing.T) {
+	t.Parallel()
+	for _, verb := range []string{"list", "watch"} {
+		t.Run(verb, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t, reviewUpstream(deniedAnswer))
+
+			header := http.Header{
+				"Content-Type": []string{protobufContentType},
+				"Accept":       []string{protobufContentType + ", */*"},
+			}
+			request := protobufReview(protoAttributes{verb: verb, resource: "namespaces"})
+			resp, body := h.postReview(t, request, header)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200", resp.StatusCode)
+			}
+			if got := resp.Header.Get("Content-Type"); got != jsonContentType {
+				t.Errorf("Content-Type = %q, want %q", got, jsonContentType)
+			}
+
+			var object map[string]any
+			if err := json.Unmarshal(body, &object); err != nil {
+				t.Fatalf("parse the response %q: %v", body, err)
+			}
+			status, ok := object["status"].(map[string]any)
+			if !ok {
+				t.Fatalf("the response has no status object: %q", body)
+			}
+			if status["allowed"] != true {
+				t.Errorf("allowed = %v, want true", status["allowed"])
+			}
+			if status["reason"] != grantedReason {
+				t.Errorf("reason = %v, want %q", status["reason"], grantedReason)
+			}
+
+			sent := h.upstream.all()
+			if len(sent) != 1 {
+				t.Fatalf("upstream requests = %d, want 1", len(sent))
+			}
+			wantBody := fmt.Sprintf(`{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectAccessReview",`+
+				`"spec":{"resourceAttributes":{"verb":%q,"resource":"namespaces"}}}`, verb)
+			if string(sent[0].body) != wantBody {
+				t.Errorf("upstream body = %q, want %q", sent[0].body, wantBody)
+			}
+			for _, name := range []string{"Content-Type", "Accept"} {
+				if got := sent[0].header.Get(name); got != jsonContentType {
+					t.Errorf("upstream %s = %q, want %q", name, got, jsonContentType)
+				}
+			}
+		})
+	}
+}
+
 func TestReviewPassesThrough(t *testing.T) {
 	t.Parallel()
+	protobufHeader := http.Header{"Content-Type": []string{protobufContentType}}
 	tests := []struct {
 		name   string
-		body   string
+		body   []byte
 		header http.Header
 	}{
 		{
 			name: "other resource",
-			body: fmt.Sprintf(reviewTemplate, `"verb":"list","resource":"pods"`),
+			body: []byte(fmt.Sprintf(reviewTemplate, `"verb":"list","resource":"pods"`)),
 		},
 		{
 			name: "namespace scope",
-			body: fmt.Sprintf(reviewTemplate, `"verb":"list","resource":"namespaces","namespace":"a"`),
+			body: []byte(fmt.Sprintf(reviewTemplate, `"verb":"list","resource":"namespaces","namespace":"a"`)),
 		},
 		{
 			name: "get verb",
-			body: fmt.Sprintf(reviewTemplate, `"verb":"get","resource":"namespaces"`),
+			body: []byte(fmt.Sprintf(reviewTemplate, `"verb":"get","resource":"namespaces"`)),
 		},
 		{
 			name: "invalid json",
-			body: `{"kind":"SelfSubjectAccessReview"`,
+			body: []byte(`{"kind":"SelfSubjectAccessReview"`),
 		},
 		{
 			name: "non resource attributes",
-			body: `{"spec":{"nonResourceAttributes":{"path":"/healthz","verb":"get"}}}`,
+			body: []byte(`{"spec":{"nonResourceAttributes":{"path":"/healthz","verb":"get"}}}`),
 		},
 		{
 			name:   "impersonation",
-			body:   fmt.Sprintf(reviewTemplate, `"verb":"list","resource":"namespaces"`),
+			body:   []byte(fmt.Sprintf(reviewTemplate, `"verb":"list","resource":"namespaces"`)),
 			header: http.Header{"Impersonate-User": []string{"someone"}},
+		},
+		{
+			name:   "protobuf other resource",
+			body:   protobufReview(protoAttributes{verb: "get", resource: "pods"}),
+			header: protobufHeader,
+		},
+		{
+			name:   "protobuf truncated",
+			body:   protobufReview(protoAttributes{verb: "list", resource: "namespaces"})[:12],
+			header: protobufHeader,
+		},
+		{
+			name:   "protobuf without the prefix",
+			body:   protobufReview(protoAttributes{verb: "list", resource: "namespaces"})[len(protobufPrefix):],
+			header: protobufHeader,
 		},
 	}
 	for _, test := range tests {
@@ -165,8 +238,15 @@ func TestReviewPassesThrough(t *testing.T) {
 			if len(sent) != 1 {
 				t.Fatalf("upstream requests = %d, want 1", len(sent))
 			}
-			if string(sent[0].body) != test.body {
+			if !bytes.Equal(sent[0].body, test.body) {
 				t.Errorf("upstream body = %q, want %q", sent[0].body, test.body)
+			}
+			wantType := test.header.Get("Content-Type")
+			if wantType == "" {
+				wantType = jsonContentType
+			}
+			if got := sent[0].header.Get("Content-Type"); got != wantType {
+				t.Errorf("upstream Content-Type = %q, want %q", got, wantType)
 			}
 		})
 	}
@@ -177,7 +257,7 @@ func TestReviewBodyTooLarge(t *testing.T) {
 	h := newHarness(t, reviewUpstream(deniedAnswer))
 
 	large := fmt.Sprintf(reviewTemplate, `"verb":"list","resource":"namespaces","name":"`+strings.Repeat("x", maxReviewBody)+`"`)
-	resp, body := h.postReview(t, large, nil)
+	resp, body := h.postReview(t, []byte(large), nil)
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d, want 413", resp.StatusCode)
 	}
