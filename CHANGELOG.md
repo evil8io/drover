@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.3.0](https://github.com/evil8io/drover/compare/v0.2.0...v0.3.0) (2026-09-18)
+
+
+### ⚠ BREAKING CHANGES
+
+* rename to drover and add subcommands ([#7](https://github.com/evil8io/drover/issues/7))
+
+### Features
+
+* add the project-sync subcommand ([#10](https://github.com/evil8io/drover/issues/10)) ([175f824](https://github.com/evil8io/drover/commit/175f82442ba3d235fe0fc3018e3ae5be84bf8e49))
+* add the rotate-token subcommand ([#11](https://github.com/evil8io/drover/issues/11)) ([0923031](https://github.com/evil8io/drover/commit/0923031aea832c53f9347cff9e92b8b5962815ca))
+* rename to drover and add subcommands ([#7](https://github.com/evil8io/drover/issues/7)) ([3acf1dd](https://github.com/evil8io/drover/commit/3acf1ddfcdfb4f46368f3f607e5941886b7f220d))
+
+
+### Bug Fixes
+
+* start without a token file ([#9](https://github.com/evil8io/drover/issues/9)) ([1dbf669](https://github.com/evil8io/drover/commit/1dbf669ff0c8226934f5dc7ab38ec9bd0760df10))
+
 ## [0.2.0](https://github.com/evil8io/rancher-namespace-filter/compare/v0.1.0...v0.2.0) (2026-09-18)
 
 
