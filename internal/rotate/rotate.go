@@ -14,6 +14,13 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/evil8io/drover/internal/rancherclient"
 )
 
 const (
@@ -71,12 +78,20 @@ type Config struct {
 	Logger *slog.Logger
 	// Now gives the time to the expiry check. Nil selects time.Now.
 	Now func() time.Time
+	// MeterProvider creates the meter of the rotate metrics, and the meter that
+	// instruments RancherClient. Nil selects otel.GetMeterProvider().
+	MeterProvider metric.MeterProvider
+	// TracerProvider creates the tracer of the rotate spans. Nil selects
+	// otel.GetTracerProvider().
+	TracerProvider trace.TracerProvider
 }
 
 type rotator struct {
-	cfg    Config
-	logger *slog.Logger
-	now    func() time.Time
+	cfg     Config
+	logger  *slog.Logger
+	now     func() time.Time
+	tracer  trace.Tracer
+	metrics *metrics
 }
 
 // Run renews the token in the Secret. It returns nil when the token in the
@@ -86,7 +101,28 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
+	return r.run(ctx)
+}
 
+// run wraps one call of check in the rotate span, and records the duration of
+// the run.
+func (r *rotator) run(ctx context.Context) error {
+	ctx, span := r.tracer.Start(ctx, "rotate")
+	defer span.End()
+	start := time.Now()
+
+	err := r.check(ctx)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	r.metrics.recordDuration(ctx, time.Since(start))
+	return err
+}
+
+// check reads the token in the Secret, and renews it when the token is not
+// valid. It returns nil when the token in the Secret is still valid.
+func (r *rotator) check(ctx context.Context) error {
 	current, err := r.secretToken(ctx)
 	if err != nil {
 		return err
@@ -159,6 +195,29 @@ func newRotator(cfg Config) (*rotator, error) {
 	if r.cfg.KubeClient == nil {
 		r.cfg.KubeClient = &http.Client{Timeout: 30 * time.Second}
 	}
+
+	meterProvider := cfg.MeterProvider
+	if meterProvider == nil {
+		meterProvider = otel.GetMeterProvider()
+	}
+	m, err := newMetrics(meterProvider)
+	if err != nil {
+		return nil, fmt.Errorf("build the rotate metrics: %w", err)
+	}
+	r.metrics = m
+	r.cfg.RancherClient = &http.Client{
+		Transport:     rancherclient.WrapTransport(r.cfg.RancherClient.Transport, meterProvider),
+		CheckRedirect: r.cfg.RancherClient.CheckRedirect,
+		Jar:           r.cfg.RancherClient.Jar,
+		Timeout:       r.cfg.RancherClient.Timeout,
+	}
+
+	tracerProvider := cfg.TracerProvider
+	if tracerProvider == nil {
+		tracerProvider = otel.GetTracerProvider()
+	}
+	r.tracer = tracerProvider.Tracer(tracerName)
+
 	return r, nil
 }
 
@@ -177,6 +236,24 @@ func (r *rotator) rotate(ctx context.Context) error {
 		return err
 	}
 	return r.prune(ctx, created, session)
+}
+
+// step starts a child span named name, and returns the traced context and a
+// function that ends the span. The caller calls the returned function once,
+// as a defer, with the outcome of the step and the error that the step
+// returns. A non-nil error always records the outcome failed and the span
+// error status, regardless of the outcome that the caller passes.
+func (r *rotator) step(ctx context.Context, name string) (context.Context, func(outcome string, err error)) {
+	ctx, span := r.tracer.Start(ctx, name)
+	return ctx, func(outcome string, err error) {
+		if err != nil {
+			outcome = outcomeFailed
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		r.metrics.step(ctx, name, outcome)
+		span.End()
+	}
 }
 
 type call struct {

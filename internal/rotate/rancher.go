@@ -81,10 +81,14 @@ type createdToken struct {
 
 // tokenIsValid reports whether the token in the Secret lasts past the renew
 // window. A token that Rancher rejects is not valid.
-func (r *rotator) tokenIsValid(ctx context.Context, token string) (bool, error) {
+func (r *rotator) tokenIsValid(ctx context.Context, token string) (_ bool, err error) {
+	ctx, end := r.step(ctx, stepTokenCheck)
+	var outcome string
+	defer func() { end(outcome, err) }()
+
 	name, _, found := strings.Cut(token, ":")
 	if !found || name == "" {
-		r.logRotate(ctx, "malformed")
+		outcome = r.logRotate(ctx, "malformed")
 		return false, nil
 	}
 
@@ -95,29 +99,30 @@ func (r *rotator) tokenIsValid(ctx context.Context, token string) (bool, error) 
 	switch status {
 	case http.StatusOK:
 	case http.StatusUnauthorized, http.StatusNotFound:
-		r.logRotate(ctx, "rejected")
+		outcome = r.logRotate(ctx, "rejected")
 		return false, nil
 	default:
 		return false, fmt.Errorf("read the token %s: status %d", name, status)
 	}
 
 	var item tokenItem
-	if err := json.Unmarshal(data, &item); err != nil {
-		return false, fmt.Errorf("decode the token %s: %w", name, err)
+	if unmarshalErr := json.Unmarshal(data, &item); unmarshalErr != nil {
+		return false, fmt.Errorf("decode the token %s: %w", name, unmarshalErr)
 	}
 	if item.Expired {
-		r.logRotate(ctx, "expired")
+		outcome = r.logRotate(ctx, "expired")
 		return false, nil
 	}
 
-	at, forever, err := item.expiry()
-	if err != nil {
-		return false, err
+	at, forever, expiryErr := item.expiry()
+	if expiryErr != nil {
+		return false, expiryErr
 	}
 	if !forever && !at.After(r.now().Add(r.cfg.RenewBefore)) {
 		r.logger.InfoContext(ctx, "the token expires inside the renew window",
 			"step", stepTokenCheck, "outcome", outcomeRotate, "reason", "window",
 			"token_name", name, "expires_at", at.UTC().Format(time.RFC3339))
+		outcome = outcomeRotate
 		return false, nil
 	}
 
@@ -127,17 +132,24 @@ func (r *rotator) tokenIsValid(ctx context.Context, token string) (bool, error) 
 	}
 	r.logger.InfoContext(ctx, "token is valid",
 		"step", stepTokenCheck, "outcome", outcomeValid, "token_name", name, "expires_at", expiresAt)
+	outcome = outcomeValid
 	return true, nil
 }
 
-func (r *rotator) logRotate(ctx context.Context, reason string) {
+// logRotate writes the line for a token that needs a rotation, with its
+// reason. It returns the outcome for the step metric.
+func (r *rotator) logRotate(ctx context.Context, reason string) string {
 	r.logger.InfoContext(ctx, "the token needs a rotation",
 		"step", stepTokenCheck, "outcome", outcomeRotate, "reason", reason)
+	return outcomeRotate
 }
 
 // login starts a session as the service user. Rancher ignores the TTL of a login
 // token, so the session ends after auth-user-session-ttl-minutes.
-func (r *rotator) login(ctx context.Context) (session, error) {
+func (r *rotator) login(ctx context.Context) (_ session, err error) {
+	ctx, end := r.step(ctx, stepLogin)
+	defer func() { end(outcomeOK, err) }()
+
 	body := map[string]string{
 		"username":     r.cfg.Username,
 		"password":     r.cfg.Password,
@@ -162,8 +174,8 @@ func (r *rotator) login(ctx context.Context) (session, error) {
 		Token string `json:"token"`
 		ID    string `json:"id"`
 	}
-	if err := json.Unmarshal(data, &answer); err != nil {
-		return session{}, fmt.Errorf("decode the login answer: %w", err)
+	if unmarshalErr := json.Unmarshal(data, &answer); unmarshalErr != nil {
+		return session{}, fmt.Errorf("decode the login answer: %w", unmarshalErr)
 	}
 	if answer.Token == "" || answer.ID == "" {
 		return session{}, errors.New("the login answer has no token")
@@ -175,7 +187,10 @@ func (r *rotator) login(ctx context.Context) (session, error) {
 
 // createToken derives the API token from the session. Rancher reduces a TTL
 // above auth-token-max-ttl-minutes without an error.
-func (r *rotator) createToken(ctx context.Context, s session) (createdToken, error) {
+func (r *rotator) createToken(ctx context.Context, s session) (_ createdToken, err error) {
+	ctx, end := r.step(ctx, stepTokenCreate)
+	defer func() { end(outcomeOK, err) }()
+
 	want := r.cfg.TTL.Milliseconds()
 	body := map[string]any{"type": "token", "ttl": want, "description": r.cfg.Description}
 	status, data, err := r.rancherDo(ctx, http.MethodPost, tokensPath, s.token, body)
@@ -187,8 +202,8 @@ func (r *rotator) createToken(ctx context.Context, s session) (createdToken, err
 	}
 
 	var item tokenItem
-	if err := json.Unmarshal(data, &item); err != nil {
-		return createdToken{}, fmt.Errorf("decode the new token: %w", err)
+	if unmarshalErr := json.Unmarshal(data, &item); unmarshalErr != nil {
+		return createdToken{}, fmt.Errorf("decode the new token: %w", unmarshalErr)
 	}
 	name := item.ID
 	if name == "" {
@@ -208,7 +223,11 @@ func (r *rotator) createToken(ctx context.Context, s session) (createdToken, err
 
 // prune deletes the tokens of the service user that this command created before,
 // except the newest Keep tokens. It also deletes a login token of an earlier run.
-func (r *rotator) prune(ctx context.Context, created createdToken, s session) error {
+func (r *rotator) prune(ctx context.Context, created createdToken, s session) (err error) {
+	ctx, end := r.step(ctx, stepTokenPrune)
+	outcome := outcomeOK
+	defer func() { end(outcome, err) }()
+
 	status, data, err := r.rancherDo(ctx, http.MethodGet, tokensPath, created.value, nil)
 	if err != nil {
 		return fmt.Errorf("list the tokens: %w", err)
@@ -219,8 +238,8 @@ func (r *rotator) prune(ctx context.Context, created createdToken, s session) er
 	var collection struct {
 		Data []tokenItem `json:"data"`
 	}
-	if err := json.Unmarshal(data, &collection); err != nil {
-		return fmt.Errorf("decode the token list: %w", err)
+	if unmarshalErr := json.Unmarshal(data, &collection); unmarshalErr != nil {
+		return fmt.Errorf("decode the token list: %w", unmarshalErr)
 	}
 
 	mine, sessions := r.selectTokens(collection.Data, s)
@@ -228,14 +247,13 @@ func (r *rotator) prune(ctx context.Context, created createdToken, s session) er
 	var errs []error
 	deleted := 0
 	for _, item := range slices.Concat(mine[keep:], sessions) {
-		if err := r.deleteToken(ctx, created.value, item.itemName()); err != nil {
-			errs = append(errs, err)
+		if delErr := r.deleteToken(ctx, created.value, item.itemName()); delErr != nil {
+			errs = append(errs, delErr)
 			continue
 		}
 		deleted++
 	}
 
-	outcome := outcomeOK
 	level := slog.LevelInfo
 	if len(errs) > 0 {
 		outcome, level = outcomeFailed, slog.LevelWarn
@@ -288,11 +306,20 @@ func (r *rotator) deleteToken(ctx context.Context, bearer, name string) error {
 // logout ends the session. Rancher refuses a delete of the current session
 // token, so the logout action is the only way to remove it.
 func (r *rotator) logout(ctx context.Context, s session) {
-	status, _, err := r.rancherDo(ctx, http.MethodPost, logoutPath, s.token, map[string]any{})
+	ctx, end := r.step(ctx, stepLogout)
+	var err error
+	outcome := outcomeOK
+	defer func() { end(outcome, err) }()
+
+	status, _, doErr := r.rancherDo(ctx, http.MethodPost, logoutPath, s.token, map[string]any{})
 	switch {
-	case err != nil:
+	case doErr != nil:
+		err = doErr
+		outcome = outcomeFailed
 		r.logger.WarnContext(ctx, "the logout failed", "step", stepLogout, "outcome", outcomeFailed, "error", err.Error())
 	case status != http.StatusOK && status != http.StatusNoContent && status != http.StatusCreated:
+		err = fmt.Errorf("the logout failed: status %d", status)
+		outcome = outcomeFailed
 		r.logger.WarnContext(ctx, "the logout failed", "step", stepLogout, "outcome", outcomeFailed, "status", status)
 	default:
 		r.logger.InfoContext(ctx, "logged out", "step", stepLogout, "outcome", outcomeOK)

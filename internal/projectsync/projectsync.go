@@ -15,6 +15,11 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/evil8io/drover/internal/rancherclient"
 )
 
@@ -41,6 +46,12 @@ type Config struct {
 	Logger *slog.Logger
 	// Version is the version in the User-Agent header. An empty value selects dev.
 	Version string
+	// MeterProvider creates the meter of the sync metrics, and the meter that
+	// instruments the Rancher requests. Nil selects otel.GetMeterProvider().
+	MeterProvider metric.MeterProvider
+	// TracerProvider creates the tracer of the reconcile spans. Nil selects
+	// otel.GetTracerProvider().
+	TracerProvider trace.TracerProvider
 }
 
 // Syncer reconciles the namespaces of every project that the service user sees.
@@ -54,6 +65,8 @@ type Syncer struct {
 	userAgent   string
 	logger      *slog.Logger
 	client      *http.Client
+	metrics     *metrics
+	tracer      trace.Tracer
 
 	// tokenMissing keeps the last state of the token file, so that the service
 	// logs one warning per state change.
@@ -109,6 +122,19 @@ func New(cfg Config) (*Syncer, error) {
 		version = "dev"
 	}
 
+	meterProvider := cfg.MeterProvider
+	if meterProvider == nil {
+		meterProvider = otel.GetMeterProvider()
+	}
+	m, err := newMetrics(meterProvider)
+	if err != nil {
+		return nil, fmt.Errorf("build the sync metrics: %w", err)
+	}
+	tracerProvider := cfg.TracerProvider
+	if tracerProvider == nil {
+		tracerProvider = otel.GetTracerProvider()
+	}
+
 	return &Syncer{
 		rancher:     &rancher,
 		tokenFile:   cfg.TokenFile,
@@ -118,7 +144,9 @@ func New(cfg Config) (*Syncer, error) {
 		timeout:     min(interval, maxTimeout),
 		userAgent:   "drover/" + version,
 		logger:      logger,
-		client:      &http.Client{Transport: transport},
+		client:      &http.Client{Transport: rancherclient.WrapTransport(transport, meterProvider)},
+		metrics:     m,
+		tracer:      tracerProvider.Tracer(tracerName),
 	}, nil
 }
 
@@ -171,12 +199,16 @@ func (s *Syncer) reconcile(ctx context.Context) {
 		s.logger.InfoContext(ctx, "the token file has a token", "path", s.tokenFile)
 	}
 
+	ctx, span := s.tracer.Start(ctx, "reconcile")
+	defer span.End()
+	start := time.Now()
+
 	var run counters
 	projects, err := s.projects(ctx, token)
 	if err != nil {
 		run.errors++
 		s.logFailure(ctx, slog.LevelError, "the project list request failed", err)
-		s.logSummary(ctx, run)
+		s.finishReconcile(ctx, span, run, start)
 		return
 	}
 
@@ -186,7 +218,22 @@ func (s *Syncer) reconcile(ctx context.Context) {
 		run.projects += len(clusters[cluster])
 		s.syncCluster(ctx, token, cluster, clusters[cluster], &run)
 	}
+	s.finishReconcile(ctx, span, run, start)
+}
+
+// finishReconcile logs the summary line of run, sets the span status when the
+// run has an error, and records the reconcile metrics.
+func (s *Syncer) finishReconcile(ctx context.Context, span trace.Span, run counters, start time.Time) {
 	s.logSummary(ctx, run)
+
+	outcome := outcomeOK
+	if run.errors > 0 {
+		outcome = outcomeError
+		err := fmt.Errorf("the run failed with %d errors", run.errors)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	s.metrics.reconcileDone(ctx, outcome, time.Since(start))
 }
 
 // byCluster groups the projects per cluster, by the project name in the
@@ -247,6 +294,7 @@ func (s *Syncer) syncCluster(ctx context.Context, token, cluster string, project
 		s.logger.InfoContext(ctx, "namespace patched",
 			"cluster", cluster, "namespace", name, "project", projectName,
 			"labels", keysOf(change.labels), "annotations", keysOf(change.annotations))
+		s.metrics.namespacePatched(ctx)
 	}
 }
 
@@ -318,4 +366,5 @@ func (s *Syncer) logFailure(ctx context.Context, level slog.Level, message strin
 		level = slog.LevelDebug
 	}
 	s.logger.Log(ctx, level, message, append(attrs, "error", err.Error())...)
+	s.metrics.syncError(ctx)
 }
