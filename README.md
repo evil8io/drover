@@ -193,3 +193,7 @@ podman build --build-arg VERSION=0.1.0 -t rancher-namespace-filter:0.1.0 .
 ## Releases
 
 PR titles follow Conventional Commits. The project squash-merges every pull request. release-please reads the PR titles and opens a release pull request. A merge of that pull request creates a tag, a GitHub release, and the image tags for the new version.
+
+## License
+
+[Apache License 2.0](LICENSE)
