@@ -6,6 +6,11 @@ on:
     branches:
       - main
 
+# A run on main waits for the previous run, so the last push sets the main image tag.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   go:
     runs-on: ubuntu-latest
