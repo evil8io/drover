@@ -1,0 +1,61 @@
+suite: token
+templates:
+  - templates/deployment.yaml
+  - templates/secret.yaml
+release:
+  name: rnf
+set:
+  upstream.url: http://rancher.cattle-system.svc
+tests:
+  - it: creates the Secret from token.value
+    set:
+      token.value: api-token
+    asserts:
+      - template: templates/secret.yaml
+        equal:
+          path: metadata.name
+          value: rnf-rancher-namespace-filter-token
+      - template: templates/secret.yaml
+        equal:
+          path: stringData.token
+          value: api-token
+      - template: templates/deployment.yaml
+        equal:
+          path: spec.template.spec.volumes[0]
+          value:
+            name: token
+            secret:
+              secretName: rnf-rancher-namespace-filter-token
+      - template: templates/deployment.yaml
+        equal:
+          path: spec.template.spec.containers[0].volumeMounts[0]
+          value:
+            name: token
+            mountPath: /var/run/secrets/rancher-namespace-filter
+            readOnly: true
+
+  - it: uses an existing Secret and creates none
+    set:
+      token.existingSecret: rancher-api-token
+    asserts:
+      - template: templates/secret.yaml
+        hasDocuments:
+          count: 0
+      - template: templates/deployment.yaml
+        equal:
+          path: spec.template.spec.volumes[0].secret.secretName
+          value: rancher-api-token
+
+  - it: follows a custom token key
+    set:
+      token.value: api-token
+      token.key: rancher-token
+    asserts:
+      - template: templates/secret.yaml
+        equal:
+          path: stringData.rancher-token
+          value: api-token
+      - template: templates/deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].args
+          content: --token-file=/var/run/secrets/rancher-namespace-filter/rancher-token

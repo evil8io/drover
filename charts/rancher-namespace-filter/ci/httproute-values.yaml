@@ -1,0 +1,14 @@
+upstream:
+  url: http://rancher.cattle-system.svc
+token:
+  value: api-token
+httpRoute:
+  enabled: true
+  parentRefs:
+    - name: rancher
+      namespace: gateway
+  hostnames:
+    - rancher.example.com
+  clusterIds:
+    - c-m-abcde12345
+    - local

@@ -1,0 +1,61 @@
+suite: topology spread
+templates:
+  - templates/deployment.yaml
+release:
+  name: rnf
+set:
+  upstream.url: http://rancher.cattle-system.svc
+  token.value: api-token
+tests:
+  - it: spreads over nodes and zones with the selector labels
+    asserts:
+      - lengthEqual:
+          path: spec.template.spec.topologySpreadConstraints
+          count: 2
+      - equal:
+          path: spec.template.spec.topologySpreadConstraints[0]
+          value:
+            maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: DoNotSchedule
+            matchLabelKeys:
+              - pod-template-hash
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: rancher-namespace-filter
+                app.kubernetes.io/instance: rnf
+      - equal:
+          path: spec.template.spec.topologySpreadConstraints[1]
+          value:
+            maxSkew: 1
+            topologyKey: topology.kubernetes.io/zone
+            whenUnsatisfiable: ScheduleAnyway
+            matchLabelKeys:
+              - pod-template-hash
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: rancher-namespace-filter
+                app.kubernetes.io/instance: rnf
+
+  - it: keeps a labelSelector that the user sets
+    set:
+      topologySpreadConstraints:
+        - maxSkew: 3
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: other
+    asserts:
+      - lengthEqual:
+          path: spec.template.spec.topologySpreadConstraints
+          count: 1
+      - equal:
+          path: spec.template.spec.topologySpreadConstraints[0]
+          value:
+            maxSkew: 3
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector:
+              matchLabels:
+                app: other

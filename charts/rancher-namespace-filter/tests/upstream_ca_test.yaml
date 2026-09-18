@@ -1,0 +1,49 @@
+suite: upstream ca
+templates:
+  - templates/deployment.yaml
+release:
+  name: rnf
+set:
+  upstream.url: https://rancher.cattle-system.svc
+  token.value: api-token
+tests:
+  - it: mounts no CA bundle by default
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --upstream-ca-file=/etc/rancher-namespace-filter/ca/ca.crt
+      - lengthEqual:
+          path: spec.template.spec.volumes
+          count: 1
+      - lengthEqual:
+          path: spec.template.spec.containers[0].volumeMounts
+          count: 1
+
+  - it: mounts the CA bundle when the Secret is set
+    set:
+      upstream.caSecret.name: rancher-ca
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --upstream-ca-file=/etc/rancher-namespace-filter/ca/ca.crt
+      - equal:
+          path: spec.template.spec.volumes[1]
+          value:
+            name: ca
+            secret:
+              secretName: rancher-ca
+      - equal:
+          path: spec.template.spec.containers[0].volumeMounts[1]
+          value:
+            name: ca
+            mountPath: /etc/rancher-namespace-filter/ca
+            readOnly: true
+
+  - it: follows a custom CA key
+    set:
+      upstream.caSecret.name: rancher-ca
+      upstream.caSecret.key: bundle.pem
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --upstream-ca-file=/etc/rancher-namespace-filter/ca/bundle.pem
