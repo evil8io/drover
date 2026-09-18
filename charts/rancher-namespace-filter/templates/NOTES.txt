@@ -1,0 +1,7 @@
+Service: {{ include "rancher-namespace-filter.fullname" . }}.{{ .Release.Namespace }}.svc
+Port:    {{ .Values.service.port }}
+
+The route must send two paths per cluster id to this Service:
+
+  /k8s/clusters/<id>/api/v1/namespaces
+  /k8s/clusters/<id>/apis/authorization.k8s.io/v1/selfsubjectaccessreviews

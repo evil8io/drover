@@ -1,0 +1,123 @@
+suite: deployment
+templates:
+  - templates/deployment.yaml
+release:
+  name: rnf
+set:
+  upstream.url: http://rancher.cattle-system.svc
+  token.value: api-token
+tests:
+  - it: runs two replicas
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 2
+
+  - it: rolls out without an unavailable pod
+    asserts:
+      - equal:
+          path: spec.strategy
+          value:
+            type: RollingUpdate
+            rollingUpdate:
+              maxUnavailable: 0
+              maxSurge: 1
+
+  - it: takes the image tag from the chart appVersion
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/evil8io/rancher-namespace-filter:0.1.0
+      - equal:
+          path: metadata.labels["app.kubernetes.io/version"]
+          value: "0.1.0"
+
+  - it: takes the image tag from the values
+    set:
+      image.tag: 1.2.3
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/evil8io/rancher-namespace-filter:1.2.3
+      - equal:
+          path: metadata.labels["app.kubernetes.io/version"]
+          value: "1.2.3"
+
+  - it: builds the args in a fixed order
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].args
+          value:
+            - --upstream=http://rancher.cattle-system.svc
+            - --token-file=/var/run/secrets/rancher-namespace-filter/token
+            - --cache-ttl=15s
+            - --log-level=info
+
+  - it: appends extraArgs after the generated args
+    set:
+      extraArgs:
+        - "--listen=:9090"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].args
+          value:
+            - --upstream=http://rancher.cattle-system.svc
+            - --token-file=/var/run/secrets/rancher-namespace-filter/token
+            - --cache-ttl=15s
+            - --log-level=info
+            - "--listen=:9090"
+
+  - it: probes /healthz on the http port
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].ports[0]
+          value:
+            name: http
+            containerPort: 8080
+            protocol: TCP
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe
+          value:
+            httpGet:
+              path: /healthz
+              port: http
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe
+          value:
+            httpGet:
+              path: /healthz
+              port: http
+
+  - it: keeps the service account token out of the pod
+    asserts:
+      - equal:
+          path: spec.template.spec.automountServiceAccountToken
+          value: false
+
+  - it: sets the pod and container security contexts
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext
+          value:
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+      - equal:
+          path: spec.template.spec.containers[0].securityContext
+          value:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+
+  - it: sets the container resources
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources
+          value:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi

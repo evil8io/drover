@@ -29,34 +29,7 @@ The service reads the body of a `selfsubjectaccessreviews` request. When the rev
 3. The token in a Secret, mounted into the service.
 4. Two `Exact` path matches per cluster id, on the Rancher hostname, that route to the service.
 
-An `Exact` match takes precedence over the `PathPrefix /` match of the Rancher route. This is a Gateway API `HTTPRoute` example for one cluster id:
-
-```yaml
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata:
-  name: rancher-namespace-filter
-spec:
-  parentRefs:
-    - name: rancher
-  hostnames:
-    - rancher.example.com
-  rules:
-    - matches:
-        - path:
-            type: Exact
-            value: /k8s/clusters/c-m-abcde12345/api/v1/namespaces
-      backendRefs:
-        - name: rancher-namespace-filter
-          port: 8080
-    - matches:
-        - path:
-            type: Exact
-            value: /k8s/clusters/c-m-abcde12345/apis/authorization.k8s.io/v1/selfsubjectaccessreviews
-      backendRefs:
-        - name: rancher-namespace-filter
-          port: 8080
-```
+The Helm chart renders this route from `httpRoute.clusterIds`, with one `GET` match on the namespace path and one `POST` match on the review path for each id. An `Exact` match takes precedence over the `PathPrefix /` match of the Rancher route.
 
 ## Configuration
 
@@ -74,84 +47,17 @@ The upstream is the Rancher Service inside the cluster, for example `http://ranc
 
 `GET /healthz` returns status 200 with body `ok`.
 
-## Deployment
+## Helm chart
 
-The image has these tags: `<version>`, `<major>.<minor>`, `latest`, and `main`.
+The chart is an OCI artifact at `oci://ghcr.io/evil8io/charts/rancher-namespace-filter`, with the same version as the image. The image has these tags: `<version>`, `<major>.<minor>`, `latest`, and `main`.
 
-Mount the token Secret so the file lands at `/var/run/secrets/rancher/token`.
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: rancher-namespace-filter
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: rancher-namespace-filter
-  template:
-    metadata:
-      labels:
-        app: rancher-namespace-filter
-    spec:
-      containers:
-        - name: rancher-namespace-filter
-          image: ghcr.io/evil8io/rancher-namespace-filter:0.1.0
-          args:
-            - --upstream=http://rancher.cattle-system.svc
-            - --token-file=/var/run/secrets/rancher/token
-          ports:
-            - containerPort: 8080
-          volumeMounts:
-            - name: token
-              mountPath: /var/run/secrets/rancher
-              readOnly: true
-          readinessProbe:
-            httpGet:
-              path: /healthz
-              port: 8080
-          livenessProbe:
-            httpGet:
-              path: /healthz
-              port: 8080
-          securityContext:
-            runAsNonRoot: true
-            readOnlyRootFilesystem: true
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
-            seccompProfile:
-              type: RuntimeDefault
-      volumes:
-        - name: token
-          secret:
-            secretName: rancher-namespace-filter-token
+```
+helm install rancher-namespace-filter oci://ghcr.io/evil8io/charts/rancher-namespace-filter --version <version> --namespace <ns> --set upstream.url=http://rancher.cattle-system.svc --set token.existingSecret=<secret>
 ```
 
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: rancher-namespace-filter-token
-type: Opaque
-stringData:
-  token: <api-token>
-```
+The chart needs two values: `upstream.url`, the Rancher Service inside the cluster, and `token.existingSecret` or `token.value`, the API token of the service user.
 
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: rancher-namespace-filter
-spec:
-  selector:
-    app: rancher-namespace-filter
-  ports:
-    - port: 8080
-      targetPort: 8080
-```
+By default, the chart deploys 2 replicas with a PodDisruptionBudget, a spread over nodes, and a rolling update with no gap. See `charts/rancher-namespace-filter/README.md` for the full values table.
 
 ## Behaviour differences
 
@@ -181,6 +87,8 @@ Run these checks before every commit:
 1. `go test -race ./...`
 2. `go vet ./...`
 3. `gofmt -l .` (it must print nothing)
+4. `helm lint --strict charts/rancher-namespace-filter -f charts/rancher-namespace-filter/ci/default-values.yaml`
+5. `helm unittest charts/rancher-namespace-filter`
 
 Build the binary with `go build ./cmd/rancher-namespace-filter`.
 
@@ -193,6 +101,8 @@ podman build --build-arg VERSION=0.1.0 -t rancher-namespace-filter:0.1.0 .
 ## Releases
 
 PR titles follow Conventional Commits. The project squash-merges every pull request. release-please reads the PR titles and opens a release pull request. A merge of that pull request creates a tag, a GitHub release, and the image tags for the new version.
+
+The release job also pushes the chart to `oci://ghcr.io/evil8io/charts/rancher-namespace-filter`, with the same version as the image. release-please bumps `Chart.yaml` in the release pull request.
 
 ## License
 

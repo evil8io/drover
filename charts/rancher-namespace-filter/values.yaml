@@ -1,0 +1,101 @@
+image:
+  repository: ghcr.io/evil8io/rancher-namespace-filter
+  # An empty tag selects the chart appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 2
+
+upstream:
+  # The Rancher Service in the cluster, for example http://rancher.cattle-system.svc.
+  url: ""
+  # PEM bundle that verifies an https upstream.
+  caSecret:
+    name: ""
+    key: ca.crt
+
+token:
+  # A Secret that has the API token of the Rancher service user.
+  existingSecret: ""
+  key: token
+  # Creates the Secret <fullname>-token when existingSecret is empty.
+  value: ""
+
+cacheTTL: 15s
+logLevel: info
+extraArgs: []
+
+service:
+  type: ClusterIP
+  port: 8080
+
+httpRoute:
+  enabled: false
+  annotations: {}
+  # For example [{name: rancher, namespace: gateway}].
+  parentRefs: []
+  # For example [rancher.example.com].
+  hostnames: []
+  # One GET match and one POST match per id.
+  clusterIds: []
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+automountServiceAccountToken: false
+
+podAnnotations: {}
+podLabels: {}
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    memory: 128Mi
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+# The chart adds a labelSelector to an entry that has none.
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: DoNotSchedule
+    matchLabelKeys:
+      - pod-template-hash
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    matchLabelKeys:
+      - pod-template-hash
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+terminationGracePeriodSeconds: 30
+priorityClassName: ""
+nodeSelector: {}
+tolerations: []
+affinity: {}
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: http

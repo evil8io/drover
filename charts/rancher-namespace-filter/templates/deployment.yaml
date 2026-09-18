@@ -1,0 +1,109 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rancher-namespace-filter.fullname" . }}
+  labels:
+    {{- include "rancher-namespace-filter.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    {{- toYaml .Values.strategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "rancher-namespace-filter.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "rancher-namespace-filter.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "rancher-namespace-filter.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      {{- $selector := dict "matchLabels" (include "rancher-namespace-filter.selectorLabels" $ | fromYaml) }}
+      {{- $constraints := list }}
+      {{- range . }}
+      {{- $constraint := . }}
+      {{- if not $constraint.labelSelector }}
+      {{- $constraint = merge (dict "labelSelector" $selector) $constraint }}
+      {{- end }}
+      {{- $constraints = append $constraints $constraint }}
+      {{- end }}
+      topologySpreadConstraints:
+        {{- toYaml $constraints | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: rancher-namespace-filter
+          image: "{{ .Values.image.repository }}:{{ include "rancher-namespace-filter.version" . }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--upstream={{ .Values.upstream.url }}"
+            - "--token-file=/var/run/secrets/rancher-namespace-filter/{{ .Values.token.key }}"
+            - "--cache-ttl={{ .Values.cacheTTL }}"
+            - "--log-level={{ .Values.logLevel }}"
+            {{- if .Values.upstream.caSecret.name }}
+            - "--upstream-ca-file=/etc/rancher-namespace-filter/ca/{{ .Values.upstream.caSecret.key }}"
+            {{- end }}
+            {{- with .Values.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: token
+              mountPath: /var/run/secrets/rancher-namespace-filter
+              readOnly: true
+            {{- if .Values.upstream.caSecret.name }}
+            - name: ca
+              mountPath: /etc/rancher-namespace-filter/ca
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: token
+          secret:
+            secretName: {{ include "rancher-namespace-filter.tokenSecretName" . }}
+        {{- if .Values.upstream.caSecret.name }}
+        - name: ca
+          secret:
+            secretName: {{ .Values.upstream.caSecret.name }}
+        {{- end }}
