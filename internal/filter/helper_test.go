@@ -106,6 +106,7 @@ func (c *fakeClock) advance(d time.Duration) {
 type harness struct {
 	upstream  *upstream
 	proxy     *httptest.Server
+	svc       *Service
 	clock     *fakeClock
 	tokenFile string
 	logs      *syncBuffer
@@ -153,7 +154,7 @@ func newHarnessWithTokenFile(t *testing.T, handler http.HandlerFunc, tokenFile s
 	}
 	clock := newClock()
 	logs := &syncBuffer{}
-	handler2, err := New(Config{
+	svc, err := New(Config{
 		Upstream:  target,
 		TokenFile: tokenFile,
 		Logger:    slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
@@ -162,9 +163,9 @@ func newHarnessWithTokenFile(t *testing.T, handler http.HandlerFunc, tokenFile s
 	if err != nil {
 		t.Fatalf("new handler: %v", err)
 	}
-	proxy := httptest.NewServer(handler2)
+	proxy := httptest.NewServer(svc)
 	t.Cleanup(proxy.Close)
-	return &harness{upstream: up, proxy: proxy, clock: clock, tokenFile: tokenFile, logs: logs}
+	return &harness{upstream: up, proxy: proxy, svc: svc, clock: clock, tokenFile: tokenFile, logs: logs}
 }
 
 func writeToken(t *testing.T, path, token string) {

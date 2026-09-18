@@ -57,7 +57,7 @@ type allowedSet struct {
 
 // allowedNamespaces returns the namespaces that the caller can get. A non-nil
 // response is the 401 or 403 answer of Steve, for the caller.
-func (s *service) allowedNamespaces(ctx context.Context, cluster string, header http.Header) ([]string, *http.Response, error) {
+func (s *Service) allowedNamespaces(ctx context.Context, cluster string, header http.Header) ([]string, *http.Response, error) {
 	set, denied, err := s.allowed(ctx, cluster, header)
 	return set.names, denied, err
 }
@@ -65,7 +65,7 @@ func (s *service) allowedNamespaces(ctx context.Context, cluster string, header 
 // allowedNamespace reports whether the caller may see the namespace: its name
 // is in the cached name set, or its project label matches one of the cached
 // project ids of the caller. A cache error or a denial answers false.
-func (s *service) allowedNamespace(ctx context.Context, cluster string, header http.Header, name string, labels map[string]string) bool {
+func (s *Service) allowedNamespace(ctx context.Context, cluster string, header http.Header, name string, labels map[string]string) bool {
 	set, denied, err := s.allowed(ctx, cluster, header)
 	if denied != nil {
 		_ = denied.Body.Close()
@@ -82,7 +82,7 @@ func (s *service) allowedNamespace(ctx context.Context, cluster string, header h
 
 // allowed returns the cached allowed set of the caller. A non-nil response is
 // the 401 or 403 answer of Steve or of the project list, for the caller.
-func (s *service) allowed(ctx context.Context, cluster string, header http.Header) (allowedSet, *http.Response, error) {
+func (s *Service) allowed(ctx context.Context, cluster string, header http.Header) (allowedSet, *http.Response, error) {
 	auth := header.Get("Authorization")
 	cookie := header.Get("Cookie")
 	sum := sha256.Sum256([]byte(auth + "\n" + cookie))
@@ -95,7 +95,7 @@ func (s *service) allowed(ctx context.Context, cluster string, header http.Heade
 
 // fetchAllowed reads the namespace names and the project ids of the caller,
 // over Steve and the Rancher project API.
-func (s *service) fetchAllowed(ctx context.Context, cluster, auth, cookie string) (allowedSet, *http.Response, error) {
+func (s *Service) fetchAllowed(ctx context.Context, cluster, auth, cookie string) (allowedSet, *http.Response, error) {
 	ctx, cancel := context.WithTimeout(ctx, steveTimeout)
 	defer cancel()
 
@@ -112,7 +112,7 @@ func (s *service) fetchAllowed(ctx context.Context, cluster, auth, cookie string
 	return allowedSet{names: names, projects: projects}, nil, nil
 }
 
-func (s *service) fetchNamespaceNames(ctx context.Context, cluster, auth, cookie string) ([]string, *http.Response, error) {
+func (s *Service) fetchNamespaceNames(ctx context.Context, cluster, auth, cookie string) ([]string, *http.Response, error) {
 	names := make(map[string]struct{})
 	token := ""
 	for page := 0; page < maxStevePages; page++ {
@@ -180,7 +180,7 @@ func (s *service) fetchNamespaceNames(ctx context.Context, cluster, auth, cookie
 // fetchProjectIDs reads the projects that the caller may see, as the part of
 // the project id after the colon. A non-nil response is the 401 or 403 answer
 // of Rancher, for the caller.
-func (s *service) fetchProjectIDs(ctx context.Context, auth, cookie string) ([]string, *http.Response, error) {
+func (s *Service) fetchProjectIDs(ctx context.Context, auth, cookie string) ([]string, *http.Response, error) {
 	target := *s.upstream
 	target.Path = projectsPath
 

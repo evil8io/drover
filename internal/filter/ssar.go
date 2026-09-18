@@ -34,7 +34,7 @@ type reviewSpec struct {
 	nonResource bool
 }
 
-func (s *service) roundTripReview(req *http.Request, cluster string) (*http.Response, error) {
+func (s *Service) roundTripReview(req *http.Request, cluster string) (*http.Response, error) {
 	if hasImpersonation(req.Header) {
 		resp, err := s.base.RoundTrip(req)
 		if err != nil {
@@ -213,13 +213,13 @@ func grantReview(body []byte) ([]byte, bool) {
 	return granted, true
 }
 
-func (s *service) logReview(ctx context.Context, cluster, outcome string, status int) {
+func (s *Service) logReview(ctx context.Context, cluster, outcome string, status int) {
 	s.logger.InfoContext(ctx, "selfsubjectaccessreview", "cluster", cluster, "outcome", outcome, "status", status)
 }
 
 // reviewError logs the failed request. The caller returns the error, and the
 // error handler of the proxy writes the Status body.
-func (s *service) reviewError(ctx context.Context, cluster string, err error) error {
+func (s *Service) reviewError(ctx context.Context, cluster string, err error) error {
 	level := slog.LevelError
 	if errors.Is(err, context.Canceled) {
 		level = slog.LevelDebug

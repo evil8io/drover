@@ -23,7 +23,7 @@ var (
 	reviewsPath    = regexp.MustCompile(`^/k8s/clusters/([^/]+)/apis/authorization\.k8s\.io/v1/selfsubjectaccessreviews/?$`)
 )
 
-func (s *service) RoundTrip(req *http.Request) (*http.Response, error) {
+func (s *Service) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.Method == http.MethodGet {
 		if m := namespacesPath.FindStringSubmatch(req.URL.Path); m != nil {
 			return s.roundTripNamespaces(req, m[1])

@@ -20,12 +20,13 @@ import (
 )
 
 type config struct {
-	listen    string
-	upstream  *url.URL
-	caFile    string
-	tokenFile string
-	cacheTTL  time.Duration
-	logLevel  slog.Level
+	listen        string
+	upstream      *url.URL
+	caFile        string
+	tokenFile     string
+	cacheTTL      time.Duration
+	logLevel      slog.Level
+	shutdownGrace time.Duration
 }
 
 func runNamespaceFilter(args []string) int {
@@ -42,7 +43,7 @@ func runNamespaceFilter(args []string) int {
 		logger.Warn("the token file is not available yet", "path", cfg.tokenFile)
 	}
 
-	handler, err := filter.New(filter.Config{
+	svc, err := filter.New(filter.Config{
 		Upstream:  cfg.upstream,
 		CAFile:    cfg.caFile,
 		TokenFile: cfg.tokenFile,
@@ -59,7 +60,7 @@ func runNamespaceFilter(args []string) int {
 
 	server := &http.Server{
 		Addr:              cfg.listen,
-		Handler:           handler,
+		Handler:           svc,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		BaseContext:       func(net.Listener) context.Context { return baseCtx },
@@ -77,6 +78,7 @@ func runNamespaceFilter(args []string) int {
 		"listen", cfg.listen,
 		"upstream", cfg.upstream.String(),
 		"cache_ttl", cfg.cacheTTL.String(),
+		"shutdown_grace", cfg.shutdownGrace.String(),
 	)
 
 	select {
@@ -87,12 +89,16 @@ func runNamespaceFilter(args []string) int {
 		}
 	case <-signalCtx.Done():
 		stop()
-		logger.Info("shutdown")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ended := svc.StartDrain()
+		logger.Info("drain", "streams_ended", ended)
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.shutdownGrace)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			logger.Warn("the shutdown did not complete", "error", err.Error())
+			logger.Error("the server did not stop", "error", err.Error())
+			return 1
 		}
+		logger.Info("stop")
 	}
 	return 0
 }
@@ -112,6 +118,7 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	flags.StringVar(&cfg.tokenFile, "token-file", "", "file with the API token of the service user")
 	flags.DurationVar(&cfg.cacheTTL, "cache-ttl", 15*time.Second, "lifetime of a cached allowed set")
 	flags.StringVar(&logLevel, "log-level", "info", "debug, info, warn or error")
+	flags.DurationVar(&cfg.shutdownGrace, "shutdown-grace", 20*time.Second, "grace period for the shutdown after SIGTERM or SIGINT")
 
 	if err := flags.Parse(args); err != nil {
 		return config{}, err

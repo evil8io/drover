@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sync/atomic"
 	"time"
 
 	"github.com/evil8io/drover/internal/rancherclient"
@@ -37,18 +38,25 @@ type Config struct {
 	Now func() time.Time
 }
 
-type service struct {
+// Service proxies a Rancher server. It implements http.Handler.
+type Service struct {
 	upstream  *url.URL
 	tokenFile string
 	logger    *slog.Logger
 	now       func() time.Time
 	base      http.RoundTripper
 	cache     *cache
+	proxy     *httputil.ReverseProxy
+
+	draining atomic.Bool
+	watches  *watchRegistry
 }
 
-// New returns a handler that proxies every request to the upstream. It answers
-// GET /healthz with 200 and the body ok.
-func New(cfg Config) (http.Handler, error) {
+// New returns a Service that proxies every request to the upstream. It answers
+// GET /healthz with 200 and the body ok, always. It answers GET /readyz with
+// 200 and the body ok, until StartDrain runs, and with 503 and the body
+// draining after that.
+func New(cfg Config) (*Service, error) {
 	if cfg.Upstream == nil {
 		return nil, errors.New("upstream is required")
 	}
@@ -87,33 +95,61 @@ func New(cfg Config) (http.Handler, error) {
 		ttl = defaultCacheTTL
 	}
 
-	svc := &service{
+	svc := &Service{
 		upstream:  &upstream,
 		tokenFile: cfg.TokenFile,
 		logger:    logger,
 		now:       now,
 		base:      base,
 		cache:     newCache(ttl, now),
+		watches:   newWatchRegistry(),
 	}
-
-	proxy := &httputil.ReverseProxy{
+	svc.proxy = &httputil.ReverseProxy{
 		Rewrite:       svc.rewrite,
 		Transport:     svc,
 		FlushInterval: -1,
 		ErrorHandler:  svc.handleError,
 	}
 
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && r.URL.Path == "/healthz" {
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			_, _ = w.Write([]byte("ok"))
-			return
-		}
-		proxy.ServeHTTP(w, r)
-	}), nil
+	return svc, nil
 }
 
-func (s *service) rewrite(pr *httputil.ProxyRequest) {
+// ServeHTTP answers GET /healthz and GET /readyz itself, and proxies every
+// other request to the upstream.
+func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		switch r.URL.Path {
+		case "/healthz":
+			writePlain(w, http.StatusOK, "ok")
+			return
+		case "/readyz":
+			if s.draining.Load() {
+				writePlain(w, http.StatusServiceUnavailable, "draining")
+				return
+			}
+			writePlain(w, http.StatusOK, "ok")
+			return
+		}
+	}
+	s.proxy.ServeHTTP(w, r)
+}
+
+func writePlain(w http.ResponseWriter, code int, body string) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(code)
+	_, _ = w.Write([]byte(body))
+}
+
+// StartDrain marks the service as draining, so /readyz answers 503 from this
+// point on, and it ends every open watch stream with a plain EOF. It returns
+// the count of streams it ends. A caller runs this once, before
+// http.Server.Shutdown.
+func (s *Service) StartDrain() int {
+	s.draining.Store(true)
+	return s.watches.closeAll()
+}
+
+func (s *Service) rewrite(pr *httputil.ProxyRequest) {
 	pr.SetURL(s.upstream)
 	pr.Out.Host = pr.In.Host
 
@@ -133,7 +169,7 @@ func (s *service) rewrite(pr *httputil.ProxyRequest) {
 	pr.Out.Header.Set("X-Forwarded-For", ip)
 }
 
-func (s *service) handleError(w http.ResponseWriter, r *http.Request, err error) {
+func (s *Service) handleError(w http.ResponseWriter, r *http.Request, err error) {
 	level := slog.LevelError
 	if errors.Is(err, context.Canceled) {
 		level = slog.LevelDebug

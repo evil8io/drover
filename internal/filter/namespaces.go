@@ -18,7 +18,7 @@ const (
 	maxDrainBody = 1 << 20
 )
 
-func (s *service) roundTripNamespaces(req *http.Request, cluster string) (*http.Response, error) {
+func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.Response, error) {
 	start := s.now()
 	watch, _ := strconv.ParseBool(req.URL.Query().Get("watch"))
 	result := listResult{cluster: cluster, watch: watch}
@@ -85,7 +85,7 @@ func (s *service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 	if watch && filtered.StatusCode == http.StatusOK {
 		filtered.Body = filterWatchBody(req.Context(), filtered.Body, func(name string, labels map[string]string) bool {
 			return s.allowedNamespace(req.Context(), cluster, req.Header, name, labels)
-		}, s.logger)
+		}, s.logger, s.watches)
 		// A dropped event changes the byte count, so the length of upstream no
 		// longer applies.
 		filtered.ContentLength = -1
@@ -142,19 +142,19 @@ type listResult struct {
 
 // listError logs the failed request. The caller returns the error, and the
 // error handler of the proxy writes the Status body.
-func (s *service) listError(req *http.Request, start time.Time, result listResult, err error) error {
+func (s *Service) listError(req *http.Request, start time.Time, result listResult, err error) error {
 	result.outcome, result.err = outcomeError, err
 	s.logList(req.Context(), start, result)
 	return err
 }
 
-func (s *service) statusError(req *http.Request, start time.Time, result listResult, err error) *http.Response {
+func (s *Service) statusError(req *http.Request, start time.Time, result listResult, err error) *http.Response {
 	result.outcome, result.status, result.err = outcomeError, http.StatusBadGateway, err
 	s.logList(req.Context(), start, result)
 	return statusResponse(req, http.StatusBadGateway, reasonInternalError, serviceName+": "+err.Error())
 }
 
-func (s *service) logList(ctx context.Context, start time.Time, result listResult) {
+func (s *Service) logList(ctx context.Context, start time.Time, result listResult) {
 	attrs := []any{"cluster", result.cluster, "outcome", result.outcome, "status", result.status}
 	if result.outcome == outcomeFiltered {
 		attrs = append(attrs, "count", result.count)
