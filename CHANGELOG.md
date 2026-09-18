@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/evil8io/drover/compare/v0.4.0...v0.4.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* keep a JSON Accept on a namespace watch and read table events ([#18](https://github.com/evil8io/drover/issues/18)) ([46dfb34](https://github.com/evil8io/drover/commit/46dfb34b6f5c8df42450065a2bfac209e29eee68))
+
 ## [0.4.0](https://github.com/evil8io/drover/compare/v0.3.2...v0.4.0) (2026-09-18)
 
 
