@@ -38,6 +38,10 @@ func runNamespaceFilter(args []string) int {
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.logLevel}))
+	if !tokenFileReady(cfg.tokenFile) {
+		logger.Warn("the token file is not available yet", "path", cfg.tokenFile)
+	}
+
 	handler, err := filter.New(filter.Config{
 		Upstream:  cfg.upstream,
 		CAFile:    cfg.caFile,
@@ -142,14 +146,16 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	if cfg.tokenFile == "" {
 		return config{}, errors.New("-token-file is required")
 	}
-	token, err := os.ReadFile(cfg.tokenFile)
-	if err != nil {
-		return config{}, fmt.Errorf("-token-file: %w", err)
-	}
-	if len(bytes.TrimSpace(token)) == 0 {
-		return config{}, fmt.Errorf("-token-file %s is empty", cfg.tokenFile)
-	}
 	return cfg, nil
+}
+
+// tokenFileReady reports whether path names a file with a non-blank token.
+func tokenFileReady(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return len(bytes.TrimSpace(data)) > 0
 }
 
 func parseLevel(name string) (slog.Level, error) {

@@ -52,6 +52,8 @@ The service reads the body of a `selfsubjectaccessreviews` request. When the rev
 
 The upstream is the Rancher Service inside the cluster, for example `http://rancher.cattle-system.svc`. The public hostname is not a valid upstream, because the route sends the two filtered paths back to the service.
 
+The service starts with no token file and returns a 502 Status on a filtered request until the file gets a token.
+
 `GET /healthz` returns status 200 with body `ok`.
 
 A Helm chart for drover is published separately.

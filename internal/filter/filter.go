@@ -172,14 +172,18 @@ func (s *service) handleError(w http.ResponseWriter, r *http.Request, err error)
 	writeStatus(w, http.StatusBadGateway, reasonInternalError, serviceName+": "+err.Error())
 }
 
+// errTokenUnavailable marks a readToken failure that a later request can
+// recover from, once the token file gets its content.
+var errTokenUnavailable = errors.New("the token file is not available yet")
+
 func readToken(path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", fmt.Errorf("read token file: %w", err)
+		return "", fmt.Errorf("%w: %w", errTokenUnavailable, err)
 	}
 	token := strings.TrimSpace(string(data))
 	if token == "" {
-		return "", fmt.Errorf("token file %s is empty", path)
+		return "", fmt.Errorf("%w: %s is empty", errTokenUnavailable, path)
 	}
 	return token, nil
 }

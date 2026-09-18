@@ -108,23 +108,55 @@ type harness struct {
 	proxy     *httptest.Server
 	clock     *fakeClock
 	tokenFile string
+	logs      *syncBuffer
+}
+
+// syncBuffer collects log output from concurrent requests.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func newHarness(t *testing.T, handler http.HandlerFunc) *harness {
 	t.Helper()
-	up := newUpstream(t, handler)
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	writeToken(t, tokenFile, "service")
+	return newHarnessWithTokenFile(t, handler, tokenFile)
+}
+
+// newHarnessWithoutToken builds a harness whose token file does not exist yet.
+func newHarnessWithoutToken(t *testing.T, handler http.HandlerFunc) *harness {
+	t.Helper()
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	return newHarnessWithTokenFile(t, handler, tokenFile)
+}
+
+func newHarnessWithTokenFile(t *testing.T, handler http.HandlerFunc, tokenFile string) *harness {
+	t.Helper()
+	up := newUpstream(t, handler)
 
 	target, err := url.Parse(up.server.URL)
 	if err != nil {
 		t.Fatalf("parse upstream URL: %v", err)
 	}
 	clock := newClock()
+	logs := &syncBuffer{}
 	handler2, err := New(Config{
 		Upstream:  target,
 		TokenFile: tokenFile,
-		Logger:    slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		Logger:    slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		Now:       clock.Now,
 	})
 	if err != nil {
@@ -132,7 +164,7 @@ func newHarness(t *testing.T, handler http.HandlerFunc) *harness {
 	}
 	proxy := httptest.NewServer(handler2)
 	t.Cleanup(proxy.Close)
-	return &harness{upstream: up, proxy: proxy, clock: clock, tokenFile: tokenFile}
+	return &harness{upstream: up, proxy: proxy, clock: clock, tokenFile: tokenFile, logs: logs}
 }
 
 func writeToken(t *testing.T, path, token string) {
