@@ -1,0 +1,52 @@
+name: release-please
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency: release-please
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      version: ${{ steps.release.outputs.version }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      tags: ${{ steps.tags.outputs.tags }}
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@v5
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # image.yml is a reusable-workflow call, so it cannot run a step of its
+      # own. Compute its tags here, from the major and minor that the
+      # release step also outputs.
+      - id: tags
+        if: steps.release.outputs.release_created == 'true'
+        run: |
+          {
+            echo "tags<<TAGS_EOF"
+            echo "${{ steps.release.outputs.version }}"
+            echo "${{ steps.release.outputs.major }}.${{ steps.release.outputs.minor }}"
+            echo "latest"
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  image:
+    needs: release
+    if: needs.release.outputs.release_created == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/image.yml
+    with:
+      push: true
+      version: ${{ needs.release.outputs.version }}
+      tags: ${{ needs.release.outputs.tags }}
