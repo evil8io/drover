@@ -3,7 +3,6 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"os"
 )
 
@@ -19,7 +18,7 @@ func main() {
 
 func run(args []string) int {
 	if len(args) == 0 {
-		usage(os.Stderr)
+		usage()
 		return 2
 	}
 
@@ -28,22 +27,22 @@ func run(args []string) int {
 		fmt.Println(version)
 		return 0
 	case "-h", "--help":
-		usage(os.Stderr)
+		usage()
 		return 0
 	}
 
 	cmd, ok := subcommands[args[0]]
 	if !ok {
-		usage(os.Stderr)
+		usage()
 		return 2
 	}
 	return cmd(args[1:])
 }
 
-func usage(w io.Writer) {
-	fmt.Fprintln(w, "Usage: drover <subcommand> [flags]")
-	fmt.Fprintln(w, "       drover --version")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Subcommands:")
-	fmt.Fprintln(w, "  namespace-filter   Filter the namespace list of a Rancher project member.")
+func usage() {
+	fmt.Fprintln(os.Stderr, "Usage: drover <subcommand> [flags]")
+	fmt.Fprintln(os.Stderr, "       drover --version")
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "Subcommands:")
+	fmt.Fprintln(os.Stderr, "  namespace-filter   Filter the namespace list of a Rancher project member.")
 }
