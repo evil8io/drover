@@ -12,10 +12,27 @@ import (
 )
 
 const (
-	maxReviewBody = 1 << 20
-	grantedReason = "granted by " + serviceName
-	outcomeGrant  = "granted"
+	maxReviewBody   = 1 << 20
+	grantedReason   = "granted by " + serviceName
+	outcomeGrant    = "granted"
+	jsonContentType = "application/json"
 )
+
+// resourceAttributes has the fields of a ResourceAttributes that the filter reads.
+type resourceAttributes struct {
+	Namespace   string `json:"namespace,omitempty"`
+	Verb        string `json:"verb,omitempty"`
+	Group       string `json:"group,omitempty"`
+	Resource    string `json:"resource,omitempty"`
+	Subresource string `json:"subresource,omitempty"`
+	Name        string `json:"name,omitempty"`
+}
+
+// reviewSpec has the fields of a SelfSubjectAccessReviewSpec that the filter reads.
+type reviewSpec struct {
+	resource    *resourceAttributes
+	nonResource bool
+}
 
 func (s *service) roundTripReview(req *http.Request, cluster string) (*http.Response, error) {
 	if hasImpersonation(req.Header) {
@@ -43,7 +60,8 @@ func (s *service) roundTripReview(req *http.Request, cluster string) (*http.Resp
 	out := req.Clone(req.Context())
 	setBody(out, body)
 
-	if !namespaceListReview(body) {
+	match, replacement := namespaceListReview(req.Header.Get("Content-Type"), body)
+	if !match {
 		resp, err := s.base.RoundTrip(out)
 		if err != nil {
 			return nil, s.reviewError(req.Context(), cluster, err)
@@ -52,6 +70,11 @@ func (s *service) roundTripReview(req *http.Request, cluster string) (*http.Resp
 		return resp, nil
 	}
 
+	if replacement != nil {
+		setBody(out, replacement)
+		out.Header.Set("Content-Type", jsonContentType)
+		out.Header.Set("Accept", jsonContentType)
+	}
 	out.Header.Del("Accept-Encoding")
 	resp, err := s.base.RoundTrip(out)
 	if err != nil {
@@ -90,38 +113,74 @@ func (s *service) roundTripReview(req *http.Request, cluster string) (*http.Resp
 }
 
 // namespaceListReview reports whether the review asks for the list or the watch
-// of the namespaces at cluster scope.
-func namespaceListReview(body []byte) bool {
+// of the namespaces at cluster scope. A protobuf review also gets the JSON body
+// that replaces it, because the filter answers the review in JSON.
+func namespaceListReview(contentType string, body []byte) (match bool, replacement []byte) {
+	if isProtobuf(contentType) {
+		spec, err := decodeProtobufReview(body)
+		if err != nil || !clusterNamespaceList(spec) {
+			return false, nil
+		}
+		replacement, err := reviewJSON(*spec.resource)
+		if err != nil {
+			return false, nil
+		}
+		return true, replacement
+	}
+
+	spec, err := jsonReviewSpec(body)
+	if err != nil {
+		return false, nil
+	}
+	return clusterNamespaceList(spec), nil
+}
+
+func jsonReviewSpec(body []byte) (reviewSpec, error) {
 	var review struct {
 		Spec struct {
-			ResourceAttributes *struct {
-				Verb        string `json:"verb"`
-				Group       string `json:"group"`
-				Resource    string `json:"resource"`
-				Namespace   string `json:"namespace"`
-				Name        string `json:"name"`
-				Subresource string `json:"subresource"`
-			} `json:"resourceAttributes"`
-			NonResourceAttributes json.RawMessage `json:"nonResourceAttributes"`
+			ResourceAttributes    *resourceAttributes `json:"resourceAttributes"`
+			NonResourceAttributes json.RawMessage     `json:"nonResourceAttributes"`
 		} `json:"spec"`
 	}
 	if err := json.Unmarshal(body, &review); err != nil {
+		return reviewSpec{}, err
+	}
+	raw := review.Spec.NonResourceAttributes
+	return reviewSpec{
+		resource:    review.Spec.ResourceAttributes,
+		nonResource: len(raw) > 0 && string(raw) != "null",
+	}, nil
+}
+
+func clusterNamespaceList(spec reviewSpec) bool {
+	if spec.nonResource || spec.resource == nil {
 		return false
 	}
-	if raw := review.Spec.NonResourceAttributes; len(raw) > 0 && string(raw) != "null" {
-		return false
-	}
-	attributes := review.Spec.ResourceAttributes
-	if attributes == nil {
-		return false
-	}
+	attributes := spec.resource
 	if attributes.Verb != "list" && attributes.Verb != "watch" {
 		return false
 	}
 	if attributes.Resource != "namespaces" {
 		return false
 	}
-	return attributes.Group == "" && attributes.Namespace == "" && attributes.Name == "" && attributes.Subresource == ""
+	return attributes.Group == "" && attributes.Namespace == "" &&
+		attributes.Name == "" && attributes.Subresource == ""
+}
+
+// reviewJSON returns the SelfSubjectAccessReview body of a JSON client.
+func reviewJSON(attributes resourceAttributes) ([]byte, error) {
+	type spec struct {
+		ResourceAttributes resourceAttributes `json:"resourceAttributes"`
+	}
+	return json.Marshal(struct {
+		APIVersion string `json:"apiVersion"`
+		Kind       string `json:"kind"`
+		Spec       spec   `json:"spec"`
+	}{
+		APIVersion: "authorization.k8s.io/v1",
+		Kind:       "SelfSubjectAccessReview",
+		Spec:       spec{ResourceAttributes: attributes},
+	})
 }
 
 // grantReview sets status.allowed to true. It reports whether it changed the body.
