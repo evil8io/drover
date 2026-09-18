@@ -53,36 +53,8 @@ jobs:
             echo "TAGS_EOF"
           } >> "$GITHUB_OUTPUT"
 
-  chart:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: azure/setup-helm@v5
-        with:
-          version: v4.3.0
-
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-
-      - run: helm plugin install https://github.com/helm-unittest/helm-unittest.git --version v1.1.2 --verify=false
-
-      - run: helm lint --strict charts/rancher-namespace-filter -f charts/rancher-namespace-filter/ci/default-values.yaml
-
-      - run: helm lint --strict charts/rancher-namespace-filter -f charts/rancher-namespace-filter/ci/existing-secret-values.yaml
-
-      - run: helm lint --strict charts/rancher-namespace-filter -f charts/rancher-namespace-filter/ci/httproute-values.yaml
-
-      - run: helm unittest charts/rancher-namespace-filter
-
-      # The schema requires upstream.url, so a template render without values must fail.
-      - run: '! helm template charts/rancher-namespace-filter'
-
-      - run: helm template rnf charts/rancher-namespace-filter -f charts/rancher-namespace-filter/ci/httproute-values.yaml | go run github.com/yannh/kubeconform/cmd/kubeconform@v0.8.0 -strict -summary -kubernetes-version 1.33.0 -schema-location default -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
-
   image:
-    needs: [go, chart]
+    needs: [go]
     permissions:
       contents: read
       packages: write

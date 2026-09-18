@@ -1,5 +1,3 @@
-// Command rancher-namespace-filter is an HTTP reverse proxy in front of a
-// Rancher server.
 package main
 
 import (
@@ -18,32 +16,25 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/evil8io/rancher-namespace-filter/internal/filter"
+	"github.com/evil8io/drover/internal/filter"
 )
 
-var version = "dev"
-
 type config struct {
-	listen      string
-	upstream    *url.URL
-	caFile      string
-	tokenFile   string
-	cacheTTL    time.Duration
-	logLevel    slog.Level
-	showVersion bool
+	listen    string
+	upstream  *url.URL
+	caFile    string
+	tokenFile string
+	cacheTTL  time.Duration
+	logLevel  slog.Level
 }
 
-func main() {
-	cfg, err := parseConfig(os.Args[1:], os.Stderr)
+func runNamespaceFilter(args []string) int {
+	cfg, err := parseConfig(args, os.Stderr)
 	if err != nil {
 		if !errors.Is(err, flag.ErrHelp) {
 			fmt.Fprintln(os.Stderr, err)
 		}
-		os.Exit(2)
-	}
-	if cfg.showVersion {
-		fmt.Println(version)
-		return
+		return 2
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.logLevel}))
@@ -56,7 +47,7 @@ func main() {
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(2)
+		return 2
 	}
 
 	baseCtx, cancelBase := context.WithCancel(context.Background())
@@ -88,7 +79,7 @@ func main() {
 	case err := <-serveErr:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("the server stopped", "error", err.Error())
-			os.Exit(1)
+			return 1
 		}
 	case <-signalCtx.Done():
 		stop()
@@ -99,10 +90,11 @@ func main() {
 			logger.Warn("the shutdown did not complete", "error", err.Error())
 		}
 	}
+	return 0
 }
 
 func parseConfig(args []string, output io.Writer) (config, error) {
-	flags := flag.NewFlagSet("rancher-namespace-filter", flag.ContinueOnError)
+	flags := flag.NewFlagSet("drover namespace-filter", flag.ContinueOnError)
 	flags.SetOutput(output)
 
 	var (
@@ -116,13 +108,9 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	flags.StringVar(&cfg.tokenFile, "token-file", "", "file with the API token of the service user")
 	flags.DurationVar(&cfg.cacheTTL, "cache-ttl", 15*time.Second, "lifetime of a cached allowed set")
 	flags.StringVar(&logLevel, "log-level", "info", "debug, info, warn or error")
-	flags.BoolVar(&cfg.showVersion, "version", false, "print the version and exit")
 
 	if err := flags.Parse(args); err != nil {
 		return config{}, err
-	}
-	if cfg.showVersion {
-		return cfg, nil
 	}
 
 	level, err := parseLevel(logLevel)

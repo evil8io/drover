@@ -1,4 +1,0 @@
-upstream:
-  url: http://rancher.cattle-system.svc
-token:
-  value: api-token

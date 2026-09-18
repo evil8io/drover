@@ -4,20 +4,7 @@
   "include-component-in-tag": false,
   "initial-version": "0.1.0",
   "packages": {
-    ".": {
-      "extra-files": [
-        {
-          "jsonpath": "$.version",
-          "path": "charts/rancher-namespace-filter/Chart.yaml",
-          "type": "yaml"
-        },
-        {
-          "jsonpath": "$.appVersion",
-          "path": "charts/rancher-namespace-filter/Chart.yaml",
-          "type": "yaml"
-        }
-      ]
-    }
+    ".": {}
   },
   "release-type": "go"
 }

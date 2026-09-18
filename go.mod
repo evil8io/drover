@@ -1,3 +1,3 @@
-module github.com/evil8io/rancher-namespace-filter
+module github.com/evil8io/drover
 
 go 1.27
