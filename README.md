@@ -134,6 +134,10 @@ A CronJob is the normal caller, because most runs find a valid token and exit 0.
 | `--kube-url` | (in-cluster) | Kubernetes API URL. The default comes from `KUBERNETES_SERVICE_HOST` and `KUBERNETES_SERVICE_PORT`. |
 | `--kube-service-account-dir` | `/var/run/secrets/kubernetes.io/serviceaccount` | Directory with the ServiceAccount token and `ca.crt`. |
 | `--log-level` | `info` | One of `debug`, `info`, `warn`, or `error`. |
+| `--otlp-endpoint` | `$OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint, `host:port` or a URL. Empty turns telemetry off. |
+| `--otlp-traces` | `true` | Send traces to the OTLP endpoint. |
+| `--otlp-metrics` | `true` | Send metrics to the OTLP endpoint. |
+| `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | `service.name` resource attribute. |
 
 The exit code is 0 after a valid token and after a rotation, 1 after a failure, and 2 after a flag error.
 
@@ -156,6 +160,15 @@ The Secret must exist before the first run. The command reads the ServiceAccount
 ### Logging
 
 The command writes JSON logs to stderr, one line per step. Each line has a `step` field and an `outcome` field. The command never logs a token, a token key, or the password.
+
+### Telemetry
+
+With `--otlp-endpoint` set, one run produces a span named `rotate`, with a child span for each step: `secret_get`, `token_check`, `login`, `token_create`, `secret_patch`, `token_prune`, and `logout`. The command flushes traces and metrics before it exits, within a 5 s grace period. It exports these metrics:
+
+| Metric | Kind | Unit | Attributes |
+| --- | --- | --- | --- |
+| `drover.rotate.steps` | Counter | `1` | `step`, `outcome` |
+| `drover.rotate.duration` | Histogram | `s` | |
 
 ## project-sync
 
@@ -180,6 +193,10 @@ The service writes a warning with the cluster id and continues with the next clu
 | `--interval` | `60s` | Time between two runs. |
 | `--listen` | `:8080` | Address the service listens on. |
 | `--log-level` | `info` | One of `debug`, `info`, `warn`, or `error`. |
+| `--otlp-endpoint` | `$OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint, `host:port` or a URL. Empty turns telemetry off. |
+| `--otlp-traces` | `true` | Send traces to the OTLP endpoint. |
+| `--otlp-metrics` | `true` | Send metrics to the OTLP endpoint. |
+| `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | `service.name` resource attribute. |
 
 The flags need at least one label key or one annotation key. A key under `field.cattle.io/`, `cattle.io/`, `kubernetes.io/`, or `k8s.io/` is not valid, because Rancher and Kubernetes own those prefixes.
 
@@ -190,6 +207,17 @@ The service starts with no token file. It skips the run until the file has a tok
 ### Design
 
 The service polls `GET /v3/projects` at every interval, and it opens no watch. One call per interval returns every project that the service user sees, because Rancher filters that list by RBAC. The service needs no cluster list of its own, and no watch connection per cluster. The service never removes a key from a namespace, because a tenant sets its own keys there, and the project does not define them. A patch with only the configured keys keeps those tenant keys. The standard library is enough for the work: the service needs an HTTP client, a JSON decoder, and a ticker.
+
+### Telemetry
+
+With `--otlp-endpoint` set, one reconcile run produces a span named `reconcile`. The service exports these metrics:
+
+| Metric | Kind | Unit | Attributes |
+| --- | --- | --- | --- |
+| `drover.sync.reconciles` | Counter | `1` | `outcome` |
+| `drover.sync.namespaces.patched` | Counter | `1` | |
+| `drover.sync.errors` | Counter | `1` | |
+| `drover.sync.duration` | Histogram | `s` | |
 
 ## Development
 

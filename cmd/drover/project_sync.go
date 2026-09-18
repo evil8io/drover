@@ -27,10 +27,11 @@ type projectSyncConfig struct {
 	annotations []string
 	interval    time.Duration
 	logLevel    slog.Level
+	telemetry   telemetry.Config
 }
 
 func runProjectSync(args []string) int {
-	cfg, err := parseProjectSyncConfig(args, os.Stderr)
+	cfg, err := parseProjectSyncConfig(args, os.Stderr, os.Getenv)
 	if err != nil {
 		if !errors.Is(err, flag.ErrHelp) {
 			fmt.Fprintln(os.Stderr, err)
@@ -39,6 +40,19 @@ func runProjectSync(args []string) int {
 	}
 
 	logger := slog.New(telemetry.NewLogHandler(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.logLevel})))
+
+	tel, err := telemetry.Setup(context.Background(), cfg.telemetry)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), telemetryShutdownGrace)
+		defer cancel()
+		if err := tel.Shutdown(shutdownCtx); err != nil {
+			logger.Error("the telemetry shutdown failed", "error", err.Error())
+		}
+	}()
 
 	syncer, err := projectsync.New(projectsync.Config{
 		RancherURL:  cfg.rancherURL,
@@ -105,7 +119,7 @@ func runProjectSync(args []string) int {
 	return 0
 }
 
-func parseProjectSyncConfig(args []string, output io.Writer) (projectSyncConfig, error) {
+func parseProjectSyncConfig(args []string, output io.Writer, getenv func(string) string) (projectSyncConfig, error) {
 	flags := flag.NewFlagSet("drover project-sync", flag.ContinueOnError)
 	flags.SetOutput(output)
 
@@ -124,6 +138,7 @@ func parseProjectSyncConfig(args []string, output io.Writer) (projectSyncConfig,
 	flags.StringVar(&annotations, "annotations", "", "comma-separated annotation keys of a project to copy")
 	flags.DurationVar(&cfg.interval, "interval", 60*time.Second, "time between two runs")
 	flags.StringVar(&logLevel, "log-level", "info", "debug, info, warn or error")
+	tf := registerTelemetryFlags(flags, getenv)
 
 	if err := flags.Parse(args); err != nil {
 		return projectSyncConfig{}, err
@@ -134,6 +149,7 @@ func parseProjectSyncConfig(args []string, output io.Writer) (projectSyncConfig,
 		return projectSyncConfig{}, err
 	}
 	cfg.logLevel = level
+	cfg.telemetry = tf.config()
 
 	target, err := parseRancherURL("-rancher-url", rancherURL)
 	if err != nil {

@@ -12,6 +12,10 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // Transport returns the transport of a Rancher client. An empty caFile selects
@@ -42,6 +46,16 @@ func Transport(caFile string) (*http.Transport, error) {
 	}
 	tr.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
 	return tr, nil
+}
+
+// WrapTransport wraps base with otelhttp, so every request through it is a
+// span and reports client metrics. A nil meterProvider selects
+// otel.GetMeterProvider().
+func WrapTransport(base http.RoundTripper, meterProvider metric.MeterProvider) http.RoundTripper {
+	if meterProvider == nil {
+		meterProvider = otel.GetMeterProvider()
+	}
+	return otelhttp.NewTransport(base, otelhttp.WithMeterProvider(meterProvider))
 }
 
 // ErrTokenUnavailable marks a ReadToken failure that a later read recovers

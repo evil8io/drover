@@ -54,7 +54,11 @@ func (r *rotator) kubeToken() (string, error) {
 
 // secretToken returns the token in the Secret. The result is empty when the key
 // is absent or empty.
-func (r *rotator) secretToken(ctx context.Context) (string, error) {
+func (r *rotator) secretToken(ctx context.Context) (_ string, err error) {
+	ctx, end := r.step(ctx, stepSecretGet)
+	var outcome string
+	defer func() { end(outcome, err) }()
+
 	status, data, err := r.kubeDo(ctx, http.MethodGet, r.secretPath(), "", nil)
 	if err != nil {
 		return "", fmt.Errorf("read the Secret %s: %w", r.secretRef(), err)
@@ -76,14 +80,14 @@ func (r *rotator) secretToken(ctx context.Context) (string, error) {
 
 	token := ""
 	if encoded := secret.Data[r.cfg.Key]; encoded != "" {
-		raw, err := base64.StdEncoding.DecodeString(encoded)
-		if err != nil {
-			return "", fmt.Errorf("decode the key %s of the Secret %s: %w", r.cfg.Key, r.secretRef(), err)
+		raw, decodeErr := base64.StdEncoding.DecodeString(encoded)
+		if decodeErr != nil {
+			return "", fmt.Errorf("decode the key %s of the Secret %s: %w", r.cfg.Key, r.secretRef(), decodeErr)
 		}
 		token = strings.TrimSpace(string(raw))
 	}
 
-	outcome := "empty"
+	outcome = "empty"
 	if token != "" {
 		outcome = "present"
 	}
@@ -91,7 +95,10 @@ func (r *rotator) secretToken(ctx context.Context) (string, error) {
 	return token, nil
 }
 
-func (r *rotator) patchSecret(ctx context.Context, token string) error {
+func (r *rotator) patchSecret(ctx context.Context, token string) (err error) {
+	ctx, end := r.step(ctx, stepSecretPatch)
+	defer func() { end(outcomeOK, err) }()
+
 	body := map[string]map[string]string{"stringData": {r.cfg.Key: token}}
 	status, _, err := r.kubeDo(ctx, http.MethodPatch, r.secretPath(), mergePatchType, body)
 	if err != nil {

@@ -174,6 +174,93 @@ func TestParseRotateConfigInCluster(t *testing.T) {
 	}
 }
 
+func TestParseRotateConfigTelemetryDefaults(t *testing.T) {
+	t.Parallel()
+	credentials := credentialsDir(t, map[string]string{"username": "drover\n", "password": "secret\n"})
+
+	cfg, err := parseRotateConfig([]string{
+		"--rancher-url", "https://rancher.example.com",
+		"--credentials-dir", credentials,
+		"--token-secret", "cattle-system/drover-token",
+		"--kube-url", "https://kubernetes.default.svc",
+	}, io.Discard, noEnvironment)
+	if err != nil {
+		t.Fatalf("parseRotateConfig: %v", err)
+	}
+	if cfg.telemetry.Endpoint != "" {
+		t.Errorf("otlp endpoint = %q, want empty", cfg.telemetry.Endpoint)
+	}
+	if !cfg.telemetry.Traces {
+		t.Error("otlp traces = false, want true")
+	}
+	if !cfg.telemetry.Metrics {
+		t.Error("otlp metrics = false, want true")
+	}
+	if cfg.telemetry.ServiceName != "drover" {
+		t.Errorf("service name = %q, want drover", cfg.telemetry.ServiceName)
+	}
+	if cfg.telemetry.Version != version {
+		t.Errorf("telemetry version = %q, want %q", cfg.telemetry.Version, version)
+	}
+}
+
+func TestParseRotateConfigTelemetryFlags(t *testing.T) {
+	t.Parallel()
+	credentials := credentialsDir(t, map[string]string{"username": "drover\n", "password": "secret\n"})
+
+	cfg, err := parseRotateConfig([]string{
+		"--rancher-url", "https://rancher.example.com",
+		"--credentials-dir", credentials,
+		"--token-secret", "cattle-system/drover-token",
+		"--kube-url", "https://kubernetes.default.svc",
+		"--otlp-endpoint", "collector:4317",
+		"--otlp-traces=false",
+		"--otlp-metrics=false",
+		"--service-name", "custom",
+	}, io.Discard, noEnvironment)
+	if err != nil {
+		t.Fatalf("parseRotateConfig: %v", err)
+	}
+	if cfg.telemetry.Endpoint != "collector:4317" {
+		t.Errorf("otlp endpoint = %q, want collector:4317", cfg.telemetry.Endpoint)
+	}
+	if cfg.telemetry.Traces {
+		t.Error("otlp traces = true, want false")
+	}
+	if cfg.telemetry.Metrics {
+		t.Error("otlp metrics = true, want false")
+	}
+	if cfg.telemetry.ServiceName != "custom" {
+		t.Errorf("service name = %q, want custom", cfg.telemetry.ServiceName)
+	}
+}
+
+func TestParseRotateConfigTelemetryFromEnvironment(t *testing.T) {
+	t.Parallel()
+	credentials := credentialsDir(t, map[string]string{"username": "drover\n", "password": "secret\n"})
+	environment := map[string]string{
+		"OTEL_EXPORTER_OTLP_ENDPOINT": "collector:4317",
+		"OTEL_SERVICE_NAME":           "custom",
+	}
+	getenv := func(name string) string { return environment[name] }
+
+	cfg, err := parseRotateConfig([]string{
+		"--rancher-url", "https://rancher.example.com",
+		"--credentials-dir", credentials,
+		"--token-secret", "cattle-system/drover-token",
+		"--kube-url", "https://kubernetes.default.svc",
+	}, io.Discard, getenv)
+	if err != nil {
+		t.Fatalf("parseRotateConfig: %v", err)
+	}
+	if cfg.telemetry.Endpoint != "collector:4317" {
+		t.Errorf("otlp endpoint = %q, want collector:4317", cfg.telemetry.Endpoint)
+	}
+	if cfg.telemetry.ServiceName != "custom" {
+		t.Errorf("service name = %q, want custom", cfg.telemetry.ServiceName)
+	}
+}
+
 func TestRunDispatchesRotateToken(t *testing.T) {
 	t.Parallel()
 	if _, ok := subcommands["rotate-token"]; !ok {

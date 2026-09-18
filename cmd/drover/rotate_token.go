@@ -41,6 +41,7 @@ type rotateConfig struct {
 	keep          int
 	description   string
 	logLevel      slog.Level
+	telemetry     telemetry.Config
 }
 
 func runRotateToken(args []string) int {
@@ -53,6 +54,19 @@ func runRotateToken(args []string) int {
 	}
 
 	logger := slog.New(telemetry.NewLogHandler(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.logLevel})))
+
+	tel, err := telemetry.Setup(context.Background(), cfg.telemetry)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), telemetryShutdownGrace)
+		defer cancel()
+		if err := tel.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("the telemetry shutdown failed", "error", err.Error())
+		}
+	}()
 
 	rancherClient, err := rotate.NewClient(cfg.rancherCAFile)
 	if err != nil {
@@ -121,6 +135,7 @@ func parseRotateConfig(args []string, output io.Writer, getenv func(string) stri
 	flags.StringVar(&serviceAccount, "kube-service-account-dir", defaultServiceAccountDir,
 		"directory with the ServiceAccount token and ca.crt")
 	flags.StringVar(&logLevel, "log-level", "info", "debug, info, warn or error")
+	tf := registerTelemetryFlags(flags, getenv)
 
 	if err := flags.Parse(args); err != nil {
 		return rotateConfig{}, err
@@ -131,6 +146,7 @@ func parseRotateConfig(args []string, output io.Writer, getenv func(string) stri
 		return rotateConfig{}, err
 	}
 	cfg.logLevel = level
+	cfg.telemetry = tf.config()
 
 	if rancherURL == "" {
 		return rotateConfig{}, errors.New("-rancher-url is required")

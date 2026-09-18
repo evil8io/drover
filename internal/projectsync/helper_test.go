@@ -174,15 +174,16 @@ func (b *syncBuffer) String() string {
 }
 
 // newSyncer returns a syncer that copies the labels cost-center and tier, and
-// the annotation owner.
-func newSyncer(t *testing.T, rancher *fakeRancher, tokenFile string) (*Syncer, *syncBuffer) {
+// the annotation owner. Each opt can override a field of the Config, for
+// example the MeterProvider or the TracerProvider.
+func newSyncer(t *testing.T, rancher *fakeRancher, tokenFile string, opts ...func(*Config)) (*Syncer, *syncBuffer) {
 	t.Helper()
 	target, err := url.Parse(rancher.server.URL)
 	if err != nil {
 		t.Fatalf("parse the server URL: %v", err)
 	}
 	logs := &syncBuffer{}
-	syncer, err := New(Config{
+	cfg := Config{
 		RancherURL:  target,
 		TokenFile:   tokenFile,
 		Labels:      []string{"cost-center", "tier"},
@@ -190,7 +191,11 @@ func newSyncer(t *testing.T, rancher *fakeRancher, tokenFile string) (*Syncer, *
 		Interval:    time.Second,
 		Logger:      slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		Version:     "test",
-	})
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	syncer, err := New(cfg)
 	if err != nil {
 		t.Fatalf("new syncer: %v", err)
 	}
