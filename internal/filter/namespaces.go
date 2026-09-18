@@ -124,9 +124,13 @@ func (s *service) logList(ctx context.Context, start time.Time, result listResul
 	level := slog.LevelInfo
 	if result.err != nil {
 		attrs = append(attrs, "error", result.err.Error())
-		level = slog.LevelError
-		if errors.Is(result.err, context.Canceled) {
+		switch {
+		case errors.Is(result.err, context.Canceled):
 			level = slog.LevelDebug
+		case errors.Is(result.err, errTokenUnavailable):
+			level = slog.LevelWarn
+		default:
+			level = slog.LevelError
 		}
 	}
 	s.logger.Log(ctx, level, "namespaces", attrs...)

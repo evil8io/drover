@@ -21,7 +21,6 @@ func tokenFile(t *testing.T, content string) string {
 func TestParseConfigErrors(t *testing.T) {
 	t.Parallel()
 	token := tokenFile(t, "token\n")
-	empty := tokenFile(t, "")
 
 	tests := []struct {
 		name string
@@ -32,8 +31,6 @@ func TestParseConfigErrors(t *testing.T) {
 		{"upstream with a path", []string{"--upstream", "https://rancher.example.com/rancher", "--token-file", token}},
 		{"upstream with another scheme", []string{"--upstream", "ftp://rancher.example.com", "--token-file", token}},
 		{"upstream without a host", []string{"--upstream", "https://", "--token-file", token}},
-		{"token file that does not exist", []string{"--upstream", "https://rancher.example.com", "--token-file", token + ".missing"}},
-		{"empty token file", []string{"--upstream", "https://rancher.example.com", "--token-file", empty}},
 		{"unknown log level", []string{"--upstream", "https://rancher.example.com", "--token-file", token, "--log-level", "trace"}},
 		{"version is not a subcommand flag", []string{"--version"}},
 	}
@@ -44,6 +41,46 @@ func TestParseConfigErrors(t *testing.T) {
 				t.Errorf("parseConfig(%v) returned no error", test.args)
 			}
 		})
+	}
+}
+
+func TestParseConfigAcceptsAbsentTokenFile(t *testing.T) {
+	t.Parallel()
+	token := tokenFile(t, "token\n")
+	missing := token + ".missing"
+	empty := tokenFile(t, "")
+
+	for _, path := range []string{missing, empty} {
+		cfg, err := parseConfig([]string{
+			"--upstream", "https://rancher.example.com",
+			"--token-file", path,
+		}, io.Discard)
+		if err != nil {
+			t.Fatalf("parseConfig with token file %q: %v", path, err)
+		}
+		if cfg.tokenFile != path {
+			t.Errorf("token file = %q, want %q", cfg.tokenFile, path)
+		}
+	}
+}
+
+func TestTokenFileReady(t *testing.T) {
+	t.Parallel()
+	token := tokenFile(t, "token\n")
+	empty := tokenFile(t, "")
+	blank := tokenFile(t, "  \n")
+
+	if !tokenFileReady(token) {
+		t.Error("tokenFileReady with a token, want true")
+	}
+	if tokenFileReady(token + ".missing") {
+		t.Error("tokenFileReady with an absent file, want false")
+	}
+	if tokenFileReady(empty) {
+		t.Error("tokenFileReady with an empty file, want false")
+	}
+	if tokenFileReady(blank) {
+		t.Error("tokenFileReady with a blank file, want false")
 	}
 }
 
