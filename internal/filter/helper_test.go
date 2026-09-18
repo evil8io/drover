@@ -15,7 +15,21 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"go.opentelemetry.io/otel/metric/noop"
 )
+
+// testMetrics returns a *metrics whose instruments record into a
+// MeterProvider that drops every measurement, for a test that does not
+// assert on the filter metrics.
+func testMetrics(t *testing.T) *metrics {
+	t.Helper()
+	m, err := newMetrics(noop.NewMeterProvider())
+	if err != nil {
+		t.Fatalf("new metrics: %v", err)
+	}
+	return m
+}
 
 const (
 	listPath    = "/k8s/clusters/c-1/api/v1/namespaces"

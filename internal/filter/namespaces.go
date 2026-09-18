@@ -85,7 +85,7 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 	if watch && filtered.StatusCode == http.StatusOK {
 		filtered.Body = filterWatchBody(req.Context(), filtered.Body, func(name string, labels map[string]string) bool {
 			return s.allowedNamespace(req.Context(), cluster, req.Header, name, labels)
-		}, s.logger, s.watches)
+		}, s.logger, s.watches, s.metrics, cluster)
 		// A dropped event changes the byte count, so the length of upstream no
 		// longer applies.
 		filtered.ContentLength = -1
@@ -155,11 +155,14 @@ func (s *Service) statusError(req *http.Request, start time.Time, result listRes
 }
 
 func (s *Service) logList(ctx context.Context, start time.Time, result listResult) {
+	duration := s.now().Sub(start)
+	s.metrics.recordRequest(ctx, result, duration)
+
 	attrs := []any{"cluster", result.cluster, "outcome", result.outcome, "status", result.status}
 	if result.outcome == outcomeFiltered {
 		attrs = append(attrs, "count", result.count)
 	}
-	attrs = append(attrs, "watch", result.watch, "duration_ms", s.now().Sub(start).Milliseconds())
+	attrs = append(attrs, "watch", result.watch, "duration_ms", duration.Milliseconds())
 
 	level := slog.LevelInfo
 	if result.err != nil {

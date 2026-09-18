@@ -17,7 +17,11 @@ import (
 	"time"
 
 	"github.com/evil8io/drover/internal/filter"
+	"github.com/evil8io/drover/internal/telemetry"
 )
+
+// telemetryShutdownGrace is the time that runNamespaceFilter gives Telemetry.Shutdown.
+const telemetryShutdownGrace = 5 * time.Second
 
 type config struct {
 	listen        string
@@ -27,10 +31,11 @@ type config struct {
 	cacheTTL      time.Duration
 	logLevel      slog.Level
 	shutdownGrace time.Duration
+	telemetry     telemetry.Config
 }
 
 func runNamespaceFilter(args []string) int {
-	cfg, err := parseConfig(args, os.Stderr)
+	cfg, err := parseConfig(args, os.Stderr, os.Getenv)
 	if err != nil {
 		if !errors.Is(err, flag.ErrHelp) {
 			fmt.Fprintln(os.Stderr, err)
@@ -38,10 +43,23 @@ func runNamespaceFilter(args []string) int {
 		return 2
 	}
 
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.logLevel}))
+	logger := slog.New(telemetry.NewLogHandler(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.logLevel})))
 	if !tokenFileReady(cfg.tokenFile) {
 		logger.Warn("the token file is not available yet", "path", cfg.tokenFile)
 	}
+
+	tel, err := telemetry.Setup(context.Background(), cfg.telemetry)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), telemetryShutdownGrace)
+		defer cancel()
+		if err := tel.Shutdown(shutdownCtx); err != nil {
+			logger.Error("the telemetry shutdown failed", "error", err.Error())
+		}
+	}()
 
 	svc, err := filter.New(filter.Config{
 		Upstream:  cfg.upstream,
@@ -103,7 +121,7 @@ func runNamespaceFilter(args []string) int {
 	return 0
 }
 
-func parseConfig(args []string, output io.Writer) (config, error) {
+func parseConfig(args []string, output io.Writer, getenv func(string) string) (config, error) {
 	flags := flag.NewFlagSet("drover namespace-filter", flag.ContinueOnError)
 	flags.SetOutput(output)
 
@@ -119,6 +137,7 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	flags.DurationVar(&cfg.cacheTTL, "cache-ttl", 15*time.Second, "lifetime of a cached allowed set")
 	flags.StringVar(&logLevel, "log-level", "info", "debug, info, warn or error")
 	flags.DurationVar(&cfg.shutdownGrace, "shutdown-grace", 20*time.Second, "grace period for the shutdown after SIGTERM or SIGINT")
+	tf := registerTelemetryFlags(flags, getenv)
 
 	if err := flags.Parse(args); err != nil {
 		return config{}, err
@@ -129,6 +148,7 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 		return config{}, err
 	}
 	cfg.logLevel = level
+	cfg.telemetry = tf.config()
 
 	target, err := parseRancherURL("-upstream", upstream)
 	if err != nil {

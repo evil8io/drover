@@ -53,6 +53,10 @@ The service reads the body of a `selfsubjectaccessreviews` request. When the rev
 | `--cache-ttl` | `15s` | Lifetime of a cached allowed set. |
 | `--log-level` | `info` | One of `debug`, `info`, `warn`, or `error`. |
 | `--shutdown-grace` | `20s` | Grace period for the shutdown after SIGTERM or SIGINT. |
+| `--otlp-endpoint` | `$OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint, `host:port` or a URL. Empty turns telemetry off. |
+| `--otlp-traces` | `true` | Send traces to the OTLP endpoint. |
+| `--otlp-metrics` | `true` | Send metrics to the OTLP endpoint. |
+| `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | `service.name` resource attribute. |
 
 The upstream is the Rancher Service inside the cluster, for example `http://rancher.cattle-system.svc`. The public hostname is not a valid upstream, because the route sends the two filtered paths back to the service.
 
@@ -82,6 +86,19 @@ A review log line has these fields: `cluster`, `outcome` (`passthrough`, `native
 The service never logs a token, a cookie, a header value, or a request body. It logs a namespace name at the `debug` level only.
 
 The service writes a `warn` line when the privileged list request gets a 403 error. The cause is a `cluster-owner` binding that the service user does not have.
+
+A log line has `trace_id` and `span_id` when the request has a span.
+
+### Telemetry
+
+The service continues an incoming `traceparent` on every request. It starts a span when the header is absent. A request span has a child span for the Steve call, the project list, the privileged list, and the privileged watch. With `--otlp-endpoint` set, the service also exports these metrics:
+
+| Metric | Kind | Unit | Attributes |
+| --- | --- | --- | --- |
+| `drover.filter.requests` | Counter | `1` | `outcome`, `cluster`, `watch` |
+| `drover.filter.request.duration` | Histogram | `s` | `outcome`, `cluster`, `watch` |
+| `drover.filter.watches.open` | Up-down counter | `1` | |
+| `drover.filter.events.dropped` | Counter | `1` | `cluster` |
 
 ### Shutdown
 

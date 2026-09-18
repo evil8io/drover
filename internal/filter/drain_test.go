@@ -72,7 +72,7 @@ func TestDrainEndsWatchWithEOF(t *testing.T) {
 
 	registry := newWatchRegistry()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reader := filterWatchBody(context.Background(), upstream, allowAll, logger, registry)
+	reader := filterWatchBody(context.Background(), upstream, allowAll, logger, registry, testMetrics(t), "c-1")
 
 	if got := registry.len(); got != 1 {
 		t.Fatalf("registry length = %d, want 1", got)
