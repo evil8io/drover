@@ -1,10 +1,20 @@
-# rancher-namespace-filter
+# drover
+
+drover is a set of tenancy extensions for Rancher. It is one binary, with one subcommand per component.
+
+## Subcommands
+
+| Subcommand | Meaning |
+| --- | --- |
+| `namespace-filter` | A reverse proxy that answers the namespace list of a Rancher project member. |
+
+## namespace-filter
 
 A filter in front of Rancher that lets a tenant list only the namespaces of its projects, with kubectl, k9s, and other Kubernetes clients.
 
 Rancher grants a project member `get` on the namespaces of its projects, and no `list`. A `kubectl get ns` request through a Rancher kubeconfig gets a 403 error, while `kubectl get ns <name>` works. This service is an HTTP reverse proxy in front of Rancher. A Gateway or an Ingress routes two paths to the service, and every other path goes to Rancher directly.
 
-## How it works
+### How it works
 
 The service handles two request patterns from a Rancher kubeconfig. It passes every other request to Rancher unchanged.
 
@@ -22,16 +32,14 @@ A watch request (`?watch=true`) streams over chunked HTTP. A websocket upgrade s
 
 The service reads the body of a `selfsubjectaccessreviews` request. When the review asks about a list or a watch on namespaces at cluster scope, the service sends the request with the caller's own credentials. A denied response then gets `allowed: true`. Every other review passes through unchanged.
 
-## Requirements
+### Requirements
 
 1. A Rancher service user with a `cluster-owner` binding on every cluster whose tenants use the filter.
 2. An API token of that service user. The token has no scope.
 3. The token in a Secret, mounted into the service.
 4. Two `Exact` path matches per cluster id, on the Rancher hostname, that route to the service.
 
-The Helm chart renders this route from `httpRoute.clusterIds`, with one `GET` match on the namespace path and one `POST` match on the review path for each id. An `Exact` match takes precedence over the `PathPrefix /` match of the Rancher route.
-
-## Configuration
+### Configuration
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -41,25 +49,14 @@ The Helm chart renders this route from `httpRoute.clusterIds`, with one `GET` ma
 | `--token-file` | (required) | File with the API token of the Rancher service user. |
 | `--cache-ttl` | `15s` | Lifetime of a cached allowed set. |
 | `--log-level` | `info` | One of `debug`, `info`, `warn`, or `error`. |
-| `--version` | | Print the version and exit. |
 
 The upstream is the Rancher Service inside the cluster, for example `http://rancher.cattle-system.svc`. The public hostname is not a valid upstream, because the route sends the two filtered paths back to the service.
 
 `GET /healthz` returns status 200 with body `ok`.
 
-## Helm chart
+A Helm chart for drover is published separately.
 
-The chart is an OCI artifact at `oci://ghcr.io/evil8io/charts/rancher-namespace-filter`, with the same version as the image. The image has these tags: `<version>`, `<major>.<minor>`, `latest`, and `main`.
-
-```
-helm install rancher-namespace-filter oci://ghcr.io/evil8io/charts/rancher-namespace-filter --version <version> --namespace <ns> --set upstream.url=http://rancher.cattle-system.svc --set token.existingSecret=<secret>
-```
-
-The chart needs two values: `upstream.url`, the Rancher Service inside the cluster, and `token.existingSecret` or `token.value`, the API token of the service user.
-
-By default, the chart deploys 2 replicas with a PodDisruptionBudget, a spread over nodes, and a rolling update with no gap. See `charts/rancher-namespace-filter/README.md` for the full values table.
-
-## Behaviour differences
+### Behaviour differences
 
 | Difference | Detail |
 | --- | --- |
@@ -68,7 +65,7 @@ By default, the chart deploys 2 replicas with a PodDisruptionBudget, a spread ov
 | Self-check | `kubectl auth can-i list namespaces` returns yes, while RBAC returns no. |
 | Trust level | The service is a privileged component. It uses the cluster-owner token only for the namespace list and the watch with the name selector. |
 
-## Logging
+### Logging
 
 The service writes JSON logs to stderr, one line per intercepted request.
 
@@ -87,22 +84,18 @@ Run these checks before every commit:
 1. `go test -race ./...`
 2. `go vet ./...`
 3. `gofmt -l .` (it must print nothing)
-4. `helm lint --strict charts/rancher-namespace-filter -f charts/rancher-namespace-filter/ci/default-values.yaml`
-5. `helm unittest charts/rancher-namespace-filter`
 
-Build the binary with `go build ./cmd/rancher-namespace-filter`.
+Build the binary with `go build ./cmd/drover`.
 
 Build the image with `docker build` or `podman build`. Pass the version with the `VERSION` build argument:
 
 ```
-podman build --build-arg VERSION=0.1.0 -t rancher-namespace-filter:0.1.0 .
+podman build --build-arg VERSION=0.3.0 -t drover:0.3.0 .
 ```
 
 ## Releases
 
 PR titles follow Conventional Commits. The project squash-merges every pull request. release-please reads the PR titles and opens a release pull request. A merge of that pull request creates a tag, a GitHub release, and the image tags for the new version.
-
-The release job also pushes the chart to `oci://ghcr.io/evil8io/charts/rancher-namespace-filter`, with the same version as the image. release-please bumps `Chart.yaml` in the release pull request.
 
 ## License
 

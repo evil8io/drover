@@ -20,7 +20,7 @@ import (
 
 const (
 	defaultCacheTTL = 15 * time.Second
-	serviceName     = "rancher-namespace-filter"
+	serviceName     = "drover"
 )
 
 // Config configures the handler that New returns.

@@ -35,6 +35,7 @@ func TestParseConfigErrors(t *testing.T) {
 		{"token file that does not exist", []string{"--upstream", "https://rancher.example.com", "--token-file", token + ".missing"}},
 		{"empty token file", []string{"--upstream", "https://rancher.example.com", "--token-file", empty}},
 		{"unknown log level", []string{"--upstream", "https://rancher.example.com", "--token-file", token, "--log-level", "trace"}},
+		{"version is not a subcommand flag", []string{"--version"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -74,16 +75,5 @@ func TestParseConfigValid(t *testing.T) {
 	}
 	if cfg.logLevel != slog.LevelDebug {
 		t.Errorf("log level = %s, want debug", cfg.logLevel)
-	}
-}
-
-func TestParseConfigVersion(t *testing.T) {
-	t.Parallel()
-	cfg, err := parseConfig([]string{"--version"}, io.Discard)
-	if err != nil {
-		t.Fatalf("parseConfig: %v", err)
-	}
-	if !cfg.showVersion {
-		t.Error("showVersion = false, want true")
 	}
 }
