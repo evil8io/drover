@@ -64,9 +64,14 @@ func (s *service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 	privileged := req.Clone(req.Context())
 	privileged.Header.Set("Authorization", "Bearer "+token)
 	privileged.Header.Del("Cookie")
-	query := privileged.URL.Query()
-	query.Set("labelSelector", mergeSelector(query.Get("labelSelector"), names))
-	privileged.URL.RawQuery = query.Encode()
+
+	if watch {
+		privileged.Header.Set("Accept", jsonContentType)
+	} else {
+		query := privileged.URL.Query()
+		query.Set("labelSelector", mergeSelector(query.Get("labelSelector"), names))
+		privileged.URL.RawQuery = query.Encode()
+	}
 
 	filtered, err := s.base.RoundTrip(privileged)
 	if err != nil {
@@ -74,6 +79,17 @@ func (s *service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 	}
 	if filtered.StatusCode == http.StatusForbidden {
 		s.logger.WarnContext(req.Context(), "the service token has no cluster-owner binding", "cluster", cluster)
+	}
+	// A plain watch stream is the only response the event filter reads. An
+	// upgraded connection has no JSON body, and an error status has no events.
+	if watch && filtered.StatusCode == http.StatusOK {
+		filtered.Body = filterWatchBody(req.Context(), filtered.Body, func(name string, labels map[string]string) bool {
+			return s.allowedNamespace(req.Context(), cluster, req.Header, name, labels)
+		}, s.logger)
+		// A dropped event changes the byte count, so the length of upstream no
+		// longer applies.
+		filtered.ContentLength = -1
+		filtered.Header.Del("Content-Length")
 	}
 	result.outcome, result.status, result.count = outcomeFiltered, filtered.StatusCode, len(names)
 	s.logList(req.Context(), start, result)

@@ -25,10 +25,11 @@ The service handles two request patterns from a Rancher kubeconfig. It passes ev
 1. The service sends the request to Rancher with the caller's own credentials.
 2. A status other than 403 goes back to the client unchanged.
 3. On a 403 error, the service requests the caller's allowed namespaces from Steve, the Rancher API server in the cluster agent.
-4. The service builds a new request with a service token, no cookie, and a label selector that matches only the allowed namespace names.
-5. The service sends the new request to Rancher and streams the response to the client.
+4. A plain list gets a new request with a service token, no cookie, and a label selector that matches only the allowed namespace names.
+5. A watch (`?watch=true`) gets a new request with a service token, no cookie, and the caller's own query, with no name filter.
+6. The service sends the new request to Rancher and streams the response to the client. For a watch, an event passes only when its namespace is in the allowed set or its `field.cattle.io/projectId` label matches a caller project.
 
-A watch request (`?watch=true`) streams over chunked HTTP. A websocket upgrade streams the same way, after the protocol switch.
+A watch request streams over chunked HTTP. A websocket upgrade streams the same way, after the protocol switch. A namespace that Rancher grants after the watch starts becomes visible within one cache TTL, because the event filter reads the allowed set through the same cache as a plain list.
 
 **Review access**
 
@@ -67,7 +68,7 @@ A Helm chart for drover is published separately.
 | Cache delay | A role change becomes visible after the cache TTL, on top of Rancher's own delay. |
 | Field selector | A field selector on a name outside the allowed set returns an empty list. A `get` on that name returns Forbidden. |
 | Self-check | `kubectl auth can-i list namespaces` returns yes, while RBAC returns no. |
-| Trust level | The service is a privileged component. It uses the cluster-owner token only for the namespace list and the watch with the name selector. |
+| Trust level | The service is a privileged component. It uses the cluster-owner token for the filtered namespace list and for the watch stream. |
 
 ### Logging
 

@@ -207,18 +207,37 @@ func callerHeader() http.Header {
 	return http.Header{"Authorization": []string{callerToken}}
 }
 
-// listUpstream routes the three requests of the list flow. The native attempt
-// gets 403.
+// listUpstream routes the four requests of the list flow. The native attempt
+// gets 403. The caller has no project, because most tests do not need one.
 func listUpstream(steve, privileged http.HandlerFunc) http.HandlerFunc {
+	return listUpstreamWithProjects(steve, projectsHandler(), privileged)
+}
+
+// listUpstreamWithProjects is listUpstream with the given project ids of the caller.
+func listUpstreamWithProjects(steve, projects, privileged http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == stevePath:
 			steve(w, r)
+		case r.URL.Path == projectsPath:
+			projects(w, r)
 		case r.Header.Get("Authorization") == serviceAuth:
 			privileged(w, r)
 		default:
 			http.Error(w, "forbidden", http.StatusForbidden)
 		}
+	}
+}
+
+// projectsHandler answers the caller's project ids, in the local cluster.
+func projectsHandler(ids ...string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		items := make([]string, 0, len(ids))
+		for _, id := range ids {
+			items = append(items, fmt.Sprintf(`{"id":"local:%s"}`, id))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, fmt.Sprintf(`{"type":"collection","data":[%s]}`, strings.Join(items, ",")))
 	}
 }
 
