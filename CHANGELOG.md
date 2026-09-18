@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/evil8io/drover/compare/v0.3.0...v0.3.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* read a protobuf access review ([#12](https://github.com/evil8io/drover/issues/12)) ([04f1289](https://github.com/evil8io/drover/commit/04f12898aeab3f2d29cbacc513920c70e822a78e))
+
 ## [0.3.0](https://github.com/evil8io/drover/compare/v0.2.0...v0.3.0) (2026-09-18)
 
 
