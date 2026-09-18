@@ -52,12 +52,13 @@ The service reads the body of a `selfsubjectaccessreviews` request. When the rev
 | `--token-file` | (required) | File with the API token of the Rancher service user. |
 | `--cache-ttl` | `15s` | Lifetime of a cached allowed set. |
 | `--log-level` | `info` | One of `debug`, `info`, `warn`, or `error`. |
+| `--shutdown-grace` | `20s` | Grace period for the shutdown after SIGTERM or SIGINT. |
 
 The upstream is the Rancher Service inside the cluster, for example `http://rancher.cattle-system.svc`. The public hostname is not a valid upstream, because the route sends the two filtered paths back to the service.
 
 The service starts with no token file and returns a 502 Status on a filtered request until the file gets a token.
 
-`GET /healthz` returns status 200 with body `ok`.
+`GET /healthz` returns status 200 with body `ok`, always. `GET /readyz` returns status 200 with body `ok` in normal operation, and status 503 with body `draining` after the shutdown starts.
 
 A Helm chart for drover is published separately.
 
@@ -81,6 +82,16 @@ A review log line has these fields: `cluster`, `outcome` (`passthrough`, `native
 The service never logs a token, a cookie, a header value, or a request body. It logs a namespace name at the `debug` level only.
 
 The service writes a `warn` line when the privileged list request gets a 403 error. The cause is a `cluster-owner` binding that the service user does not have.
+
+### Shutdown
+
+On SIGTERM or SIGINT, the service drains before it stops:
+
+1. It marks itself not ready. `/readyz` answers 503 from that point on.
+2. It ends every open watch stream with a clean end of the stream. A client re-lists and re-watches, with no error.
+3. It stops the HTTP server, within the `--shutdown-grace` period.
+
+The exit code is non-zero only when the server does not stop in time.
 
 ## rotate-token
 

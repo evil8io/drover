@@ -94,6 +94,7 @@ func TestParseConfigValid(t *testing.T) {
 		"--token-file", token,
 		"--cache-ttl", "30s",
 		"--log-level", "debug",
+		"--shutdown-grace", "5s",
 	}, io.Discard)
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
@@ -112,5 +113,24 @@ func TestParseConfigValid(t *testing.T) {
 	}
 	if cfg.logLevel != slog.LevelDebug {
 		t.Errorf("log level = %s, want debug", cfg.logLevel)
+	}
+	if cfg.shutdownGrace != 5*time.Second {
+		t.Errorf("shutdown grace = %s, want 5s", cfg.shutdownGrace)
+	}
+}
+
+func TestParseConfigShutdownGraceDefault(t *testing.T) {
+	t.Parallel()
+	token := tokenFile(t, "token\n")
+
+	cfg, err := parseConfig([]string{
+		"--upstream", "https://rancher.example.com",
+		"--token-file", token,
+	}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if cfg.shutdownGrace != 20*time.Second {
+		t.Errorf("shutdown grace = %s, want 20s", cfg.shutdownGrace)
 	}
 }
