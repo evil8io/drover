@@ -32,7 +32,7 @@ A watch request (`?watch=true`) streams over chunked HTTP. A websocket upgrade s
 
 **Review access**
 
-The service reads the body of a `selfsubjectaccessreviews` request. When the review asks about a list or a watch on namespaces at cluster scope, the service sends the request with the caller's own credentials. A denied response then gets `allowed: true`. Every other review passes through unchanged. The service reads a JSON review or a Kubernetes protobuf review, and it answers an intercepted review in JSON.
+The service reads the body of a `selfsubjectaccessreviews` request. When the review asks about a list or a watch on the namespaces resource, the service sends the request with the caller's own credentials. A review may name a namespace, because kubectl sends the namespace of the kubeconfig context even for this cluster-scoped resource. The service ignores that attribute. A denied response then gets `allowed: true`, and every other review passes through unchanged. The service reads a JSON review or a Kubernetes protobuf review, and it answers an intercepted review in JSON.
 
 ### Requirements
 
