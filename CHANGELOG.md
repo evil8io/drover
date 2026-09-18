@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/evil8io/drover/compare/v0.3.2...v0.4.0) (2026-09-18)
+
+
+### Features
+
+* filter a namespace watch by event, not by a fixed selector ([#16](https://github.com/evil8io/drover/issues/16)) ([bf4ff46](https://github.com/evil8io/drover/commit/bf4ff4683e2d46028525cf0a9f3f166b46f437d6))
+
 ## [0.3.2](https://github.com/evil8io/drover/compare/v0.3.1...v0.3.2) (2026-09-18)
 
 
