@@ -47,12 +47,21 @@ func (h *harness) postReview(t *testing.T, body []byte, header http.Header) (*ht
 
 func TestReviewGrantsNamespaceList(t *testing.T) {
 	t.Parallel()
-	for _, verb := range []string{"list", "watch"} {
-		t.Run(verb, func(t *testing.T) {
+	tests := []struct {
+		name       string
+		attributes string
+	}{
+		{"list", `"verb":"list","resource":"namespaces"`},
+		{"watch", `"verb":"watch","resource":"namespaces"`},
+		{"list/namespace", `"verb":"list","resource":"namespaces","namespace":"default"`},
+		{"watch/namespace", `"verb":"watch","resource":"namespaces","namespace":"default"`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			h := newHarness(t, reviewUpstream(deniedAnswer))
 
-			request := fmt.Sprintf(reviewTemplate, fmt.Sprintf(`"verb":%q,"resource":"namespaces"`, verb))
+			request := fmt.Sprintf(reviewTemplate, test.attributes)
 			resp, body := h.postReview(t, []byte(request), nil)
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("status = %d, want 200", resp.StatusCode)
@@ -121,8 +130,17 @@ func TestReviewKeepsAllowed(t *testing.T) {
 
 func TestReviewGrantsProtobufNamespaceList(t *testing.T) {
 	t.Parallel()
-	for _, verb := range []string{"list", "watch"} {
-		t.Run(verb, func(t *testing.T) {
+	tests := []struct {
+		name       string
+		attributes protoAttributes
+	}{
+		{"list", protoAttributes{verb: "list", resource: "namespaces"}},
+		{"watch", protoAttributes{verb: "watch", resource: "namespaces"}},
+		{"list/namespace", protoAttributes{verb: "list", resource: "namespaces", namespace: "default"}},
+		{"watch/namespace", protoAttributes{verb: "watch", resource: "namespaces", namespace: "default"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			h := newHarness(t, reviewUpstream(deniedAnswer))
 
@@ -130,7 +148,7 @@ func TestReviewGrantsProtobufNamespaceList(t *testing.T) {
 				"Content-Type": []string{protobufContentType},
 				"Accept":       []string{protobufContentType + ", */*"},
 			}
-			request := protobufReview(protoAttributes{verb: verb, resource: "namespaces"})
+			request := protobufReview(test.attributes)
 			resp, body := h.postReview(t, request, header)
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("status = %d, want 200", resp.StatusCode)
@@ -158,8 +176,12 @@ func TestReviewGrantsProtobufNamespaceList(t *testing.T) {
 			if len(sent) != 1 {
 				t.Fatalf("upstream requests = %d, want 1", len(sent))
 			}
+			wantAttributes := fmt.Sprintf(`"verb":%q,"resource":"namespaces"`, test.attributes.verb)
+			if test.attributes.namespace != "" {
+				wantAttributes = fmt.Sprintf(`"namespace":%q,%s`, test.attributes.namespace, wantAttributes)
+			}
 			wantBody := fmt.Sprintf(`{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectAccessReview",`+
-				`"spec":{"resourceAttributes":{"verb":%q,"resource":"namespaces"}}}`, verb)
+				`"spec":{"resourceAttributes":{%s}}}`, wantAttributes)
 			if string(sent[0].body) != wantBody {
 				t.Errorf("upstream body = %q, want %q", sent[0].body, wantBody)
 			}
@@ -185,8 +207,8 @@ func TestReviewPassesThrough(t *testing.T) {
 			body: []byte(fmt.Sprintf(reviewTemplate, `"verb":"list","resource":"pods"`)),
 		},
 		{
-			name: "namespace scope",
-			body: []byte(fmt.Sprintf(reviewTemplate, `"verb":"list","resource":"namespaces","namespace":"a"`)),
+			name: "name set",
+			body: []byte(fmt.Sprintf(reviewTemplate, `"verb":"list","resource":"namespaces","name":"a"`)),
 		},
 		{
 			name: "get verb",

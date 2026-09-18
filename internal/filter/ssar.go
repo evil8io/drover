@@ -113,12 +113,12 @@ func (s *service) roundTripReview(req *http.Request, cluster string) (*http.Resp
 }
 
 // namespaceListReview reports whether the review asks for the list or the watch
-// of the namespaces at cluster scope. A protobuf review also gets the JSON body
-// that replaces it, because the filter answers the review in JSON.
+// of the namespaces resource. A protobuf review also gets the JSON body that
+// replaces it, because the filter answers the review in JSON.
 func namespaceListReview(contentType string, body []byte) (match bool, replacement []byte) {
 	if isProtobuf(contentType) {
 		spec, err := decodeProtobufReview(body)
-		if err != nil || !clusterNamespaceList(spec) {
+		if err != nil || !namespaceList(spec) {
 			return false, nil
 		}
 		replacement, err := reviewJSON(*spec.resource)
@@ -132,7 +132,7 @@ func namespaceListReview(contentType string, body []byte) (match bool, replaceme
 	if err != nil {
 		return false, nil
 	}
-	return clusterNamespaceList(spec), nil
+	return namespaceList(spec), nil
 }
 
 func jsonReviewSpec(body []byte) (reviewSpec, error) {
@@ -152,7 +152,11 @@ func jsonReviewSpec(body []byte) (reviewSpec, error) {
 	}, nil
 }
 
-func clusterNamespaceList(spec reviewSpec) bool {
+// namespaceList reports whether the review asks for a list or a watch of the
+// namespaces resource. It ignores the namespace attribute: kubectl sends the
+// context namespace even for this cluster-scoped resource, and RBAC evaluates
+// the review the same with or without it.
+func namespaceList(spec reviewSpec) bool {
 	if spec.nonResource || spec.resource == nil {
 		return false
 	}
@@ -163,8 +167,7 @@ func clusterNamespaceList(spec reviewSpec) bool {
 	if attributes.Resource != "namespaces" {
 		return false
 	}
-	return attributes.Group == "" && attributes.Namespace == "" &&
-		attributes.Name == "" && attributes.Subresource == ""
+	return attributes.Group == "" && attributes.Name == "" && attributes.Subresource == ""
 }
 
 // reviewJSON returns the SelfSubjectAccessReview body of a JSON client.
