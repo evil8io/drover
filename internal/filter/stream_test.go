@@ -154,6 +154,133 @@ func TestWatchPassesBookmark(t *testing.T) {
 	}
 }
 
+func TestWatchAllowsTableRow(t *testing.T) {
+	t.Parallel()
+	event := `{"type":"ADDED","object":{"kind":"Table","apiVersion":"meta.k8s.io/v1","metadata":{"resourceVersion":"1"},` +
+		`"rows":[{"cells":["a","Active","1h"],"object":{"kind":"PartialObjectMetadata","apiVersion":"meta.k8s.io/v1",` +
+		`"metadata":{"name":"a"}}}]}}` + "\n"
+	h := newHarness(t, listUpstream(steveHandler("a"), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, event)
+	}))
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, listPath+"?watch=true", nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if string(body) != event {
+		t.Errorf("body = %q, want the unchanged table event %q", body, event)
+	}
+}
+
+func TestWatchDropsTableRowOutsideProjects(t *testing.T) {
+	t.Parallel()
+	event := `{"type":"ADDED","object":{"kind":"Table","apiVersion":"meta.k8s.io/v1","metadata":{"resourceVersion":"1"},` +
+		`"rows":[{"cells":["z","Active","1h"],"object":{"kind":"PartialObjectMetadata","apiVersion":"meta.k8s.io/v1",` +
+		`"metadata":{"name":"z"}}}]}}` + "\n"
+	h := newHarness(t, listUpstream(steveHandler("a"), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, event)
+	}))
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, listPath+"?watch=true", nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if len(body) != 0 {
+		t.Errorf("body = %q, want no event", body)
+	}
+}
+
+func TestWatchAllowsTableRowWithProjectLabel(t *testing.T) {
+	t.Parallel()
+	event := `{"type":"ADDED","object":{"kind":"Table","apiVersion":"meta.k8s.io/v1","metadata":{"resourceVersion":"1"},` +
+		`"rows":[{"cells":["z","Active","1h"],"object":{"kind":"PartialObjectMetadata","apiVersion":"meta.k8s.io/v1",` +
+		`"metadata":{"name":"z","labels":{"field.cattle.io/projectId":"p-1"}}}}]}}` + "\n"
+	h := newHarness(t, listUpstreamWithProjects(steveHandler("a"), projectsHandler("p-1"), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, event)
+	}))
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, listPath+"?watch=true", nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if string(body) != event {
+		t.Errorf("body = %q, want the unchanged table event %q", body, event)
+	}
+}
+
+// TestWatchAllowsPartialObjectMetadata covers a metadata-only informer, which
+// asks for application/json;as=PartialObjectMetadataList;v=v1;g=meta.k8s.io.
+// Its event object has the kind PartialObjectMetadata, not Table, with the
+// name and the labels directly under object.metadata.
+func TestWatchAllowsPartialObjectMetadata(t *testing.T) {
+	t.Parallel()
+	event := `{"type":"ADDED","object":{"kind":"PartialObjectMetadata","apiVersion":"meta.k8s.io/v1",` +
+		`"metadata":{"name":"a","labels":{"team":"x"}}}}` + "\n"
+	h := newHarness(t, listUpstream(steveHandler("a"), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, event)
+	}))
+
+	header := callerHeader()
+	header.Set("Accept", "application/json;as=PartialObjectMetadataList;v=v1;g=meta.k8s.io")
+	resp, body := h.do(t, h.request(t, http.MethodGet, listPath+"?watch=true", nil, header))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if string(body) != event {
+		t.Errorf("body = %q, want the unchanged event %q", body, event)
+	}
+}
+
+func TestWatchKeepsCallerTableAccept(t *testing.T) {
+	t.Parallel()
+	const kubectlTable = "application/json;as=Table;v=v1;g=meta.k8s.io," +
+		"application/json;as=Table;v=v1beta1;g=meta.k8s.io,application/json"
+	h := newHarness(t, listUpstream(steveHandler("a"), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	header := callerHeader()
+	header.Set("Accept", kubectlTable)
+	resp, _ := h.do(t, h.request(t, http.MethodGet, listPath+"?watch=true", nil, header))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	privileged := h.upstream.all()[3]
+	if got := privileged.header.Get("Accept"); got != kubectlTable {
+		t.Errorf("privileged Accept = %q, want %q", got, kubectlTable)
+	}
+}
+
+func TestWatchReplacesCallerProtobufAccept(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstream(steveHandler("a"), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	header := callerHeader()
+	header.Set("Accept", protobufContentType)
+	resp, _ := h.do(t, h.request(t, http.MethodGet, listPath+"?watch=true", nil, header))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	privileged := h.upstream.all()[3]
+	if got := privileged.header.Get("Accept"); got != jsonContentType {
+		t.Errorf("privileged Accept = %q, want %q", got, jsonContentType)
+	}
+}
+
 func TestListWatchWebsocketUpgrade(t *testing.T) {
 	t.Parallel()
 	echoed := make(chan struct{})

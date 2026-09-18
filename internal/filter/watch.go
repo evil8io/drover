@@ -11,18 +11,48 @@ const (
 	watchAdded    = "ADDED"
 	watchModified = "MODIFIED"
 	watchDeleted  = "DELETED"
+
+	// tableKind is the kind of a server-side table response, for example the
+	// response to the Accept that kubectl sends.
+	tableKind = "Table"
 )
 
 // watchEvent is the part of a watch event that the filter reads. The filter
 // re-emits the raw bytes of a passed event, not a re-encoding of this struct.
+// A table event has kind Table, and one row per object. Any other event has
+// its name and its labels directly under the object.
 type watchEvent struct {
 	Type   string `json:"type"`
 	Object struct {
+		Kind     string `json:"kind"`
 		Metadata struct {
 			Name   string            `json:"name"`
 			Labels map[string]string `json:"labels"`
 		} `json:"metadata"`
+		Rows []struct {
+			Object struct {
+				Metadata struct {
+					Name   string            `json:"name"`
+					Labels map[string]string `json:"labels"`
+				} `json:"metadata"`
+			} `json:"object"`
+		} `json:"rows"`
 	} `json:"object"`
+}
+
+// eventAllowed reports whether allow accepts every row of a table event, or
+// the object of any other event. A table event with no row passes, because no
+// name reaches the caller.
+func eventAllowed(event watchEvent, allow func(name string, labels map[string]string) bool) bool {
+	if event.Object.Kind != tableKind {
+		return allow(event.Object.Metadata.Name, event.Object.Metadata.Labels)
+	}
+	for _, row := range event.Object.Rows {
+		if !allow(row.Object.Metadata.Name, row.Object.Metadata.Labels) {
+			return false
+		}
+	}
+	return true
 }
 
 // filterWatchBody reads a namespace watch stream from upstream, and returns a
@@ -51,10 +81,9 @@ func filterWatchBody(ctx context.Context, upstream io.ReadCloser, allow func(nam
 			if json.Unmarshal(raw, &event) == nil {
 				switch event.Type {
 				case watchAdded, watchModified, watchDeleted:
-					name := event.Object.Metadata.Name
-					pass = allow(name, event.Object.Metadata.Labels)
+					pass = eventAllowed(event, allow)
 					if !pass {
-						logger.DebugContext(ctx, "dropped a watch event", "namespace", name)
+						logger.DebugContext(ctx, "dropped a watch event", "kind", event.Object.Kind, "namespace", event.Object.Metadata.Name)
 					}
 				}
 			}

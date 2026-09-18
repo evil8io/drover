@@ -26,8 +26,8 @@ The service handles two request patterns from a Rancher kubeconfig. It passes ev
 2. A status other than 403 goes back to the client unchanged.
 3. On a 403 error, the service requests the caller's allowed namespaces from Steve, the Rancher API server in the cluster agent.
 4. A plain list gets a new request with a service token, no cookie, and a label selector that matches only the allowed namespace names.
-5. A watch (`?watch=true`) gets a new request with a service token, no cookie, and the caller's own query, with no name filter.
-6. The service sends the new request to Rancher and streams the response to the client. For a watch, an event passes only when its namespace is in the allowed set or its `field.cattle.io/projectId` label matches a caller project.
+5. A watch (`?watch=true`) gets a new request with a service token, no cookie, and the caller's own query, with no name filter. The request keeps every Accept entry of the caller whose media type is `application/json`, for example a table request from kubectl, and drops every other entry, for example protobuf or CBOR. It sets `application/json` when no entry remains.
+6. The service sends the new request to Rancher and streams the response to the client. For a watch, an event passes only when every namespace in it is in the allowed set, or its `field.cattle.io/projectId` label matches a caller project. A server-side table event has one row per namespace, and the filter checks the name and the labels of each row.
 
 A watch request streams over chunked HTTP. A websocket upgrade streams the same way, after the protocol switch. A namespace that Rancher grants after the watch starts becomes visible within one cache TTL, because the event filter reads the allowed set through the same cache as a plain list.
 

@@ -66,7 +66,7 @@ func (s *service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 	privileged.Header.Del("Cookie")
 
 	if watch {
-		privileged.Header.Set("Accept", jsonContentType)
+		privileged.Header.Set("Accept", filterJSONAccept(req.Header.Get("Accept")))
 	} else {
 		query := privileged.URL.Query()
 		query.Set("labelSelector", mergeSelector(query.Get("labelSelector"), names))
@@ -94,6 +94,28 @@ func (s *service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 	result.outcome, result.status, result.count = outcomeFiltered, filtered.StatusCode, len(names)
 	s.logList(req.Context(), start, result)
 	return filtered, nil
+}
+
+// filterJSONAccept keeps every entry of the Accept header of the caller whose
+// media type is application/json, and drops every other entry, for example a
+// protobuf or a CBOR entry that the stream filter cannot read. It sets
+// application/json when no entry remains.
+func filterJSONAccept(accept string) string {
+	var kept []string
+	for _, entry := range strings.Split(accept, ",") {
+		entry = strings.TrimSpace(entry)
+		mediaType := entry
+		if i := strings.IndexByte(entry, ';'); i >= 0 {
+			mediaType = entry[:i]
+		}
+		if strings.EqualFold(strings.TrimSpace(mediaType), jsonContentType) {
+			kept = append(kept, entry)
+		}
+	}
+	if len(kept) == 0 {
+		return jsonContentType
+	}
+	return strings.Join(kept, ",")
 }
 
 // mergeSelector appends the name requirement to the selector of the caller. An
