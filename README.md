@@ -8,6 +8,7 @@ drover is a set of tenancy extensions for Rancher. It is one binary, with one su
 | --- | --- |
 | `namespace-filter` | A reverse proxy that answers the namespace list of a Rancher project member. |
 | `rotate-token` | A command that renews the API token of the Rancher service user in a Secret. |
+| `project-sync` | A loop that copies labels and annotations of a Rancher project to the namespaces of that project. |
 
 ## namespace-filter
 
@@ -126,6 +127,40 @@ The Secret must exist before the first run. The command reads the ServiceAccount
 ### Logging
 
 The command writes JSON logs to stderr, one line per step. Each line has a `step` field and an `outcome` field. The command never logs a token, a token key, or the password.
+
+## project-sync
+
+This service copies labels and annotations of a Rancher project to every namespace of that project, because Rancher does not copy them. The `--labels` and `--annotations` flags are the allow list of keys. The value of the project wins, and the service overwrites a different value on the namespace. A key that the project does not have stays untouched, so the service never removes a key from a namespace. The service polls Rancher at every `--interval`, and one replica is enough, because every run is a full reconcile. A namespace list that returns status 403 means that the service user has no `cluster-owner` binding on that cluster.
+
+The service writes a warning with the cluster id and continues with the next cluster.
+
+### Requirements
+
+1. A Rancher service user with a `cluster-owner` binding on every cluster whose namespaces the service syncs.
+2. An API token of that service user, in a Secret that the service mounts.
+
+### Configuration
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--rancher-url` | (required) | URL of Rancher. Use `http://` or `https://`. The path must be empty or `/`. |
+| `--rancher-ca-file` | | PEM bundle that verifies an `https` URL. |
+| `--token-file` | (required) | File with the API token of the Rancher service user. |
+| `--labels` | | Comma-separated label keys of a project to copy. |
+| `--annotations` | | Comma-separated annotation keys of a project to copy. |
+| `--interval` | `60s` | Time between two runs. |
+| `--listen` | `:8080` | Address the service listens on. |
+| `--log-level` | `info` | One of `debug`, `info`, `warn`, or `error`. |
+
+The flags need at least one label key or one annotation key. A key under `field.cattle.io/`, `cattle.io/`, `kubernetes.io/`, or `k8s.io/` is not valid, because Rancher and Kubernetes own those prefixes.
+
+The service starts with no token file. It skips the run until the file has a token, and it writes one warning per state change of the file.
+
+`GET /healthz` returns status 200 with body `ok`.
+
+### Design
+
+The service polls `GET /v3/projects` at every interval, and it opens no watch. One call per interval returns every project that the service user sees, because Rancher filters that list by RBAC. The service needs no cluster list of its own, and no watch connection per cluster. The service never removes a key from a namespace, because a tenant sets its own keys there, and the project does not define them. A patch with only the configured keys keeps those tenant keys. The standard library is enough for the work: the service needs an HTTP client, a JSON decoder, and a ticker.
 
 ## Development
 

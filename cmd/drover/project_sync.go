@@ -1,0 +1,160 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/evil8io/drover/internal/projectsync"
+)
+
+type projectSyncConfig struct {
+	listen      string
+	rancherURL  *url.URL
+	caFile      string
+	tokenFile   string
+	labels      []string
+	annotations []string
+	interval    time.Duration
+	logLevel    slog.Level
+}
+
+func runProjectSync(args []string) int {
+	cfg, err := parseProjectSyncConfig(args, os.Stderr)
+	if err != nil {
+		if !errors.Is(err, flag.ErrHelp) {
+			fmt.Fprintln(os.Stderr, err)
+		}
+		return 2
+	}
+
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.logLevel}))
+
+	syncer, err := projectsync.New(projectsync.Config{
+		RancherURL:  cfg.rancherURL,
+		CAFile:      cfg.caFile,
+		TokenFile:   cfg.tokenFile,
+		Labels:      cfg.labels,
+		Annotations: cfg.annotations,
+		Interval:    cfg.interval,
+		Logger:      logger,
+		Version:     version,
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+
+	server := &http.Server{
+		Addr:              cfg.listen,
+		Handler:           syncer.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelDebug),
+	}
+
+	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.ListenAndServe() }()
+
+	logger.Info("start",
+		"version", version,
+		"listen", cfg.listen,
+		"rancher", cfg.rancherURL.String(),
+		"interval", cfg.interval.String(),
+		"labels", cfg.labels,
+		"annotations", cfg.annotations,
+	)
+
+	syncDone := make(chan struct{})
+	go func() {
+		defer close(syncDone)
+		syncer.Run(signalCtx)
+	}()
+
+	select {
+	case err := <-serveErr:
+		stop()
+		<-syncDone
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("the server stopped", "error", err.Error())
+			return 1
+		}
+	case <-signalCtx.Done():
+		stop()
+		logger.Info("shutdown")
+		<-syncDone
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("the shutdown did not complete", "error", err.Error())
+		}
+	}
+	return 0
+}
+
+func parseProjectSyncConfig(args []string, output io.Writer) (projectSyncConfig, error) {
+	flags := flag.NewFlagSet("drover project-sync", flag.ContinueOnError)
+	flags.SetOutput(output)
+
+	var (
+		cfg         projectSyncConfig
+		rancherURL  string
+		labels      string
+		annotations string
+		logLevel    string
+	)
+	flags.StringVar(&cfg.listen, "listen", ":8080", "listen address")
+	flags.StringVar(&rancherURL, "rancher-url", "", "Rancher URL, http:// or https://")
+	flags.StringVar(&cfg.caFile, "rancher-ca-file", "", "PEM bundle that verifies an https Rancher URL")
+	flags.StringVar(&cfg.tokenFile, "token-file", "", "file with the API token of the service user")
+	flags.StringVar(&labels, "labels", "", "comma-separated label keys of a project to copy")
+	flags.StringVar(&annotations, "annotations", "", "comma-separated annotation keys of a project to copy")
+	flags.DurationVar(&cfg.interval, "interval", 60*time.Second, "time between two runs")
+	flags.StringVar(&logLevel, "log-level", "info", "debug, info, warn or error")
+
+	if err := flags.Parse(args); err != nil {
+		return projectSyncConfig{}, err
+	}
+
+	level, err := parseLevel(logLevel)
+	if err != nil {
+		return projectSyncConfig{}, err
+	}
+	cfg.logLevel = level
+
+	target, err := parseRancherURL("-rancher-url", rancherURL)
+	if err != nil {
+		return projectSyncConfig{}, err
+	}
+	cfg.rancherURL = target
+
+	if cfg.tokenFile == "" {
+		return projectSyncConfig{}, errors.New("-token-file is required")
+	}
+	if cfg.interval <= 0 {
+		return projectSyncConfig{}, fmt.Errorf("-interval %s is not positive", cfg.interval)
+	}
+
+	if cfg.labels, err = projectsync.ParseKeys(labels); err != nil {
+		return projectSyncConfig{}, fmt.Errorf("-labels: %w", err)
+	}
+	if cfg.annotations, err = projectsync.ParseKeys(annotations); err != nil {
+		return projectSyncConfig{}, fmt.Errorf("-annotations: %w", err)
+	}
+	if len(cfg.labels)+len(cfg.annotations) == 0 {
+		return projectSyncConfig{}, errors.New("-labels or -annotations needs at least one key")
+	}
+	return cfg, nil
+}

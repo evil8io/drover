@@ -4,8 +4,6 @@ package filter
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,9 +11,9 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"os"
-	"strings"
 	"time"
+
+	"github.com/evil8io/drover/internal/rancherclient"
 )
 
 const (
@@ -71,7 +69,7 @@ func New(cfg Config) (http.Handler, error) {
 	upstream.Path = ""
 	upstream.RawPath = ""
 
-	base, err := newTransport(cfg.CAFile)
+	base, err := rancherclient.Transport(cfg.CAFile)
 	if err != nil {
 		return nil, err
 	}
@@ -115,34 +113,6 @@ func New(cfg Config) (http.Handler, error) {
 	}), nil
 }
 
-func newTransport(caFile string) (*http.Transport, error) {
-	tr := &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		DisableCompression:  true,
-		ForceAttemptHTTP2:   false,
-		TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{},
-		TLSHandshakeTimeout: 10 * time.Second,
-		IdleConnTimeout:     90 * time.Second,
-		MaxIdleConnsPerHost: 100,
-	}
-	if caFile == "" {
-		return tr, nil
-	}
-	pem, err := os.ReadFile(caFile)
-	if err != nil {
-		return nil, fmt.Errorf("read upstream CA file: %w", err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf("upstream CA file %s has no certificate", caFile)
-	}
-	tr.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
-	return tr, nil
-}
-
 func (s *service) rewrite(pr *httputil.ProxyRequest) {
 	pr.SetURL(s.upstream)
 	pr.Out.Host = pr.In.Host
@@ -170,20 +140,4 @@ func (s *service) handleError(w http.ResponseWriter, r *http.Request, err error)
 	}
 	s.logger.Log(r.Context(), level, "proxy error", "method", r.Method, "path", r.URL.Path, "error", err.Error())
 	writeStatus(w, http.StatusBadGateway, reasonInternalError, serviceName+": "+err.Error())
-}
-
-// errTokenUnavailable marks a readToken failure that a later request can
-// recover from, once the token file gets its content.
-var errTokenUnavailable = errors.New("the token file is not available yet")
-
-func readToken(path string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("%w: %w", errTokenUnavailable, err)
-	}
-	token := strings.TrimSpace(string(data))
-	if token == "" {
-		return "", fmt.Errorf("%w: %s is empty", errTokenUnavailable, path)
-	}
-	return token, nil
 }
