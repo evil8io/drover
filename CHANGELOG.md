@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/evil8io/drover/compare/v0.4.1...v0.5.0) (2026-09-18)
+
+
+### Features
+
+* end open watches with EOF before shutdown ([#20](https://github.com/evil8io/drover/issues/20)) ([a7ffbe1](https://github.com/evil8io/drover/commit/a7ffbe1b28ea8ff1d70d9e061ddf1788fa213e58))
+
 ## [0.4.1](https://github.com/evil8io/drover/compare/v0.4.0...v0.4.1) (2026-09-18)
 
 
