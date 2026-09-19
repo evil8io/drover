@@ -51,6 +51,18 @@ func reviewUpstreamWithNames(answer string, names ...string) http.HandlerFunc {
 
 func (h *harness) postReview(t *testing.T, body []byte, header http.Header) (*http.Response, []byte) {
 	t.Helper()
+	return h.do(t, h.reviewRequest(t, body, header))
+}
+
+// postReviewDirect is postReview with no network hop, for a test that reads
+// the exported spans of the request.
+func (h *harness) postReviewDirect(t *testing.T, body []byte, header http.Header) (*http.Response, []byte) {
+	t.Helper()
+	return h.doDirect(t, h.reviewRequest(t, body, header))
+}
+
+func (h *harness) reviewRequest(t *testing.T, body []byte, header http.Header) *http.Request {
+	t.Helper()
 	all := http.Header{}
 	for name, values := range header {
 		for _, value := range values {
@@ -60,7 +72,7 @@ func (h *harness) postReview(t *testing.T, body []byte, header http.Header) (*ht
 	if all.Get("Content-Type") == "" {
 		all.Set("Content-Type", jsonContentType)
 	}
-	return h.do(t, h.request(t, http.MethodPost, reviewPath, bytes.NewReader(body), all))
+	return h.request(t, http.MethodPost, reviewPath, bytes.NewReader(body), all)
 }
 
 func TestReviewGrantsNamespaceList(t *testing.T) {
@@ -132,6 +144,41 @@ func TestReviewGrantsNamespaceList(t *testing.T) {
 				t.Errorf("upstream Accept-Encoding = %q, want no header", got)
 			}
 		})
+	}
+}
+
+// TestReviewGrantLogsAndSpanHaveCallerName checks that a resolved caller
+// identity reaches the review log line and the drover.user span attribute.
+// This is the path that grants a denied review.
+func TestReviewGrantLogsAndSpanHaveCallerName(t *testing.T) {
+	t.Parallel()
+	upstream := func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case stevePath:
+			steveHandler("prod")(w, r)
+		case projectsPath:
+			projectsHandler()(w, r)
+		case selfSubjectReviewPath:
+			selfSubjectReviewHandler("u-alice")(w, r)
+		default:
+			reviewUpstream(deniedAnswer)(w, r)
+		}
+	}
+	h, exporter := newHarnessWithSpans(t, upstream)
+
+	request := fmt.Sprintf(reviewTemplate, `"verb":"list","resource":"namespaces"`)
+	resp, _ := h.postReviewDirect(t, []byte(request), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if !strings.Contains(h.logs.String(), "user=u-alice") {
+		t.Errorf("logs have no user=u-alice line: %s", h.logs.String())
+	}
+
+	span := requestSpan(t, exporter)
+	got, ok := spanAttributeString(span, "drover.user")
+	if !ok || got != "u-alice" {
+		t.Errorf("drover.user attribute = %q, ok=%v, want u-alice", got, ok)
 	}
 }
 

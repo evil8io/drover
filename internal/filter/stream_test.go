@@ -89,7 +89,7 @@ func TestListWatchStreams(t *testing.T) {
 		t.Fatal("the second event did not arrive")
 	}
 
-	privileged := h.upstream.all()[3]
+	privileged := h.upstream.privileged(t)
 	if got := privileged.query.Get("watch"); got != "true" {
 		t.Errorf("privileged watch = %q, want true", got)
 	}
@@ -120,7 +120,7 @@ func TestWatchSendsProjectSelector(t *testing.T) {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 
-	privileged := h.upstream.all()[3]
+	privileged := h.upstream.privileged(t)
 	want := "team=x,field.cattle.io/projectId in (p-1)"
 	if got := privileged.query.Get("labelSelector"); got != want {
 		t.Errorf("labelSelector = %q, want %q", got, want)
@@ -141,7 +141,7 @@ func TestWatchSendsEmptySelector(t *testing.T) {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 
-	privileged := h.upstream.all()[3]
+	privileged := h.upstream.privileged(t)
 	want := "team=x,kubernetes.io/metadata.name,!kubernetes.io/metadata.name"
 	if got := privileged.query.Get("labelSelector"); got != want {
 		t.Errorf("labelSelector = %q, want %q", got, want)
@@ -350,7 +350,7 @@ func TestWatchKeepsCallerTableAccept(t *testing.T) {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 
-	privileged := h.upstream.all()[3]
+	privileged := h.upstream.privileged(t)
 	if got := privileged.header.Get("Accept"); got != kubectlTable {
 		t.Errorf("privileged Accept = %q, want %q", got, kubectlTable)
 	}
@@ -370,7 +370,7 @@ func TestWatchReplacesCallerProtobufAccept(t *testing.T) {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 
-	privileged := h.upstream.all()[3]
+	privileged := h.upstream.privileged(t)
 	if got := privileged.header.Get("Accept"); got != jsonContentType {
 		t.Errorf("privileged Accept = %q, want %q", got, jsonContentType)
 	}
@@ -455,10 +455,10 @@ func TestListWatchWebsocketUpgrade(t *testing.T) {
 	}
 
 	requests := h.upstream.all()
-	if len(requests) != 4 {
-		t.Fatalf("upstream requests = %d, want 4", len(requests))
+	if len(requests) != 5 {
+		t.Fatalf("upstream requests = %d, want 5", len(requests))
 	}
-	privileged := requests[3]
+	privileged := h.upstream.privileged(t)
 	if got := privileged.header.Get("Authorization"); got != serviceAuth {
 		t.Errorf("privileged Authorization = %q, want %q", got, serviceAuth)
 	}

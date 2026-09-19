@@ -56,11 +56,14 @@ type projectCollection struct {
 
 // allowedSet is the cached view of one caller. It has the namespace names the
 // caller may list, and the ids of the projects it may see. extras is the
-// subset of names whose project label is not one of those project ids.
+// subset of names whose project label is not one of those project ids. user
+// is the Rancher user id of the caller, from a SelfSubjectReview, or empty
+// when the lookup failed.
 type allowedSet struct {
 	names    []string
 	projects []string
 	extras   []string
+	user     string
 }
 
 // allowedNamespace reports whether the caller may see the namespace: its name
@@ -119,7 +122,14 @@ func (s *Service) fetchAllowed(ctx context.Context, cluster, auth, cookie string
 		return allowedSet{}, denied, err
 	}
 
-	return allowedSet{names: names, projects: projects, extras: extraNames(names, projectOf, projects)}, nil, nil
+	user := s.fetchCallerName(ctx, cluster, auth, cookie)
+
+	return allowedSet{
+		names:    names,
+		projects: projects,
+		extras:   extraNames(names, projectOf, projects),
+		user:     user,
+	}, nil, nil
 }
 
 // extraNames returns the names among names whose project label, from
@@ -281,6 +291,76 @@ func (s *Service) fetchProjectIDs(ctx context.Context, auth, cookie string) ([]s
 		}
 	}
 	return slices.Sorted(maps.Keys(ids)), nil, nil
+}
+
+// selfSubjectReviewBody is the fixed SelfSubjectReview request that resolves
+// the Rancher user id of the caller. Kubernetes 1.28 and later serve the
+// resource. The built-in system:basic-user role lets every authenticated
+// caller create it.
+const selfSubjectReviewBody = `{"apiVersion":"authentication.k8s.io/v1","kind":"SelfSubjectReview"}`
+
+// fetchCallerName reads the Rancher user id of the caller, through a
+// SelfSubjectReview. The lookup never fails the allowed set fetch. Each of
+// these leaves the name empty, with one debug line for the reason:
+//
+//   - a transport error
+//   - a status other than 200 or 201
+//   - a body that does not parse
+//   - an empty username
+func (s *Service) fetchCallerName(ctx context.Context, cluster, auth, cookie string) string {
+	target := *s.upstream
+	target.Path = "/k8s/clusters/" + cluster + "/apis/authentication.k8s.io/v1/selfsubjectreviews"
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.String(), strings.NewReader(selfSubjectReviewBody))
+	if err != nil {
+		s.logger.DebugContext(ctx, "caller identity lookup", "cluster", cluster, "reason", err.Error())
+		return ""
+	}
+	if auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+	if cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+	req.Header.Set("Content-Type", jsonContentType)
+	req.Header.Set("Accept", jsonContentType)
+
+	resp, err := s.base.RoundTrip(req)
+	if err != nil {
+		s.logger.DebugContext(ctx, "caller identity lookup", "cluster", cluster, "reason", err.Error())
+		return ""
+	}
+	body, tooLarge, err := readLimited(resp.Body, maxSteveBody)
+	_ = resp.Body.Close()
+	if err != nil {
+		s.logger.DebugContext(ctx, "caller identity lookup", "cluster", cluster, "reason", err.Error())
+		return ""
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		s.logger.DebugContext(ctx, "caller identity lookup", "cluster", cluster, "reason", "status "+resp.Status)
+		return ""
+	}
+	if tooLarge {
+		s.logger.DebugContext(ctx, "caller identity lookup", "cluster", cluster, "reason", "the response is larger than the limit")
+		return ""
+	}
+
+	var review struct {
+		Status struct {
+			UserInfo struct {
+				Username string `json:"username"`
+			} `json:"userInfo"`
+		} `json:"status"`
+	}
+	if err := json.Unmarshal(body, &review); err != nil {
+		s.logger.DebugContext(ctx, "caller identity lookup", "cluster", cluster, "reason", err.Error())
+		return ""
+	}
+	if review.Status.UserInfo.Username == "" {
+		s.logger.DebugContext(ctx, "caller identity lookup", "cluster", cluster, "reason", "the answer has no username")
+		return ""
+	}
+	return review.Status.UserInfo.Username
 }
 
 type cacheEntry struct {

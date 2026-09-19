@@ -52,8 +52,8 @@ func TestListFiltersAfter403(t *testing.T) {
 	}
 
 	requests := h.upstream.all()
-	if len(requests) != 4 {
-		t.Fatalf("upstream requests = %d, want 4", len(requests))
+	if len(requests) != 5 {
+		t.Fatalf("upstream requests = %d, want 5", len(requests))
 	}
 
 	native := requests[0]
@@ -83,7 +83,15 @@ func TestListFiltersAfter403(t *testing.T) {
 		t.Errorf("project list Authorization = %q, want %q", projects.header.Get("Authorization"), callerToken)
 	}
 
-	privileged := requests[3]
+	identity := requests[3]
+	if identity.method != http.MethodPost || identity.path != selfSubjectReviewPath {
+		t.Errorf("caller identity request = %s %q, want POST %q", identity.method, identity.path, selfSubjectReviewPath)
+	}
+	if identity.header.Get("Authorization") != callerToken {
+		t.Errorf("caller identity Authorization = %q, want %q", identity.header.Get("Authorization"), callerToken)
+	}
+
+	privileged := requests[4]
 	if privileged.path != listPath {
 		t.Errorf("privileged path = %q, want %q", privileged.path, listPath)
 	}
@@ -110,7 +118,7 @@ func TestListMergesCallerSelector(t *testing.T) {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 
-	privileged := h.upstream.all()[3]
+	privileged := h.upstream.privileged(t)
 	want := "team=x,kubernetes.io/metadata.name in (a,b)"
 	if got := privileged.query.Get("labelSelector"); got != want {
 		t.Errorf("labelSelector = %q, want %q", got, want)
@@ -126,7 +134,7 @@ func TestListEmptySet(t *testing.T) {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 
-	privileged := h.upstream.all()[3]
+	privileged := h.upstream.privileged(t)
 	want := "kubernetes.io/metadata.name,!kubernetes.io/metadata.name"
 	if got := privileged.query.Get("labelSelector"); got != want {
 		t.Errorf("labelSelector = %q, want %q", got, want)
@@ -146,7 +154,7 @@ func TestListProjectSelector(t *testing.T) {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 
-	privileged := h.upstream.all()[3]
+	privileged := h.upstream.privileged(t)
 	want := "field.cattle.io/projectId in (p-1)"
 	if got := privileged.query.Get("labelSelector"); got != want {
 		t.Errorf("labelSelector = %q, want %q", got, want)
@@ -166,7 +174,7 @@ func TestListMergesCallerSelectorIntoProjectSelector(t *testing.T) {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 
-	privileged := h.upstream.all()[3]
+	privileged := h.upstream.privileged(t)
 	want := "team=x,field.cattle.io/projectId in (p-1)"
 	if got := privileged.query.Get("labelSelector"); got != want {
 		t.Errorf("labelSelector = %q, want %q", got, want)
@@ -186,7 +194,7 @@ func TestListNameSelectorOnMismatchedProject(t *testing.T) {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 
-	privileged := h.upstream.all()[3]
+	privileged := h.upstream.privileged(t)
 	want := "kubernetes.io/metadata.name in (a,z)"
 	if got := privileged.query.Get("labelSelector"); got != want {
 		t.Errorf("labelSelector = %q, want %q", got, want)
@@ -206,7 +214,7 @@ func TestListNameSelectorOnMissingProjectLabel(t *testing.T) {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 
-	privileged := h.upstream.all()[3]
+	privileged := h.upstream.privileged(t)
 	want := "kubernetes.io/metadata.name in (a,z)"
 	if got := privileged.query.Get("labelSelector"); got != want {
 		t.Errorf("labelSelector = %q, want %q", got, want)
@@ -312,14 +320,14 @@ func TestListStevePagination(t *testing.T) {
 	}
 
 	requests := h.upstream.all()
-	if len(requests) != 5 {
-		t.Fatalf("upstream requests = %d, want 5", len(requests))
+	if len(requests) != 6 {
+		t.Fatalf("upstream requests = %d, want 6", len(requests))
 	}
 	if got := requests[2].query.Get("continue"); got != "t1" {
 		t.Errorf("second allowed set continue = %q, want t1", got)
 	}
 	want := "kubernetes.io/metadata.name in (a,b,c)"
-	if got := requests[4].query.Get("labelSelector"); got != want {
+	if got := requests[5].query.Get("labelSelector"); got != want {
 		t.Errorf("labelSelector = %q, want %q", got, want)
 	}
 }
@@ -456,6 +464,33 @@ func TestListCachesAllowedSet(t *testing.T) {
 	}
 }
 
+// TestListCachesCallerName checks that the caller identity lookup runs once
+// per cache TTL, cached with the rest of the allowed set.
+func TestListCachesCallerName(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstreamFull(steveHandler("a"), projectsHandler(),
+		selfSubjectReviewHandler("u-alice"), namespaceListHandler))
+
+	for i := range 2 {
+		resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want 200", i, resp.StatusCode)
+		}
+	}
+	if got := h.upstream.countPath(selfSubjectReviewPath); got != 1 {
+		t.Fatalf("caller identity requests = %d, want 1", got)
+	}
+
+	h.clock.advance(defaultCacheTTL + time.Second)
+	resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := h.upstream.countPath(selfSubjectReviewPath); got != 2 {
+		t.Errorf("caller identity requests = %d, want 2", got)
+	}
+}
+
 func TestListCoalescesAllowedSetRequests(t *testing.T) {
 	t.Parallel()
 	const callers = 5
@@ -471,6 +506,8 @@ func TestListCoalescesAllowedSetRequests(t *testing.T) {
 			steveHandler("a")(w, r)
 		case r.URL.Path == projectsPath:
 			projectsHandler()(w, r)
+		case r.URL.Path == selfSubjectReviewPath:
+			selfSubjectReviewHandler(callerUsername)(w, r)
 		case r.Header.Get("Authorization") == serviceAuth:
 			namespaceListHandler(w, r)
 		default:
@@ -529,10 +566,10 @@ func TestListCookieCaller(t *testing.T) {
 	if got := requests[1].header.Get("Authorization"); got != "" {
 		t.Errorf("allowed set Authorization = %q, want no header", got)
 	}
-	if got := requests[3].header.Get("Authorization"); got != serviceAuth {
+	if got := requests[4].header.Get("Authorization"); got != serviceAuth {
 		t.Errorf("privileged Authorization = %q, want %q", got, serviceAuth)
 	}
-	if _, ok := requests[3].header["Cookie"]; ok {
+	if _, ok := requests[4].header["Cookie"]; ok {
 		t.Error("the privileged request has a Cookie header")
 	}
 }

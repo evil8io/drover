@@ -2,6 +2,7 @@ package filter
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,7 +17,12 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric/noop"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // testMetrics returns a *metrics whose instruments record into a
@@ -32,11 +38,16 @@ func testMetrics(t *testing.T) *metrics {
 }
 
 const (
-	listPath    = "/k8s/clusters/c-1/api/v1/namespaces"
-	stevePath   = "/k8s/clusters/c-1/v1/namespaces"
-	reviewPath  = "/k8s/clusters/c-1/apis/authorization.k8s.io/v1/selfsubjectaccessreviews"
-	callerToken = "Bearer caller"
-	serviceAuth = "Bearer service"
+	listPath              = "/k8s/clusters/c-1/api/v1/namespaces"
+	stevePath             = "/k8s/clusters/c-1/v1/namespaces"
+	reviewPath            = "/k8s/clusters/c-1/apis/authorization.k8s.io/v1/selfsubjectaccessreviews"
+	selfSubjectReviewPath = "/k8s/clusters/c-1/apis/authentication.k8s.io/v1/selfsubjectreviews"
+	callerToken           = "Bearer caller"
+	serviceAuth           = "Bearer service"
+
+	// callerUsername is the identity that selfSubjectReviewHandler answers by
+	// default, for a test that does not care about a specific user id.
+	callerUsername = "u-caller"
 )
 
 type recorded struct {
@@ -94,6 +105,18 @@ func (u *upstream) countPath(path string) int {
 		}
 	}
 	return count
+}
+
+// privileged returns the last recorded request. fetchAllowed ends the fill
+// with the request it sends on the service token, so a test that indexes
+// this request stays correct when a step joins the fill before it.
+func (u *upstream) privileged(t *testing.T) recorded {
+	t.Helper()
+	requests := u.all()
+	if len(requests) == 0 {
+		t.Fatal("no upstream request")
+	}
+	return requests[len(requests)-1]
 }
 
 type fakeClock struct {
@@ -158,6 +181,64 @@ func newHarnessOpt(t *testing.T, handler http.HandlerFunc, opts ...func(*Config)
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	writeToken(t, tokenFile, "service")
 	return newHarnessWithTokenFile(t, handler, tokenFile, opts...)
+}
+
+// newHarnessWithSpans is newHarnessOpt with an in-memory span exporter
+// installed as the TracerProvider, for a test that reads the span of a request.
+func newHarnessWithSpans(t *testing.T, handler http.HandlerFunc) (*harness, *tracetest.InMemoryExporter) {
+	t.Helper()
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter), sdktrace.WithSampler(sdktrace.AlwaysSample()))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	h := newHarnessOpt(t, handler, func(cfg *Config) { cfg.TracerProvider = provider })
+	return h, exporter
+}
+
+// requestSpan returns the exported server span of the request. Each upstream
+// call has its own client span, through the same TracerProvider. The server
+// kind therefore identifies the request span of otelhttp.NewHandler.
+func requestSpan(t *testing.T, exporter *tracetest.InMemoryExporter) tracetest.SpanStub {
+	t.Helper()
+	for _, span := range exporter.GetSpans() {
+		if span.SpanKind == trace.SpanKindServer {
+			return span
+		}
+	}
+	t.Fatal("no server span")
+	return tracetest.SpanStub{}
+}
+
+// spanAttributeString returns the string value of the span attribute named
+// key. It reports whether the span has that attribute.
+func spanAttributeString(span tracetest.SpanStub, key string) (string, bool) {
+	for _, kv := range span.Attributes {
+		if string(kv.Key) == key {
+			return kv.Value.AsString(), true
+		}
+	}
+	return "", false
+}
+
+// metricAttributeKeys returns the attribute keys of every data point of m.
+func metricAttributeKeys(m metricdata.Metrics) []string {
+	var sets []attribute.Set
+	switch data := m.Data.(type) {
+	case metricdata.Sum[int64]:
+		for _, dp := range data.DataPoints {
+			sets = append(sets, dp.Attributes)
+		}
+	case metricdata.Histogram[float64]:
+		for _, dp := range data.DataPoints {
+			sets = append(sets, dp.Attributes)
+		}
+	}
+	var keys []string
+	for _, set := range sets {
+		for _, kv := range set.ToSlice() {
+			keys = append(keys, string(kv.Key))
+		}
+	}
+	return keys
 }
 
 // newHarnessWithoutToken builds a harness whose token file does not exist yet.
@@ -230,12 +311,27 @@ func (h *harness) do(t *testing.T, req *http.Request) (*http.Response, []byte) {
 	return resp, body
 }
 
+// doDirect calls Service.ServeHTTP directly, with no network hop. A real
+// connection flushes the response before the wrapping span ends. A test
+// that reads the exported spans needs this call instead of do.
+func (h *harness) doDirect(t *testing.T, req *http.Request) (*http.Response, []byte) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.svc.ServeHTTP(rec, req)
+	resp := rec.Result()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	return resp, body
+}
+
 // callerHeader returns the headers of a project member.
 func callerHeader() http.Header {
 	return http.Header{"Authorization": []string{callerToken}}
 }
 
-// listUpstream routes the four requests of the list flow. The native attempt
+// listUpstream routes the five requests of the list flow. The native attempt
 // gets 403. The caller has no project, because most tests do not need one.
 func listUpstream(steve, privileged http.HandlerFunc) http.HandlerFunc {
 	return listUpstreamWithProjects(steve, projectsHandler(), privileged)
@@ -243,12 +339,21 @@ func listUpstream(steve, privileged http.HandlerFunc) http.HandlerFunc {
 
 // listUpstreamWithProjects is listUpstream with the given project ids of the caller.
 func listUpstreamWithProjects(steve, projects, privileged http.HandlerFunc) http.HandlerFunc {
+	return listUpstreamFull(steve, projects, selfSubjectReviewHandler(callerUsername), privileged)
+}
+
+// listUpstreamFull is listUpstreamWithProjects with the given handler for the
+// caller identity lookup. A test that needs a specific username, or a
+// specific failure of that lookup, uses this instead.
+func listUpstreamFull(steve, projects, identity, privileged http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == stevePath:
 			steve(w, r)
 		case r.URL.Path == projectsPath:
 			projects(w, r)
+		case r.URL.Path == selfSubjectReviewPath:
+			identity(w, r)
 		case r.Header.Get("Authorization") == serviceAuth:
 			privileged(w, r)
 		default:
@@ -266,6 +371,20 @@ func projectsHandler(ids ...string) http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, fmt.Sprintf(`{"type":"collection","data":[%s]}`, strings.Join(items, ",")))
+	}
+}
+
+// selfSubjectReviewHandler answers a SelfSubjectReview with the given
+// username. An empty username omits the username field from the answer.
+func selfSubjectReviewHandler(username string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		userInfo := "{}"
+		if username != "" {
+			userInfo = fmt.Sprintf(`{"username":%q}`, username)
+		}
+		_, _ = io.WriteString(w, fmt.Sprintf(
+			`{"apiVersion":"authentication.k8s.io/v1","kind":"SelfSubjectReview","status":{"userInfo":%s}}`, userInfo))
 	}
 }
 

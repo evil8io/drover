@@ -3,6 +3,7 @@ package filter
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -159,5 +160,70 @@ func TestConfigDefaults(t *testing.T) {
 	}
 	if want := 2 * float64(defaultFetchRate); svc.limiter.burst != want {
 		t.Errorf("fetch burst = %v, want %v", svc.limiter.burst, want)
+	}
+}
+
+func TestFetchAllowedResolvesCallerName(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstreamFull(steveHandler("a"), projectsHandler(),
+		selfSubjectReviewHandler("u-alice"), namespaceListHandler))
+
+	set, denied, err := h.svc.fetchAllowed(context.Background(), "c-1", callerToken, "")
+	if denied != nil || err != nil {
+		t.Fatalf("fetchAllowed: denied=%v err=%v", denied, err)
+	}
+	if set.user != "u-alice" {
+		t.Errorf("user = %q, want u-alice", set.user)
+	}
+}
+
+func TestFetchAllowedKeepsUserEmptyOnIdentityForbidden(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstreamFull(steveHandler("a"), projectsHandler(),
+		func(w http.ResponseWriter, r *http.Request) { http.Error(w, "forbidden", http.StatusForbidden) },
+		namespaceListHandler))
+
+	set, denied, err := h.svc.fetchAllowed(context.Background(), "c-1", callerToken, "")
+	if denied != nil || err != nil {
+		t.Fatalf("fetchAllowed: denied=%v err=%v", denied, err)
+	}
+	if set.user != "" {
+		t.Errorf("user = %q, want empty on a 403 identity answer", set.user)
+	}
+	if len(set.names) != 1 || set.names[0] != "a" {
+		t.Errorf("names = %v, want [a], the allowed set must stay correct", set.names)
+	}
+}
+
+func TestFetchAllowedKeepsUserEmptyOnIdentityNotFound(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstreamFull(steveHandler("a"), projectsHandler(),
+		func(w http.ResponseWriter, r *http.Request) { http.Error(w, "not found", http.StatusNotFound) },
+		namespaceListHandler))
+
+	set, denied, err := h.svc.fetchAllowed(context.Background(), "c-1", callerToken, "")
+	if denied != nil || err != nil {
+		t.Fatalf("fetchAllowed: denied=%v err=%v", denied, err)
+	}
+	if set.user != "" {
+		t.Errorf("user = %q, want empty on a 404 identity answer, as a cluster below 1.28 gives", set.user)
+	}
+}
+
+func TestFetchAllowedKeepsUserEmptyOnMalformedIdentityBody(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstreamFull(steveHandler("a"), projectsHandler(),
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"status": tomato}`)
+		},
+		namespaceListHandler))
+
+	set, denied, err := h.svc.fetchAllowed(context.Background(), "c-1", callerToken, "")
+	if denied != nil || err != nil {
+		t.Fatalf("fetchAllowed: denied=%v err=%v", denied, err)
+	}
+	if set.user != "" {
+		t.Errorf("user = %q, want empty on a body that does not parse", set.user)
 	}
 }

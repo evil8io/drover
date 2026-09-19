@@ -40,7 +40,7 @@ func (s *Service) roundTripReview(req *http.Request, cluster string) (*http.Resp
 		if err != nil {
 			return nil, s.reviewError(req.Context(), cluster, err)
 		}
-		s.logReview(req.Context(), cluster, outcomePassthrough, resp.StatusCode)
+		s.logReview(req.Context(), cluster, outcomePassthrough, resp.StatusCode, "")
 		return resp, nil
 	}
 
@@ -52,7 +52,7 @@ func (s *Service) roundTripReview(req *http.Request, cluster string) (*http.Resp
 		return nil, s.reviewError(req.Context(), cluster, err)
 	}
 	if tooLarge {
-		s.logReview(req.Context(), cluster, outcomeError, http.StatusRequestEntityTooLarge)
+		s.logReview(req.Context(), cluster, outcomeError, http.StatusRequestEntityTooLarge, "")
 		message := serviceName + ": the request body is larger than " + strconv.Itoa(maxReviewBody) + " bytes"
 		return statusResponse(req, http.StatusRequestEntityTooLarge, reasonTooLarge, message), nil
 	}
@@ -66,7 +66,7 @@ func (s *Service) roundTripReview(req *http.Request, cluster string) (*http.Resp
 		if err != nil {
 			return nil, s.reviewError(req.Context(), cluster, err)
 		}
-		s.logReview(req.Context(), cluster, outcomePassthrough, resp.StatusCode)
+		s.logReview(req.Context(), cluster, outcomePassthrough, resp.StatusCode, "")
 		return resp, nil
 	}
 
@@ -81,7 +81,7 @@ func (s *Service) roundTripReview(req *http.Request, cluster string) (*http.Resp
 		return nil, s.reviewError(req.Context(), cluster, err)
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		s.logReview(req.Context(), cluster, outcomeNative, resp.StatusCode)
+		s.logReview(req.Context(), cluster, outcomeNative, resp.StatusCode, "")
 		return resp, nil
 	}
 
@@ -92,13 +92,13 @@ func (s *Service) roundTripReview(req *http.Request, cluster string) (*http.Resp
 	}
 	if tooLarge {
 		resp.Body = joinedBody{Reader: io.MultiReader(bytes.NewReader(answer), resp.Body), Closer: resp.Body}
-		s.logReview(req.Context(), cluster, outcomeNative, resp.StatusCode)
+		s.logReview(req.Context(), cluster, outcomeNative, resp.StatusCode, "")
 		return resp, nil
 	}
 	_ = resp.Body.Close()
 
 	if !reviewDenied(answer) {
-		return s.nativeReview(req.Context(), cluster, resp, answer)
+		return s.nativeReview(req.Context(), cluster, "", resp, answer)
 	}
 
 	set, denied, err := s.allowed(req.Context(), cluster, req.Header)
@@ -109,27 +109,27 @@ func (s *Service) roundTripReview(req *http.Request, cluster string) (*http.Resp
 		s.logger.WarnContext(req.Context(), "selfsubjectaccessreview", "cluster", cluster, "error", err.Error())
 	}
 	if denied != nil || err != nil || len(set.names) == 0 {
-		return s.nativeReview(req.Context(), cluster, resp, answer)
+		return s.nativeReview(req.Context(), cluster, set.user, resp, answer)
 	}
 
 	granted, ok := grantReview(answer)
 	if !ok {
-		return s.nativeReview(req.Context(), cluster, resp, answer)
+		return s.nativeReview(req.Context(), cluster, set.user, resp, answer)
 	}
 
 	resp.Body = io.NopCloser(bytes.NewReader(granted))
 	resp.ContentLength = int64(len(granted))
 	resp.TransferEncoding = nil
 	resp.Header.Set("Content-Length", strconv.Itoa(len(granted)))
-	s.logReview(req.Context(), cluster, outcomeGrant, resp.StatusCode)
+	s.logReview(req.Context(), cluster, outcomeGrant, resp.StatusCode, set.user)
 	return resp, nil
 }
 
 // nativeReview returns the review answer of the upstream unchanged, and logs
 // the native outcome.
-func (s *Service) nativeReview(ctx context.Context, cluster string, resp *http.Response, answer []byte) (*http.Response, error) {
+func (s *Service) nativeReview(ctx context.Context, cluster, user string, resp *http.Response, answer []byte) (*http.Response, error) {
 	resp.Body = io.NopCloser(bytes.NewReader(answer))
-	s.logReview(ctx, cluster, outcomeNative, resp.StatusCode)
+	s.logReview(ctx, cluster, outcomeNative, resp.StatusCode, user)
 	return resp, nil
 }
 
@@ -251,8 +251,13 @@ func grantReview(body []byte) ([]byte, bool) {
 	return granted, true
 }
 
-func (s *Service) logReview(ctx context.Context, cluster, outcome string, status int) {
-	s.logger.InfoContext(ctx, "selfsubjectaccessreview", "cluster", cluster, "outcome", outcome, "status", status)
+func (s *Service) logReview(ctx context.Context, cluster, outcome string, status int, user string) {
+	attrs := []any{"cluster", cluster, "outcome", outcome, "status", status}
+	if user != "" {
+		attrs = append(attrs, "user", user)
+	}
+	s.logger.InfoContext(ctx, "selfsubjectaccessreview", attrs...)
+	setCallerAttribute(ctx, user)
 }
 
 // reviewError logs the failed request. The caller returns the error, and the

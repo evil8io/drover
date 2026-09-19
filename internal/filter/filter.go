@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/evil8io/drover/internal/rancherclient"
 )
@@ -47,6 +48,9 @@ type Config struct {
 	// MeterProvider creates the meter of the filter metrics. Nil selects
 	// otel.GetMeterProvider().
 	MeterProvider metric.MeterProvider
+	// TracerProvider creates the tracer of the request span. Nil selects
+	// otel.GetTracerProvider().
+	TracerProvider trace.TracerProvider
 	// Now gives the time to the cache. Nil selects time.Now.
 	Now func() time.Time
 }
@@ -123,6 +127,10 @@ func New(cfg Config) (*Service, error) {
 	if meterProvider == nil {
 		meterProvider = otel.GetMeterProvider()
 	}
+	tracerProvider := cfg.TracerProvider
+	if tracerProvider == nil {
+		tracerProvider = otel.GetTracerProvider()
+	}
 	m, err := newMetrics(meterProvider)
 	if err != nil {
 		return nil, fmt.Errorf("build the filter metrics: %w", err)
@@ -133,7 +141,7 @@ func New(cfg Config) (*Service, error) {
 		tokenFile: cfg.TokenFile,
 		logger:    logger,
 		now:       now,
-		base:      otelhttp.NewTransport(base, otelhttp.WithMeterProvider(meterProvider)),
+		base:      otelhttp.NewTransport(base, otelhttp.WithMeterProvider(meterProvider), otelhttp.WithTracerProvider(tracerProvider)),
 		cache:     newCache(ttl, maxCacheEntries, now),
 		limiter:   newLimiter(fetchRate, fetchBurst, now),
 		metrics:   m,
@@ -147,6 +155,7 @@ func New(cfg Config) (*Service, error) {
 	}
 	svc.handler = otelhttp.NewHandler(http.HandlerFunc(svc.serve), "namespace-filter",
 		otelhttp.WithMeterProvider(meterProvider),
+		otelhttp.WithTracerProvider(tracerProvider),
 		otelhttp.WithFilter(func(r *http.Request) bool {
 			return r.URL.Path != "/healthz" && r.URL.Path != "/readyz"
 		}),
