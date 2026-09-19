@@ -28,6 +28,8 @@ func TestParseKeys(t *testing.T) {
 		{name: "a Kubernetes key", list: "kubernetes.io/metadata.name", wantErr: true},
 		{name: "a k8s.io key", list: "k8s.io/cluster-name", wantErr: true},
 		{name: "a denied key after a valid key", list: "cost-center,kubernetes.io/metadata.name", wantErr: true},
+		{name: "the managed labels annotation", list: managedLabelsKey, wantErr: true},
+		{name: "the managed annotations annotation", list: managedAnnotationsKey, wantErr: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

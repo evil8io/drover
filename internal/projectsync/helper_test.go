@@ -27,17 +27,20 @@ const (
 	betaProject = `{"id":"c-2:p-beta","clusterId":"c-2","name":"Beta",` +
 		`"labels":{"cost-center":"cc-2"},"annotations":{}}`
 
-	// alphaNamespaces has the four namespaces of cluster c-1. Only alpha-two
-	// needs a patch.
+	// alphaNamespaces has the five namespaces of cluster c-1. alpha-two and
+	// alpha-moved need a patch. alpha-one is in the wanted state already, and
+	// its tier label belongs to the tenant, because the managed annotation does
+	// not name it. alpha-moved owns tier, and the project does not set it.
 	alphaNamespaces = `{"kind":"NamespaceList","items":[
-{"metadata":{"name":"alpha-one","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1","tier":"gold"},"annotations":{"owner":"alpha@example.com"}}},
-{"metadata":{"name":"alpha-two","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"old","tier":"gold"},"annotations":{}}},
-{"metadata":{"name":"alpha-three","labels":{"other":"value"},"annotations":{}}},
-{"metadata":{"name":"alpha-orphan","labels":{"field.cattle.io/projectId":"p-gone"},"annotations":{}}}
+{"metadata":{"name":"alpha-one","resourceVersion":"11","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1","tier":"gold"},"annotations":{"owner":"alpha@example.com","drover-managed-labels":"cost-center","drover-managed-annotations":"owner"}}},
+{"metadata":{"name":"alpha-two","resourceVersion":"12","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"old","tier":"gold"},"annotations":{}}},
+{"metadata":{"name":"alpha-three","resourceVersion":"13","labels":{"other":"value"},"annotations":{}}},
+{"metadata":{"name":"alpha-orphan","resourceVersion":"14","labels":{"field.cattle.io/projectId":"p-gone"},"annotations":{}}},
+{"metadata":{"name":"alpha-moved","resourceVersion":"15","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1","tier":"gold"},"annotations":{"owner":"alpha@example.com","drover-managed-labels":"cost-center,tier","drover-managed-annotations":"owner"}}}
 ]}`
 
 	betaNamespaces = `{"kind":"NamespaceList","items":[
-{"metadata":{"name":"beta-one","labels":{"field.cattle.io/projectId":"p-beta"},"annotations":{}}}
+{"metadata":{"name":"beta-one","resourceVersion":"21","labels":{"field.cattle.io/projectId":"p-beta"},"annotations":{}}}
 ]}`
 
 	// nextPage is the pagination link of Rancher. Its host is the server URL of
@@ -62,6 +65,14 @@ type fakeRancher struct {
 	paginate bool
 	// forbidden is the cluster whose namespace list returns status 403.
 	forbidden string
+	// events are the watch frames of a cluster, in order. The handler writes
+	// them, then it ends the stream.
+	events map[string][]string
+	// patchStatus is the status of the patch of a namespace, by name. A name
+	// without an entry gets status 200.
+	patchStatus map[string]int
+	// patchBody is the answer body of a patch that fails, by namespace name.
+	patchBody map[string]string
 
 	mu       sync.Mutex
 	requests []recorded
@@ -86,6 +97,28 @@ func forbid(cluster string) func(*fakeRancher) {
 	return func(f *fakeRancher) { f.forbidden = cluster }
 }
 
+// watching serves frames as the namespace watch stream of cluster.
+func watching(cluster string, frames ...string) func(*fakeRancher) {
+	return func(f *fakeRancher) {
+		if f.events == nil {
+			f.events = make(map[string][]string)
+		}
+		f.events[cluster] = frames
+	}
+}
+
+// failPatch answers the patch of namespace with status and body.
+func failPatch(namespace string, status int, body string) func(*fakeRancher) {
+	return func(f *fakeRancher) {
+		if f.patchStatus == nil {
+			f.patchStatus = make(map[string]int)
+			f.patchBody = make(map[string]string)
+		}
+		f.patchStatus[namespace] = status
+		f.patchBody[namespace] = body
+	}
+}
+
 func (f *fakeRancher) serve(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	f.mu.Lock()
@@ -105,7 +138,7 @@ func (f *fakeRancher) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/api/v1/namespaces"):
 		f.serveNamespaces(w, r)
 	case r.Method == http.MethodPatch:
-		_, _ = io.WriteString(w, `{"kind":"Namespace"}`)
+		f.servePatch(w, r)
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
@@ -123,10 +156,26 @@ func (f *fakeRancher) serveProjects(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, `{"type":"collection","data":[`+betaProject+`],"pagination":{}}`)
 }
 
+func (f *fakeRancher) servePatch(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+	if status, ok := f.patchStatus[name]; ok {
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, f.patchBody[name])
+		return
+	}
+	_, _ = io.WriteString(w, `{"kind":"Namespace"}`)
+}
+
 func (f *fakeRancher) serveNamespaces(w http.ResponseWriter, r *http.Request) {
 	cluster := strings.Split(strings.TrimPrefix(r.URL.Path, "/k8s/clusters/"), "/")[0]
 	if cluster == f.forbidden {
 		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if r.URL.Query().Get("watch") == "true" {
+		for _, frame := range f.events[cluster] {
+			_, _ = io.WriteString(w, frame)
+		}
 		return
 	}
 	switch cluster {
