@@ -12,6 +12,7 @@ import (
 const (
 	reasonInternalError = "InternalError"
 	reasonTooLarge      = "RequestEntityTooLarge"
+	reasonThrottled     = "TooManyRequests"
 )
 
 type statusBody struct {

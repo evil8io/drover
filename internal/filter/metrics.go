@@ -19,6 +19,7 @@ type metrics struct {
 	watchesOpen      metric.Int64UpDownCounter
 	eventsDropped    metric.Int64Counter
 	framesUnfiltered metric.Int64Counter
+	fetchesThrottled metric.Int64Counter
 }
 
 // newMetrics creates the instruments of the filter, on the meter that
@@ -50,6 +51,12 @@ func newMetrics(provider metric.MeterProvider) (*metrics, error) {
 	if err != nil {
 		return nil, err
 	}
+	fetchesThrottled, err := meter.Int64Counter("drover.filter.fetch.throttled",
+		metric.WithDescription("Fetches of an allowed set that the fetch rate limit throttles, answered with 429."),
+		metric.WithUnit("1"))
+	if err != nil {
+		return nil, err
+	}
 
 	framesUnfiltered, err := meter.Int64Counter("drover.filter.frames.unfiltered",
 		metric.WithDescription("Websocket watch messages that the filter forwards without a decision, because the payload is above the size limit or does not parse."),
@@ -64,6 +71,7 @@ func newMetrics(provider metric.MeterProvider) (*metrics, error) {
 		watchesOpen:      watchesOpen,
 		eventsDropped:    eventsDropped,
 		framesUnfiltered: framesUnfiltered,
+		fetchesThrottled: fetchesThrottled,
 	}, nil
 }
 
@@ -100,4 +108,9 @@ func (m *metrics) eventDropped(ctx context.Context, cluster string) {
 // without a filter decision, for the cluster.
 func (m *metrics) frameUnfiltered(ctx context.Context, cluster string) {
 	m.framesUnfiltered.Add(ctx, 1, metric.WithAttributes(attribute.String("cluster", cluster)))
+}
+
+// fetchThrottled records one fetch that the rate limit throttles, with a 429 answer.
+func (m *metrics) fetchThrottled(ctx context.Context) {
+	m.fetchesThrottled.Add(ctx, 1)
 }

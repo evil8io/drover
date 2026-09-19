@@ -24,14 +24,16 @@ import (
 const telemetryShutdownGrace = 5 * time.Second
 
 type config struct {
-	listen        string
-	upstream      *url.URL
-	caFile        string
-	tokenFile     string
-	cacheTTL      time.Duration
-	logLevel      slog.Level
-	shutdownGrace time.Duration
-	telemetry     telemetry.Config
+	listen          string
+	upstream        *url.URL
+	caFile          string
+	tokenFile       string
+	cacheTTL        time.Duration
+	maxCacheEntries int
+	fetchRate       float64
+	logLevel        slog.Level
+	shutdownGrace   time.Duration
+	telemetry       telemetry.Config
 }
 
 func runNamespaceFilter(args []string) int {
@@ -62,11 +64,13 @@ func runNamespaceFilter(args []string) int {
 	}()
 
 	svc, err := filter.New(filter.Config{
-		Upstream:  cfg.upstream,
-		CAFile:    cfg.caFile,
-		TokenFile: cfg.tokenFile,
-		CacheTTL:  cfg.cacheTTL,
-		Logger:    logger,
+		Upstream:        cfg.upstream,
+		CAFile:          cfg.caFile,
+		TokenFile:       cfg.tokenFile,
+		CacheTTL:        cfg.cacheTTL,
+		MaxCacheEntries: cfg.maxCacheEntries,
+		FetchRate:       cfg.fetchRate,
+		Logger:          logger,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -96,6 +100,8 @@ func runNamespaceFilter(args []string) int {
 		"listen", cfg.listen,
 		"upstream", cfg.upstream.String(),
 		"cache_ttl", cfg.cacheTTL.String(),
+		"max_cache_entries", cfg.maxCacheEntries,
+		"fetch_rate", cfg.fetchRate,
 		"shutdown_grace", cfg.shutdownGrace.String(),
 	)
 
@@ -135,6 +141,8 @@ func parseConfig(args []string, output io.Writer, getenv func(string) string) (c
 	flags.StringVar(&cfg.caFile, "upstream-ca-file", "", "PEM bundle that verifies an https upstream")
 	flags.StringVar(&cfg.tokenFile, "token-file", "", "file with the API token of the service user")
 	flags.DurationVar(&cfg.cacheTTL, "cache-ttl", 15*time.Second, "lifetime of a cached allowed set")
+	flags.IntVar(&cfg.maxCacheEntries, "max-cache-entries", 1000, "hard bound on the cached allowed sets")
+	flags.Float64Var(&cfg.fetchRate, "fetch-rate", 50, "fetches per second that the shared rate limit allows, for a fetch of an allowed set")
 	flags.StringVar(&logLevel, "log-level", "info", "debug, info, warn or error")
 	flags.DurationVar(&cfg.shutdownGrace, "shutdown-grace", 20*time.Second, "grace period for the shutdown after SIGTERM or SIGINT")
 	tf := registerTelemetryFlags(flags, getenv)

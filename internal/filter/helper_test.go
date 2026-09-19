@@ -151,6 +151,15 @@ func newHarness(t *testing.T, handler http.HandlerFunc) *harness {
 	return newHarnessWithTokenFile(t, handler, tokenFile)
 }
 
+// newHarnessOpt is newHarness with Config overrides, for a test that needs a
+// custom cache bound or fetch rate.
+func newHarnessOpt(t *testing.T, handler http.HandlerFunc, opts ...func(*Config)) *harness {
+	t.Helper()
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	writeToken(t, tokenFile, "service")
+	return newHarnessWithTokenFile(t, handler, tokenFile, opts...)
+}
+
 // newHarnessWithoutToken builds a harness whose token file does not exist yet.
 func newHarnessWithoutToken(t *testing.T, handler http.HandlerFunc) *harness {
 	t.Helper()
@@ -158,7 +167,7 @@ func newHarnessWithoutToken(t *testing.T, handler http.HandlerFunc) *harness {
 	return newHarnessWithTokenFile(t, handler, tokenFile)
 }
 
-func newHarnessWithTokenFile(t *testing.T, handler http.HandlerFunc, tokenFile string) *harness {
+func newHarnessWithTokenFile(t *testing.T, handler http.HandlerFunc, tokenFile string, opts ...func(*Config)) *harness {
 	t.Helper()
 	up := newUpstream(t, handler)
 
@@ -168,12 +177,16 @@ func newHarnessWithTokenFile(t *testing.T, handler http.HandlerFunc, tokenFile s
 	}
 	clock := newClock()
 	logs := &syncBuffer{}
-	svc, err := New(Config{
+	cfg := Config{
 		Upstream:  target,
 		TokenFile: tokenFile,
 		Logger:    slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		Now:       clock.Now,
-	})
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	svc, err := New(cfg)
 	if err != nil {
 		t.Fatalf("new handler: %v", err)
 	}
