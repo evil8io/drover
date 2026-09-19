@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.0](https://github.com/evil8io/drover/compare/v0.6.0...v0.7.0) (2026-09-19)
+
+
+### Features
+
+* select a namespace list by project, not by name ([#27](https://github.com/evil8io/drover/issues/27)) ([dffbe07](https://github.com/evil8io/drover/commit/dffbe0796220aa29c387effc3009851a61967296))
+
+
+### Bug Fixes
+
+* stream the Steve allowed-set decode to cut peak memory ([#25](https://github.com/evil8io/drover/issues/25)) ([13f42f4](https://github.com/evil8io/drover/commit/13f42f424186b91506731cc258d6a517071c15cf))
+
 ## [0.6.0](https://github.com/evil8io/drover/compare/v0.5.0...v0.6.0) (2026-09-18)
 
 
