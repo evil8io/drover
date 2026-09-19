@@ -191,6 +191,8 @@ The service writes a warning with the cluster id and continues with the next clu
 | `--token-file` | (required) | File with the API token of the Rancher service user. |
 | `--labels` | | Comma-separated label keys of a project to copy. |
 | `--annotations` | | Comma-separated annotation keys of a project to copy. |
+| `--name-label` | | Label key on the namespace that gets the display name of the project. |
+| `--name-annotation` | | Annotation key on the namespace that gets the display name of the project. |
 | `--interval` | `60s` | Time between two runs. |
 | `--listen` | `:8080` | Address the service listens on. |
 | `--log-level` | `info` | One of `debug`, `info`, `warn`, or `error`. |
@@ -199,7 +201,9 @@ The service writes a warning with the cluster id and continues with the next clu
 | `--otlp-metrics` | `true` | Send metrics to the OTLP endpoint. |
 | `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | `service.name` resource attribute. |
 
-The flags need at least one label key or one annotation key. A key under `field.cattle.io/`, `cattle.io/`, `kubernetes.io/`, or `k8s.io/` is not valid, because Rancher and Kubernetes own those prefixes.
+The flags need at least one label key, annotation key, name label key, or name annotation key. A key under `field.cattle.io/`, `cattle.io/`, `kubernetes.io/`, or `k8s.io/` is not valid, because Rancher and Kubernetes own those prefixes.
+
+The `--name-annotation` value is the raw display name of the project. The `--name-label` value is a sanitised copy: the service replaces every character outside `[A-Za-z0-9._-]` with `-`, and cuts the result to 63 characters. It then trims the leading and trailing characters that are not alphanumeric. A name that sanitises to an empty value gets no label, and the service writes one warning line for that project in that run.
 
 The service starts with no token file. It skips the run until the file has a token, and it writes one warning per state change of the file.
 
