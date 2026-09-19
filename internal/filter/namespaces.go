@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -65,8 +66,15 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 	privileged.Header.Set("Authorization", "Bearer "+token)
 	privileged.Header.Del("Cookie")
 
+	selected := false
 	if watch {
 		privileged.Header.Set("Accept", filterJSONAccept(req.Header.Get("Accept")))
+		query := privileged.URL.Query()
+		if selector, ok := watchSelector(query.Get("labelSelector"), set); ok {
+			query.Set("labelSelector", selector)
+			privileged.URL.RawQuery = query.Encode()
+			selected = true
+		}
 	} else {
 		query := privileged.URL.Query()
 		query.Set("labelSelector", namespaceSelector(query.Get("labelSelector"), set))
@@ -86,15 +94,19 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 		allow := func(name string, labels map[string]string) bool {
 			return s.allowedNamespace(req.Context(), cluster, req.Header, name, labels)
 		}
+		var writer *io.PipeWriter
 		switch filtered.StatusCode {
 		case http.StatusOK:
-			filtered.Body = filterWatchBody(req.Context(), filtered.Body, allow, s.logger, s.watches, s.metrics, cluster)
+			filtered.Body, writer = filterWatchBody(req.Context(), filtered.Body, allow, s.logger, s.watches, s.metrics, cluster)
 			// A dropped event changes the byte count, so the length of upstream
 			// no longer applies.
 			filtered.ContentLength = -1
 			filtered.Header.Del("Content-Length")
 		case http.StatusSwitchingProtocols:
-			filterWatchUpgrade(req.Context(), filtered, allow, s.logger, s.watches, s.metrics, cluster)
+			writer = filterWatchUpgrade(req.Context(), filtered, allow, s.logger, s.watches, s.metrics, cluster)
+		}
+		if selected && writer != nil {
+			go s.watchProjects(req.Context(), cluster, req.Header, set.projects, writer)
 		}
 	}
 	result.outcome, result.status, result.count = outcomeFiltered, filtered.StatusCode, len(set.names)
@@ -135,6 +147,58 @@ func namespaceSelector(caller string, set allowedSet) string {
 		return mergeProjectSelector(caller, set.projects)
 	}
 	return mergeSelector(caller, set.names)
+}
+
+// watchSelector picks the label selector for the privileged watch, and
+// reports whether the watch gets one. The selector of a watch does not change
+// while the stream runs, so a name selector hides a namespace that Rancher
+// puts in a project of the caller later. A project selector has no such gap, because a
+// new namespace of a project matches by itself. A caller with a namespace
+// outside its own projects gets no selector, because only the event filter
+// separates that case.
+func watchSelector(caller string, set allowedSet) (string, bool) {
+	switch {
+	case len(set.names) == 0 && len(set.projects) == 0:
+		return mergeSelector(caller, nil), true
+	case len(set.projects) > 0 && len(set.extras) == 0:
+		return mergeProjectSelector(caller, set.projects), true
+	default:
+		return "", false
+	}
+}
+
+// watchProjects ends the watch stream of writer once the project set of the
+// caller differs from projects. A watch with a selector gets no event outside
+// that selector, so the event filter cannot show a project that Rancher
+// grants later. The client re-lists and re-watches after the end of the
+// stream, and the new watch gets a selector for the new project set. The
+// re-read of the allowed set goes through the cache of a plain list, so it
+// adds no request beyond the one fetch per cache TTL.
+func (s *Service) watchProjects(ctx context.Context, cluster string, header http.Header, projects []string, writer *io.PipeWriter) {
+	done := s.watches.done(writer)
+	ticker := time.NewTicker(s.cache.ttl)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+		}
+
+		set, denied, err := s.allowed(ctx, cluster, header)
+		if denied != nil {
+			_ = denied.Body.Close()
+		}
+		if denied != nil || err != nil || slices.Equal(set.projects, projects) {
+			continue
+		}
+		s.logger.InfoContext(ctx, "ended a namespace watch, because the projects of the caller changed", "cluster", cluster)
+		s.watches.end(writer)
+		return
+	}
 }
 
 // mergeSelector appends the name requirement to the selector of the caller. An

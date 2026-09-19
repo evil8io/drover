@@ -605,6 +605,69 @@ func TestMergeSelector(t *testing.T) {
 	}
 }
 
+func TestWatchSelector(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		caller   string
+		set      allowedSet
+		want     string
+		selected bool
+	}{
+		{
+			name:     "no namespace and no project",
+			set:      allowedSet{},
+			want:     "kubernetes.io/metadata.name,!kubernetes.io/metadata.name",
+			selected: true,
+		},
+		{
+			name:     "no namespace and no project, with a caller selector",
+			caller:   "team=x",
+			set:      allowedSet{},
+			want:     "team=x,kubernetes.io/metadata.name,!kubernetes.io/metadata.name",
+			selected: true,
+		},
+		{
+			name:     "every namespace in a project of the caller",
+			set:      allowedSet{names: []string{"a", "b"}, projects: []string{"p-1", "p-2"}},
+			want:     "field.cattle.io/projectId in (p-1,p-2)",
+			selected: true,
+		},
+		{
+			name:     "every namespace in a project of the caller, with a caller selector",
+			caller:   "team=x",
+			set:      allowedSet{names: []string{"a", "b"}, projects: []string{"p-1"}},
+			want:     "team=x,field.cattle.io/projectId in (p-1)",
+			selected: true,
+		},
+		{
+			name: "a namespace outside the projects of the caller",
+			set:  allowedSet{names: []string{"a", "b"}, projects: []string{"p-1"}, extras: []string{"b"}},
+		},
+		{
+			name:   "a namespace outside the projects of the caller, with a caller selector",
+			caller: "team=x",
+			set:    allowedSet{names: []string{"a", "b"}, projects: []string{"p-1"}, extras: []string{"b"}},
+		},
+		{
+			name: "a namespace and no project",
+			set:  allowedSet{names: []string{"a"}, extras: []string{"a"}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got, selected := watchSelector(test.caller, test.set)
+			if selected != test.selected {
+				t.Fatalf("watchSelector(%q, %+v) selected = %v, want %v", test.caller, test.set, selected, test.selected)
+			}
+			if got != test.want {
+				t.Errorf("watchSelector(%q, %+v) = %q, want %q", test.caller, test.set, got, test.want)
+			}
+		})
+	}
+}
+
 func TestFilterJSONAccept(t *testing.T) {
 	t.Parallel()
 	const kubectlTable = "application/json;as=Table;v=v1;g=meta.k8s.io," +
