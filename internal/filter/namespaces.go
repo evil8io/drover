@@ -45,7 +45,7 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBody))
 	_ = resp.Body.Close()
 
-	names, denied, err := s.allowedNamespaces(req.Context(), cluster, req.Header)
+	set, denied, err := s.allowed(req.Context(), cluster, req.Header)
 	switch {
 	case denied != nil:
 		result.outcome, result.status = outcomeDenied, denied.StatusCode
@@ -54,7 +54,7 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 	case err != nil:
 		return s.statusError(req, start, result, err), nil
 	}
-	s.logger.DebugContext(req.Context(), "allowed namespaces", "cluster", cluster, "names", names)
+	s.logger.DebugContext(req.Context(), "allowed namespaces", "cluster", cluster, "names", set.names)
 
 	token, err := rancherclient.ReadToken(s.tokenFile)
 	if err != nil {
@@ -69,7 +69,7 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 		privileged.Header.Set("Accept", filterJSONAccept(req.Header.Get("Accept")))
 	} else {
 		query := privileged.URL.Query()
-		query.Set("labelSelector", mergeSelector(query.Get("labelSelector"), names))
+		query.Set("labelSelector", namespaceSelector(query.Get("labelSelector"), set))
 		privileged.URL.RawQuery = query.Encode()
 	}
 
@@ -91,7 +91,7 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 		filtered.ContentLength = -1
 		filtered.Header.Del("Content-Length")
 	}
-	result.outcome, result.status, result.count = outcomeFiltered, filtered.StatusCode, len(names)
+	result.outcome, result.status, result.count = outcomeFiltered, filtered.StatusCode, len(set.names)
 	s.logList(req.Context(), start, result)
 	return filtered, nil
 }
@@ -118,6 +118,19 @@ func filterJSONAccept(accept string) string {
 	return strings.Join(kept, ",")
 }
 
+// namespaceSelector picks the label selector for the privileged list.
+// A namespace with the project label of a project the caller may see is a
+// namespace the caller may list. The watch path applies that same rule per
+// event. The project selector is therefore equivalent to the name selector
+// when set.extras is empty. Unlike the name selector, it also stays the same
+// across the pages of one chunked list.
+func namespaceSelector(caller string, set allowedSet) string {
+	if len(set.projects) > 0 && len(set.extras) == 0 {
+		return mergeProjectSelector(caller, set.projects)
+	}
+	return mergeSelector(caller, set.names)
+}
+
 // mergeSelector appends the name requirement to the selector of the caller. An
 // empty set gives a selector that matches nothing.
 func mergeSelector(caller string, names []string) string {
@@ -125,6 +138,16 @@ func mergeSelector(caller string, names []string) string {
 	if len(names) > 0 {
 		requirement = nameLabel + " in (" + strings.Join(names, ",") + ")"
 	}
+	if caller == "" {
+		return requirement
+	}
+	return caller + "," + requirement
+}
+
+// mergeProjectSelector appends the project requirement to the selector of the
+// caller.
+func mergeProjectSelector(caller string, projects []string) string {
+	requirement := projectLabel + " in (" + strings.Join(projects, ",") + ")"
 	if caller == "" {
 		return requirement
 	}

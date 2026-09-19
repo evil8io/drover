@@ -99,6 +99,28 @@ func TestListWatchStreams(t *testing.T) {
 	}
 }
 
+func TestWatchSendsNoSelectorWithProjectMatch(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstreamWithProjects(
+		steveLabeledHandler(steveNamespace{name: "a", project: "p-1"}),
+		projectsHandler("p-1"),
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+		},
+	))
+
+	resp, _ := h.do(t, h.request(t, http.MethodGet, listPath+"?watch=true", nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	privileged := h.upstream.all()[3]
+	if got := privileged.query.Get("labelSelector"); got != "" {
+		t.Errorf("labelSelector = %q, want no selector", got)
+	}
+}
+
 func TestWatchDropsDisallowedNamespace(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, listUpstream(steveHandler("a"), func(w http.ResponseWriter, r *http.Request) {

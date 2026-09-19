@@ -272,6 +272,32 @@ func steveHandler(names ...string) http.HandlerFunc {
 	}
 }
 
+// steveNamespace is one namespace item of steveLabeledHandler, with its
+// project label. An empty project omits the label.
+type steveNamespace struct {
+	name    string
+	project string
+}
+
+// steveLabeledHandler answers a Steve namespace collection whose items have
+// the given project labels.
+func steveLabeledHandler(namespaces ...steveNamespace) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		items := make([]string, 0, len(namespaces))
+		for _, ns := range namespaces {
+			if ns.project == "" {
+				items = append(items, fmt.Sprintf(`{"id":%q,"type":"namespace","metadata":{"name":%q}}`, ns.name, ns.name))
+				continue
+			}
+			items = append(items, fmt.Sprintf(`{"id":%q,"type":"namespace","metadata":{"name":%q,"labels":{%q:%q}}}`,
+				ns.name, ns.name, projectLabel, ns.project))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, fmt.Sprintf(`{"type":"collection","resourceType":"namespace","count":%d,"continue":"","data":[%s]}`,
+			len(namespaces), strings.Join(items, ",")))
+	}
+}
+
 func namespaceListHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Source", "privileged")
