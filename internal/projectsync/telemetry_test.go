@@ -118,3 +118,53 @@ func findSum(t *testing.T, data metricdata.ResourceMetrics, name string) metricd
 	t.Fatalf("no metric named %s", name)
 	return metricdata.Sum[int64]{}
 }
+
+// TestWatchRecordsTheEventAndTheOpenStream checks that one namespace watch
+// stream records drover.sync.events with the type attribute, and that
+// drover.sync.watches.open returns to zero once the stream ends.
+func TestWatchRecordsTheEventAndTheOpenStream(t *testing.T) {
+	t.Parallel()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	rancher := newFakeRancher(t, watching("c-1", addedEvent, modifiedEvent))
+	syncer, _ := newSyncer(t, rancher, tokenFile(t, serviceToken), func(cfg *Config) {
+		cfg.MeterProvider = provider
+	})
+	ctx := context.Background()
+	syncer.reconcile(ctx)
+	if _, err := syncer.streamNamespaces(ctx, "c-1", ""); err != nil {
+		t.Fatalf("stream the namespace watch: %v", err)
+	}
+
+	var data metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &data); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+
+	events := findSum(t, data, "drover.sync.events")
+	types := make(map[string]int64, len(events.DataPoints))
+	for _, point := range events.DataPoints {
+		value, _ := point.Attributes.Value(attribute.Key("type"))
+		types[value.AsString()] = point.Value
+	}
+	if types[watchAdded] != 1 || types[watchModified] != 1 {
+		t.Errorf("event points = %v, want one ADDED and one MODIFIED", types)
+	}
+
+	open := findSum(t, data, "drover.sync.watches.open")
+	if len(open.DataPoints) != 1 || open.DataPoints[0].Value != 0 {
+		t.Errorf("drover.sync.watches.open points = %v, want one point with value 0", open.DataPoints)
+	}
+
+	patched := findSum(t, data, "drover.sync.namespaces.patched")
+	var fromTheWatch int64
+	for _, point := range patched.DataPoints {
+		if origin, ok := point.Attributes.Value(attribute.Key("origin")); ok && origin.AsString() == originWatch {
+			fromTheWatch = point.Value
+		}
+	}
+	if fromTheWatch != 1 {
+		t.Errorf("namespaces patched from the watch = %d, want 1", fromTheWatch)
+	}
+}

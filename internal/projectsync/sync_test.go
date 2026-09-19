@@ -12,12 +12,17 @@ import (
 )
 
 const (
-	alphaTwoPath  = "/k8s/clusters/c-1/api/v1/namespaces/alpha-two"
-	betaOnePath   = "/k8s/clusters/c-2/api/v1/namespaces/beta-one"
-	alphaListPath = "/k8s/clusters/c-1/api/v1/namespaces"
+	alphaTwoPath   = "/k8s/clusters/c-1/api/v1/namespaces/alpha-two"
+	alphaMovedPath = "/k8s/clusters/c-1/api/v1/namespaces/alpha-moved"
+	betaOnePath    = "/k8s/clusters/c-2/api/v1/namespaces/beta-one"
+	alphaListPath  = "/k8s/clusters/c-1/api/v1/namespaces"
 
-	alphaTwoBody = `{"metadata":{"labels":{"cost-center":"cc-1"},"annotations":{"owner":"alpha@example.com"}}}`
-	betaOneBody  = `{"metadata":{"labels":{"cost-center":"cc-2"}}}`
+	alphaTwoBody = `{"metadata":{"labels":{"cost-center":"cc-1"},` +
+		`"annotations":{"drover-managed-annotations":"owner","drover-managed-labels":"cost-center",` +
+		`"owner":"alpha@example.com"}}}`
+	alphaMovedBody = `{"metadata":{"labels":{"tier":null},"annotations":{"drover-managed-labels":"cost-center"}}}`
+	betaOneBody    = `{"metadata":{"labels":{"cost-center":"cc-2"},` +
+		`"annotations":{"drover-managed-labels":"cost-center"}}}`
 )
 
 // reconcileOnce runs one reconcile against a fake Rancher with a token file.
@@ -51,10 +56,11 @@ func TestReconcileSetsAMissingKeyAndOverwritesADifferentValue(t *testing.T) {
 	t.Parallel()
 	rancher, logs := reconcileOnce(t)
 
-	if got := patchedPaths(rancher); !slices.Equal(got, []string{alphaTwoPath, betaOnePath}) {
-		t.Fatalf("patched paths = %v, want [%s %s]", got, alphaTwoPath, betaOnePath)
+	want := []string{alphaMovedPath, alphaTwoPath, betaOnePath}
+	if got := patchedPaths(rancher); !slices.Equal(got, want) {
+		t.Fatalf("patched paths = %v, want %v", got, want)
 	}
-	bodies := map[string]string{alphaTwoPath: alphaTwoBody, betaOnePath: betaOneBody}
+	bodies := map[string]string{alphaTwoPath: alphaTwoBody, alphaMovedPath: alphaMovedBody, betaOnePath: betaOneBody}
 	for _, patch := range rancher.method(http.MethodPatch) {
 		if patch.body != bodies[patch.path] {
 			t.Errorf("patch of %s = %s, want %s", patch.path, patch.body, bodies[patch.path])
@@ -80,7 +86,7 @@ func TestReconcileSetsAMissingKeyAndOverwritesADifferentValue(t *testing.T) {
 	if !strings.Contains(logs.String(), `msg="namespace unchanged" cluster=c-1 namespace=alpha-one`) {
 		t.Errorf("no unchanged line for alpha-one:\n%s", logs.String())
 	}
-	if !strings.Contains(logs.String(), "msg=reconcile clusters=2 projects=2 namespaces=5 patched=2 errors=0") {
+	if !strings.Contains(logs.String(), "msg=reconcile clusters=2 projects=2 namespaces=6 patched=3 errors=0") {
 		t.Errorf("no summary line:\n%s", logs.String())
 	}
 }
@@ -101,21 +107,51 @@ func TestReconcileSetsTheProjectDisplayName(t *testing.T) {
 		t.Fatalf("patch requests of %s = %d, want 1", alphaTwoPath, len(patches))
 	}
 	want := `{"metadata":{"labels":{"example.com/project-name":"Alpha"},` +
-		`"annotations":{"example.com/project-display-name":"Alpha"}}}`
+		`"annotations":{"drover-managed-annotations":"example.com/project-display-name",` +
+		`"drover-managed-labels":"example.com/project-name",` +
+		`"example.com/project-display-name":"Alpha"}}}`
 	if got := patches[0].body; got != want {
 		t.Errorf("patch of %s = %s, want %s", alphaTwoPath, got, want)
 	}
 }
 
-func TestReconcileKeepsAKeyThatTheProjectDoesNotHave(t *testing.T) {
+func TestReconcileKeepsAKeyOfTheTenant(t *testing.T) {
 	t.Parallel()
 	rancher, _ := reconcileOnce(t)
 
-	// The project has no tier label, and namespace alpha-two has tier gold.
-	for _, patch := range rancher.method(http.MethodPatch) {
+	// The project has no tier label. Namespace alpha-two has tier gold, and its
+	// managed annotation does not name tier, so the tier key belongs to the
+	// tenant.
+	for _, patch := range requestsOfPath(rancher, alphaTwoPath) {
 		if strings.Contains(patch.body, "tier") {
 			t.Errorf("patch of %s has the tier key: %s", patch.path, patch.body)
 		}
+	}
+}
+
+func TestReconcileRemovesAManagedKeyThatTheProjectDropped(t *testing.T) {
+	t.Parallel()
+	rancher, _ := reconcileOnce(t)
+
+	// Namespace alpha-moved owns cost-center and tier. The project has no tier,
+	// so the patch removes tier and records the smaller owned set.
+	patches := requestsOfPath(rancher, alphaMovedPath)
+	if len(patches) != 1 {
+		t.Fatalf("patch requests of %s = %d, want 1", alphaMovedPath, len(patches))
+	}
+	if got := patches[0].body; got != alphaMovedBody {
+		t.Errorf("patch of %s = %s, want %s", alphaMovedPath, got, alphaMovedBody)
+	}
+}
+
+func TestReconcileLeavesANamespaceThatIsInTheWantedState(t *testing.T) {
+	t.Parallel()
+	rancher, _ := reconcileOnce(t)
+
+	// Namespace alpha-one has every key of the project, and its managed
+	// annotations name the same keys.
+	if got := requestsOfPath(rancher, "/k8s/clusters/c-1/api/v1/namespaces/alpha-one"); len(got) != 0 {
+		t.Errorf("patch requests of alpha-one = %d, want 0", len(got))
 	}
 }
 
@@ -183,8 +219,8 @@ func TestReconcileWaitsForTheTokenFile(t *testing.T) {
 	writeToken(t, path, serviceToken+"\n")
 	syncer.reconcile(context.Background())
 
-	if got := patchedPaths(rancher); !slices.Equal(got, []string{alphaTwoPath, betaOnePath}) {
-		t.Errorf("patched paths = %v, want [%s %s]", got, alphaTwoPath, betaOnePath)
+	if got := patchedPaths(rancher); !slices.Equal(got, []string{alphaMovedPath, alphaTwoPath, betaOnePath}) {
+		t.Errorf("patched paths = %v, want [%s %s %s]", got, alphaMovedPath, alphaTwoPath, betaOnePath)
 	}
 	if !strings.Contains(logs.String(), `msg="the token file has a token"`) {
 		t.Errorf("no line about the token file:\n%s", logs.String())
@@ -202,8 +238,8 @@ func TestReconcileFollowsThePagination(t *testing.T) {
 	if got := lists[1].query.Get("marker"); got != "2" {
 		t.Errorf("marker of the second page = %q, want 2", got)
 	}
-	if got := patchedPaths(rancher); !slices.Equal(got, []string{alphaTwoPath, betaOnePath}) {
-		t.Errorf("patched paths = %v, want [%s %s]", got, alphaTwoPath, betaOnePath)
+	if got := patchedPaths(rancher); !slices.Equal(got, []string{alphaMovedPath, alphaTwoPath, betaOnePath}) {
+		t.Errorf("patched paths = %v, want [%s %s %s]", got, alphaMovedPath, alphaTwoPath, betaOnePath)
 	}
 }
 

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 const (
@@ -40,9 +42,10 @@ type projectList struct {
 // namespace is the part of a Kubernetes namespace that the service reads.
 type namespace struct {
 	Metadata struct {
-		Name        string            `json:"name"`
-		Labels      map[string]string `json:"labels"`
-		Annotations map[string]string `json:"annotations"`
+		Name            string            `json:"name"`
+		ResourceVersion string            `json:"resourceVersion"`
+		Labels          map[string]string `json:"labels"`
+		Annotations     map[string]string `json:"annotations"`
 	} `json:"metadata"`
 }
 
@@ -50,15 +53,81 @@ type namespaceList struct {
 	Items []namespace `json:"items"`
 }
 
+// watchEvent is one event of a namespace watch stream. The object is a
+// Namespace on every type but ERROR, which carries a Status.
+type watchEvent struct {
+	Type   string          `json:"type"`
+	Object json.RawMessage `json:"object"`
+}
+
+// namespace returns the Namespace of the event.
+func (e watchEvent) namespace() (namespace, error) {
+	var item namespace
+	if err := json.Unmarshal(e.Object, &item); err != nil {
+		return namespace{}, err
+	}
+	return item, nil
+}
+
+// status returns the reason and the message of an ERROR event, as one line.
+func (e watchEvent) status() string {
+	var answer kubeStatus
+	if err := json.Unmarshal(e.Object, &answer); err != nil {
+		return "the watch returned an error event"
+	}
+	return fmt.Sprintf("the watch returned an error event: %s %s", answer.Reason, answer.Message)
+}
+
+// kubeStatus is the part of a Kubernetes Status object that the service reads.
+type kubeStatus struct {
+	Reason  string `json:"reason"`
+	Message string `json:"message"`
+}
+
 // statusError is an answer of Rancher with a status that the service does not expect.
 type statusError struct {
-	method string
-	path   string
-	status int
+	method  string
+	path    string
+	status  int
+	reason  string
+	message string
+}
+
+// newStatusError returns the error of an answer with status. It reads the
+// reason and the message from a Kubernetes Status body, and it accepts a body
+// that is not one.
+func newStatusError(method, path string, status int, body []byte) statusError {
+	err := statusError{method: method, path: path, status: status}
+	var answer kubeStatus
+	if json.Unmarshal(body, &answer) == nil {
+		err.reason, err.message = answer.Reason, answer.Message
+	}
+	return err
 }
 
 func (e statusError) Error() string {
-	return fmt.Sprintf("%s %s returned status %d", e.method, e.path, e.status)
+	if e.reason == "" {
+		return fmt.Sprintf("%s %s returned status %d", e.method, e.path, e.status)
+	}
+	return fmt.Sprintf("%s %s returned status %d, reason %s", e.method, e.path, e.status, e.reason)
+}
+
+// skippable reports whether a failed namespace patch needs no error. A
+// namespace that is gone answers 404. A namespace that another writer changed
+// at the same time answers 409. A namespace in Terminating answers 403 with a
+// message that names that state. The next reconcile run repeats the work.
+func skippable(err error) bool {
+	var status statusError
+	if !errors.As(err, &status) {
+		return false
+	}
+	switch status.status {
+	case http.StatusNotFound, http.StatusConflict:
+		return true
+	case http.StatusForbidden:
+		return strings.Contains(strings.ToLower(status.message), "terminat")
+	}
+	return false
 }
 
 // projects returns every project that the service user sees, over all pages.
@@ -72,7 +141,7 @@ func (s *Syncer) projects(ctx context.Context, token string) ([]project, error) 
 			return nil, err
 		}
 		if status != http.StatusOK {
-			return nil, statusError{method: http.MethodGet, path: projectsPath, status: status}
+			return nil, newStatusError(http.MethodGet, projectsPath, status, body)
 		}
 
 		var list projectList
@@ -102,7 +171,7 @@ func (s *Syncer) namespaces(ctx context.Context, token, cluster string) ([]names
 		return nil, err
 	}
 	if status != http.StatusOK {
-		return nil, statusError{method: http.MethodGet, path: path, status: status}
+		return nil, newStatusError(http.MethodGet, path, status, body)
 	}
 
 	var list namespaceList
@@ -120,14 +189,28 @@ func (s *Syncer) patchNamespace(ctx context.Context, token, cluster, name string
 	}
 
 	path := namespacesPath(cluster) + "/" + name
-	status, _, err := s.do(ctx, http.MethodPatch, s.target(path, nil), token, mergePatchType, body)
+	status, answer, err := s.do(ctx, http.MethodPatch, s.target(path, nil), token, mergePatchType, body)
 	if err != nil {
 		return err
 	}
 	if status != http.StatusOK {
-		return statusError{method: http.MethodPatch, path: path, status: status}
+		return newStatusError(http.MethodPatch, path, status, answer)
 	}
 	return nil
+}
+
+// openStream sends a GET that returns a long-lived body. Only ctx ends the
+// request, because a watch stream outlives the request timeout of the service.
+// The caller closes the body.
+func (s *Syncer) openStream(ctx context.Context, target, token string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", s.userAgent)
+	return s.client.Do(req)
 }
 
 func namespacesPath(cluster string) string {
