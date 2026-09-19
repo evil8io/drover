@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -240,6 +241,114 @@ func TestListStevePagination(t *testing.T) {
 	want := "kubernetes.io/metadata.name in (a,b,c)"
 	if got := requests[4].query.Get("labelSelector"); got != want {
 		t.Errorf("labelSelector = %q, want %q", got, want)
+	}
+}
+
+func TestListSteveRequestExcludesManagedFields(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstream(steveHandler("a"), namespaceListHandler))
+
+	resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	requests := h.upstream.all()
+	steve := requests[1]
+	if got := steve.query.Get("exclude"); got != "metadata.managedFields" {
+		t.Errorf("allowed set exclude = %q, want %q", got, "metadata.managedFields")
+	}
+	projects := requests[2]
+	if _, ok := projects.query["exclude"]; ok {
+		t.Error("the project list request has an exclude parameter")
+	}
+}
+
+func TestListSteveBodyTooLarge(t *testing.T) {
+	t.Parallel()
+	huge := fmt.Sprintf(`{"type":"collection","data":[{"id":"a","metadata":{"name":"%s"}}]}`, strings.Repeat("x", maxSteveBody))
+	h := newHarness(t, listUpstream(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, huge)
+	}, namespaceListHandler))
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+
+	var status struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &status); err != nil {
+		t.Fatalf("parse status body %q: %v", body, err)
+	}
+	want := fmt.Sprintf("allowed set response is larger than %d bytes", maxSteveBody)
+	if !strings.Contains(status.Message, want) {
+		t.Errorf("message = %q, want to contain %q", status.Message, want)
+	}
+}
+
+func TestListProjectsBodyTooLarge(t *testing.T) {
+	t.Parallel()
+	huge := fmt.Sprintf(`{"type":"collection","data":[{"id":"local:%s"}]}`, strings.Repeat("x", maxSteveBody))
+	h := newHarness(t, listUpstreamWithProjects(steveHandler("a"), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, huge)
+	}, namespaceListHandler))
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+
+	var status struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &status); err != nil {
+		t.Fatalf("parse status body %q: %v", body, err)
+	}
+	want := fmt.Sprintf("project list response is larger than %d bytes", maxSteveBody)
+	if !strings.Contains(status.Message, want) {
+		t.Errorf("message = %q, want to contain %q", status.Message, want)
+	}
+}
+
+func TestListTooManyAllowedNames(t *testing.T) {
+	t.Parallel()
+	names := make([]string, maxAllowedNames+1)
+	for i := range names {
+		names[i] = fmt.Sprintf("ns-%d", i)
+	}
+	h := newHarness(t, listUpstream(steveHandler(names...), namespaceListHandler))
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+
+	var status struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &status); err != nil {
+		t.Fatalf("parse status body %q: %v", body, err)
+	}
+	want := fmt.Sprintf("allowed set has more than %d names", maxAllowedNames)
+	if !strings.Contains(status.Message, want) {
+		t.Errorf("message = %q, want to contain %q", status.Message, want)
+	}
+}
+
+func TestListSteveMalformedBody(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstream(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data": tomato}`)
+	}, namespaceListHandler))
+
+	resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", resp.StatusCode)
 	}
 }
 

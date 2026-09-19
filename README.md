@@ -72,6 +72,7 @@ A Helm chart for drover is published separately.
 | --- | --- |
 | Cache delay | A role change becomes visible after the cache TTL, on top of Rancher's own delay. |
 | Field selector | A field selector on a name outside the allowed set returns an empty list. A `get` on that name returns Forbidden. |
+| Namespace cap | A caller with more than 20,000 allowed namespace names gets an error, not a list. |
 | Self-check | `kubectl auth can-i list namespaces` returns yes, while RBAC returns no. |
 | Trust level | The service is a privileged component. It uses the cluster-owner token for the filtered namespace list and for the watch stream. |
 
