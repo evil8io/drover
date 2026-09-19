@@ -749,3 +749,63 @@ func TestUpgradedWatchEndsOnProjectChange(t *testing.T) {
 		t.Errorf("read after the close frame = %v, want io.EOF", err)
 	}
 }
+
+// TestWatchEndsOnNamespaceOutsideProjects checks that the ticker ends the
+// stream once the caller gets a namespace outside its own projects. The
+// selector of the watch holds the projects of the caller only, and Rancher
+// drops that namespace server-side, so no event reaches the event filter.
+func TestWatchEndsOnNamespaceOutsideProjects(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	namespaces := newNamespaceSet(steveNamespace{name: "a", project: "p-1"})
+	h := newHarnessOpt(t, listUpstreamWithProjects(
+		namespaces.handler(),
+		newProjectSet("p-1").handler(),
+		openWatch(release),
+	), shortTTL)
+
+	ended := streamEnd(startWatch(t, h))
+	namespaces.set(steveNamespace{name: "a", project: "p-1"}, steveNamespace{name: "b"})
+	h.clock.advance(time.Minute)
+
+	select {
+	case err := <-ended:
+		if err != nil {
+			t.Errorf("stream error = %v, want a clean end of the stream", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the stream stayed open after the caller got a namespace outside its projects")
+	}
+}
+
+// TestWatchStaysOpenOnNamespaceInsideProjects checks that a new namespace in a
+// project of the caller keeps the stream open. The selector for the same
+// projects is the same string, and Rancher sends the event for that namespace.
+func TestWatchStaysOpenOnNamespaceInsideProjects(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	namespaces := newNamespaceSet(steveNamespace{name: "a", project: "p-1"})
+	h := newHarnessOpt(t, listUpstreamWithProjects(
+		namespaces.handler(),
+		newProjectSet("p-1").handler(),
+		openWatch(release),
+	), shortTTL)
+
+	ended := streamEnd(startWatch(t, h))
+	before := h.upstream.countPath(stevePath)
+	namespaces.set(steveNamespace{name: "a", project: "p-1"}, steveNamespace{name: "b", project: "p-1"})
+	h.clock.advance(time.Minute)
+
+	if !waitFor(func() bool { return h.upstream.countPath(stevePath) > before }) {
+		t.Fatal("the ticker did not re-read the allowed set of the caller")
+	}
+	select {
+	case err := <-ended:
+		t.Fatalf("the stream ended with %v, want an open stream", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
