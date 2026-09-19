@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/evil8io/drover/compare/v0.8.0...v0.8.1) (2026-09-19)
+
+
+### Bug Fixes
+
+* read a websocket watch as a byte stream, not one event per message ([#35](https://github.com/evil8io/drover/issues/35)) ([d4b1950](https://github.com/evil8io/drover/commit/d4b1950ae15bb030ae1a898103ba4e732b2170ff))
+
 ## [0.8.0](https://github.com/evil8io/drover/compare/v0.7.0...v0.8.0) (2026-09-19)
 
 
