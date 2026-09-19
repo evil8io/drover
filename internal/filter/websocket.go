@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"time"
 )
 
 const (
@@ -27,7 +28,16 @@ const (
 	maxMessage = 1 << 20
 	// maxControlPayload is the payload limit of RFC 6455 for a control frame.
 	maxControlPayload = 125
+
+	// closeFrameWait bounds the write of closeFrame into the stream, because
+	// that write waits for the reader.
+	closeFrameWait = 5 * time.Second
 )
+
+// closeFrame is an unmasked close frame of RFC 6455 with status 1000, a
+// normal closure. The service writes it when it ends an upgraded stream
+// itself, so the client reports a clean end of the stream.
+var closeFrame = []byte{0x80 | opcodeClose, 0x02, 0x03, 0xe8}
 
 // upgradedWatch is the body of a namespace watch that Rancher answers with a
 // protocol switch. Read returns the frames of the upstream that pass the
@@ -49,21 +59,22 @@ func (u *upgradedWatch) Close() error {
 
 // filterWatchUpgrade replaces the body of an upgraded namespace watch, so
 // every websocket message gets the event filter of a chunked watch. It
-// registers the stream in registry while the goroutine runs, so a drain can
+// returns the write side of the filtered stream. It registers that write side
+// in registry while the goroutine runs, so a drain and a project change can
 // end the stream. It raises drover.filter.watches.open while the stream is
-// open. The body stays unchanged when it is not an io.ReadWriteCloser,
-// because httputil.ReverseProxy needs that interface for an upgraded
-// connection.
-func filterWatchUpgrade(ctx context.Context, resp *http.Response, allow func(name string, labels map[string]string) bool, logger *slog.Logger, registry *watchRegistry, metrics *metrics, cluster string) {
+// open. The body stays unchanged, and the return is nil, when the body is not
+// an io.ReadWriteCloser, because httputil.ReverseProxy needs that interface
+// for an upgraded connection.
+func filterWatchUpgrade(ctx context.Context, resp *http.Response, allow func(name string, labels map[string]string) bool, logger *slog.Logger, registry *watchRegistry, metrics *metrics, cluster string) *io.PipeWriter {
 	upstream, ok := resp.Body.(io.ReadWriteCloser)
 	if !ok {
 		logger.ErrorContext(ctx, "the upgraded watch gets no filter, because its body is read-only",
 			"cluster", cluster, "body_type", fmt.Sprintf("%T", resp.Body))
-		return
+		return nil
 	}
 
 	reader, writer := io.Pipe()
-	registry.add(writer)
+	registry.add(writer, true)
 	metrics.watchOpened(ctx)
 
 	filter := &frameFilter{
@@ -87,6 +98,7 @@ func filterWatchUpgrade(ctx context.Context, resp *http.Response, allow func(nam
 	}()
 
 	resp.Body = &upgradedWatch{PipeReader: reader, upstream: upstream}
+	return writer
 }
 
 // frameFilter reads the RFC 6455 frames of a namespace watch, and writes the

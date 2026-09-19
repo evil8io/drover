@@ -26,10 +26,17 @@ The service handles two request patterns from a Rancher kubeconfig. It passes ev
 2. A status other than 403 goes back to the client unchanged.
 3. On a 403 error, the service requests the caller's allowed namespaces from Steve, the Rancher API server in the cluster agent.
 4. A plain list gets a new request with a service token, no cookie, and a label selector. The selector matches `field.cattle.io/projectId` on the caller's projects, when every allowed namespace has that label. It matches the allowed namespace names in every other case. That case includes the selector that matches no namespace, when the caller may see none.
-5. A watch (`?watch=true`) gets a new request with a service token, no cookie, and the caller's own query, with no name filter. The request keeps every Accept entry of the caller whose media type is `application/json`, for example a table request from kubectl, and drops every other entry, for example protobuf or CBOR. It sets `application/json` when no entry remains.
-6. The service sends the new request to Rancher and streams the response to the client. For a watch, an event passes only when every namespace in it is in the allowed set, or its `field.cattle.io/projectId` label matches a caller project. A server-side table event has one row per namespace, and the filter checks the name and the labels of each row.
+5. A watch (`?watch=true`) gets a new request with a service token, no cookie, and the caller's own query. The selector of a watch does not change while the stream runs. A name selector on a watch hides a namespace that Rancher puts in a project of the caller later. The watch therefore gets a project selector, or no selector at all. The selector of the caller merges into it, as it does on a list. Three cases apply:
+   - A caller with no namespace and no project gets the selector that matches no namespace.
+   - A caller whose namespaces are all in its own projects gets a `field.cattle.io/projectId` selector on those projects. A new namespace of such a project matches that selector by itself.
+   - A caller with a namespace outside its own projects gets no selector, because no selector holds that namespace and the projects of the caller at the same time.
 
-A watch request streams over chunked HTTP, or over a websocket connection after a protocol switch. A namespace that Rancher grants after the watch starts becomes visible within one cache TTL, because the event filter reads the allowed set through the same cache as a plain list.
+   The request keeps every Accept entry of the caller whose media type is `application/json`, for example a table request from kubectl, and drops every other entry, for example protobuf or CBOR. It sets `application/json` when no entry remains.
+6. The service sends the new request to Rancher, and it streams the response to the client. The event filter runs on every watch, also on a watch with a selector. An event passes only when every namespace in it is in the allowed set, or its `field.cattle.io/projectId` label matches a project of the caller. A server-side table event has one row per namespace, and the filter checks the name and the labels of each row. The filter is the only gate for a watch with no selector. It is the second gate for a watch with a selector.
+
+A watch request streams over chunked HTTP, or over a websocket connection after a protocol switch. A namespace that Rancher grants after the start of the watch becomes visible in one of three ways. A project selector matches a new namespace of a project of the caller at once. A watch with no selector gets the event too, because the event filter reads the allowed set through the same cache as a plain list. In every other case the service ends the watch, and the client sees the namespace on its next watch.
+
+The service ends a watch with a selector when the projects of the caller change. A timer re-reads the allowed set of the caller once per cache TTL, from the cache of a plain list, so it adds no request. A different project set ends the stream with a clean end of the stream. The client then re-lists and re-watches, and the new watch gets a selector for the new projects. An upgraded stream gets a websocket close frame with status 1000 first, so the client reports a normal closure. A watch with no selector needs no timer, because the event filter shows a new project by itself.
 
 On a websocket connection the events arrive as RFC 6455 frames. The filter assembles a text or a binary message from its continuation frames, and it decides on the whole message. It forwards a close, a ping, and a pong frame unchanged, also while a message is incomplete. With the `base64.binary.k8s.io` subprotocol it decodes the message before the decision, and it forwards the original bytes. A message above 1 MiB reaches the client without a decision, and so does a message that is no watch event. The filter counts each one, and it writes a `warn` line.
 
@@ -113,7 +120,7 @@ The service continues an incoming `traceparent` on every request. It starts a sp
 On SIGTERM or SIGINT, the service drains before it stops:
 
 1. It marks itself not ready. `/readyz` answers 503 from that point on.
-2. It ends every open watch stream with a clean end of the stream. A client re-lists and re-watches, with no error.
+2. It ends every open watch stream with a clean end of the stream. An upgraded stream gets a websocket close frame with status 1000 first. A client re-lists and re-watches, with no error.
 3. It stops the HTTP server, within the `--shutdown-grace` period.
 
 The exit code is non-zero only when the server does not stop in time.

@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"time"
 )
 
 const (
@@ -56,63 +57,108 @@ func eventAllowed(event watchEvent, allow func(name string, labels map[string]st
 	return true
 }
 
-// watchRegistry is the set of open watch streams of a Service. filterWatchBody
-// adds a stream when it starts, and removes it when its goroutine ends.
+// watchStream is one open watch stream. upgraded marks a stream of a
+// websocket connection, which needs a close frame before the pipe ends.
+type watchStream struct {
+	upgraded bool
+	done     chan struct{}
+}
+
+// watchRegistry is the set of open watch streams of a Service. A stream joins
+// when it starts, and it leaves when its goroutine ends.
 type watchRegistry struct {
 	mu      sync.Mutex
-	writers map[*io.PipeWriter]struct{}
+	streams map[*io.PipeWriter]*watchStream
 }
 
 func newWatchRegistry() *watchRegistry {
-	return &watchRegistry{writers: make(map[*io.PipeWriter]struct{})}
+	return &watchRegistry{streams: make(map[*io.PipeWriter]*watchStream)}
 }
 
-func (r *watchRegistry) add(w *io.PipeWriter) {
+func (r *watchRegistry) add(w *io.PipeWriter, upgraded bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.writers[w] = struct{}{}
+	r.streams[w] = &watchStream{upgraded: upgraded, done: make(chan struct{})}
 }
 
 func (r *watchRegistry) remove(w *io.PipeWriter) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	delete(r.writers, w)
+	if stream, ok := r.streams[w]; ok {
+		close(stream.done)
+		delete(r.streams, w)
+	}
+}
+
+// done returns a channel that closes once the stream leaves the registry. A
+// writer that is not in the registry gets a channel that is closed already.
+func (r *watchRegistry) done(w *io.PipeWriter) <-chan struct{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if stream, ok := r.streams[w]; ok {
+		return stream.done
+	}
+	ended := make(chan struct{})
+	close(ended)
+	return ended
 }
 
 func (r *watchRegistry) len() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return len(r.writers)
+	return len(r.streams)
 }
 
-// closeAll ends every registered stream with a plain EOF, that is
-// writer.Close, never CloseWithError. It returns the count of streams it ends.
+// end ends one registered stream with a plain EOF, that is writer.Close,
+// never CloseWithError. An upgraded stream gets a websocket close frame
+// first, because a connection that ends without one gives the client an error
+// instead of a clean end of the stream. The write of that frame waits for the
+// reader, so a timer ends the stream even when the client reads nothing.
+func (r *watchRegistry) end(w *io.PipeWriter) {
+	r.mu.Lock()
+	stream, ok := r.streams[w]
+	r.mu.Unlock()
+	if !ok {
+		return
+	}
+	if stream.upgraded {
+		timer := time.AfterFunc(closeFrameWait, func() { _ = w.Close() })
+		defer timer.Stop()
+		_, _ = w.Write(closeFrame)
+	}
+	_ = w.Close()
+}
+
+// closeAll ends every registered stream, and returns the count of streams it
+// ends. Each stream ends in its own goroutine, because the close frame of an
+// upgraded stream waits for the reader.
 func (r *watchRegistry) closeAll() int {
 	r.mu.Lock()
-	writers := make([]*io.PipeWriter, 0, len(r.writers))
-	for w := range r.writers {
+	writers := make([]*io.PipeWriter, 0, len(r.streams))
+	for w := range r.streams {
 		writers = append(writers, w)
 	}
 	r.mu.Unlock()
 
 	for _, w := range writers {
-		_ = w.Close()
+		go r.end(w)
 	}
 	return len(writers)
 }
 
 // filterWatchBody reads a namespace watch stream from upstream, and returns a
-// stream with only the events that allow lets through. A BOOKMARK, an ERROR,
-// and any event the filter cannot parse always pass. It registers writer in
-// registry while the goroutine runs, so a drain can end the stream. The
-// goroutine ends, and closes upstream, in two cases: a read of upstream fails,
-// for example because ctx cancels, or a write to the pipe fails because the
-// reader closed it or a drain ended it. It raises drover.filter.watches.open
-// while the stream is open, and counts a dropped event on cluster in
-// drover.filter.events.dropped.
-func filterWatchBody(ctx context.Context, upstream io.ReadCloser, allow func(name string, labels map[string]string) bool, logger *slog.Logger, registry *watchRegistry, metrics *metrics, cluster string) io.ReadCloser {
+// stream with only the events that allow lets through, plus the write side of
+// that stream. A BOOKMARK, an ERROR, and any event the filter cannot parse
+// always pass. It registers the write side in registry while the goroutine
+// runs, so a drain and a project change can end the stream. The goroutine
+// ends, and closes upstream, in two cases: a read of upstream fails, for
+// example because ctx cancels, or a write to the pipe fails because the
+// reader closed it or the registry ended it. It raises
+// drover.filter.watches.open while the stream is open, and counts a dropped
+// event on cluster in drover.filter.events.dropped.
+func filterWatchBody(ctx context.Context, upstream io.ReadCloser, allow func(name string, labels map[string]string) bool, logger *slog.Logger, registry *watchRegistry, metrics *metrics, cluster string) (io.ReadCloser, *io.PipeWriter) {
 	reader, writer := io.Pipe()
-	registry.add(writer)
+	registry.add(writer, false)
 	metrics.watchOpened(ctx)
 
 	go func() {
@@ -155,5 +201,5 @@ func filterWatchBody(ctx context.Context, upstream io.ReadCloser, allow func(nam
 		}
 	}()
 
-	return reader
+	return reader, writer
 }

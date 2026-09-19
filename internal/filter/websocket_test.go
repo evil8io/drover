@@ -367,8 +367,9 @@ func TestUpgradeWritesToUpstream(t *testing.T) {
 	}
 }
 
-// TestDrainEndsUpgradedWatch checks that a drain ends an upgraded stream with
-// io.EOF, and that the goroutine leaves the registry.
+// TestDrainEndsUpgradedWatch checks that a drain writes a close frame, that
+// the stream then ends with io.EOF, and that the goroutine leaves the
+// registry.
 func TestDrainEndsUpgradedWatch(t *testing.T) {
 	t.Parallel()
 	source, sourceWriter := io.Pipe()
@@ -380,9 +381,12 @@ func TestDrainEndsUpgradedWatch(t *testing.T) {
 	if got := h.registry.closeAll(); got != 1 {
 		t.Errorf("closeAll = %d, want 1", got)
 	}
-	if _, err := h.body.Read(make([]byte, 1)); err != io.EOF {
-		t.Errorf("read error = %v, want io.EOF", err)
+
+	frame := h.next(t)
+	if frame.opcode != opcodeClose || !bytes.Equal(frame.payload, []byte{0x03, 0xe8}) {
+		t.Errorf("frame = %+v, want the close frame with status 1000", frame)
 	}
+	h.wantEnd(t)
 
 	// Unblock the read of the goroutine, so it can remove itself.
 	_ = sourceWriter.Close()
