@@ -14,10 +14,11 @@ const meterName = "github.com/evil8io/drover/internal/filter"
 // metrics has the instruments that record the outcome of a request that the
 // filter answers.
 type metrics struct {
-	requests      metric.Int64Counter
-	requestDur    metric.Float64Histogram
-	watchesOpen   metric.Int64UpDownCounter
-	eventsDropped metric.Int64Counter
+	requests         metric.Int64Counter
+	requestDur       metric.Float64Histogram
+	watchesOpen      metric.Int64UpDownCounter
+	eventsDropped    metric.Int64Counter
+	framesUnfiltered metric.Int64Counter
 }
 
 // newMetrics creates the instruments of the filter, on the meter that
@@ -50,11 +51,19 @@ func newMetrics(provider metric.MeterProvider) (*metrics, error) {
 		return nil, err
 	}
 
+	framesUnfiltered, err := meter.Int64Counter("drover.filter.frames.unfiltered",
+		metric.WithDescription("Websocket watch messages that the filter forwards without a decision, because the payload is above the size limit or does not parse."),
+		metric.WithUnit("1"))
+	if err != nil {
+		return nil, err
+	}
+
 	return &metrics{
-		requests:      requests,
-		requestDur:    requestDur,
-		watchesOpen:   watchesOpen,
-		eventsDropped: eventsDropped,
+		requests:         requests,
+		requestDur:       requestDur,
+		watchesOpen:      watchesOpen,
+		eventsDropped:    eventsDropped,
+		framesUnfiltered: framesUnfiltered,
 	}, nil
 }
 
@@ -85,4 +94,10 @@ func (m *metrics) watchClosed(ctx context.Context) {
 // eventDropped records one dropped watch event, for the cluster.
 func (m *metrics) eventDropped(ctx context.Context, cluster string) {
 	m.eventsDropped.Add(ctx, 1, metric.WithAttributes(attribute.String("cluster", cluster)))
+}
+
+// frameUnfiltered records one websocket watch message that reaches the caller
+// without a filter decision, for the cluster.
+func (m *metrics) frameUnfiltered(ctx context.Context, cluster string) {
+	m.framesUnfiltered.Add(ctx, 1, metric.WithAttributes(attribute.String("cluster", cluster)))
 }

@@ -303,11 +303,14 @@ func TestWatchReplacesCallerProtobufAccept(t *testing.T) {
 	}
 }
 
+// TestListWatchWebsocketUpgrade checks that the event filter also reads the
+// frames of a watch that Rancher answers with a protocol switch.
 func TestListWatchWebsocketUpgrade(t *testing.T) {
 	t.Parallel()
-	echoed := make(chan struct{})
-	defer close(echoed)
+	read := make(chan struct{})
+	defer close(read)
 
+	allowed := addedEvent("a")
 	h := newHarness(t, listUpstream(steveHandler("a"), func(w http.ResponseWriter, r *http.Request) {
 		hijacker, ok := w.(http.Hijacker)
 		if !ok {
@@ -321,21 +324,14 @@ func TestListWatchWebsocketUpgrade(t *testing.T) {
 		}
 		defer func() { _ = conn.Close() }()
 		_, _ = buffered.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_, _ = buffered.Write(wsFrame(true, opcodeText, addedEvent("z")))
+		_, _ = buffered.Write(wsFrame(true, opcodeText, allowed))
+		_, _ = buffered.Write(wsFrame(true, opcodeClose, nil))
 		if err := buffered.Flush(); err != nil {
 			t.Errorf("write the upgrade response: %v", err)
 			return
 		}
-		line, err := buffered.ReadString('\n')
-		if err != nil {
-			t.Errorf("read from the client: %v", err)
-			return
-		}
-		_, _ = buffered.WriteString(line)
-		if err := buffered.Flush(); err != nil {
-			t.Errorf("write the echo: %v", err)
-			return
-		}
-		<-echoed
+		<-read
 	}))
 
 	conn, err := net.Dial("tcp", strings.TrimPrefix(h.proxy.URL, "http://"))
@@ -370,15 +366,19 @@ func TestListWatchWebsocketUpgrade(t *testing.T) {
 		t.Errorf("Upgrade = %q, want websocket", got)
 	}
 
-	if _, err := conn.Write([]byte("ping\n")); err != nil {
-		t.Fatalf("write to the upgraded connection: %v", err)
-	}
-	echo, err := reader.ReadString('\n')
+	frame, err := readWSFrame(reader)
 	if err != nil {
-		t.Fatalf("read the echo: %v", err)
+		t.Fatalf("read the first frame: %v", err)
 	}
-	if echo != "ping\n" {
-		t.Errorf("echo = %q, want %q", echo, "ping\n")
+	if string(frame.payload) != string(allowed) {
+		t.Errorf("first frame = %q, want the allowed event %q", frame.payload, allowed)
+	}
+	frame, err = readWSFrame(reader)
+	if err != nil {
+		t.Fatalf("read the second frame: %v", err)
+	}
+	if frame.opcode != opcodeClose {
+		t.Errorf("second frame opcode = %#x, want the close frame %#x", frame.opcode, opcodeClose)
 	}
 
 	requests := h.upstream.all()
