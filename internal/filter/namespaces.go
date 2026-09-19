@@ -6,7 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -74,13 +73,15 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 	privileged.Header.Del(extensionsHeader)
 
 	selected := false
+	var callerSelector, watchLabelSelector string
 	if watch {
 		privileged.Header.Set("Accept", filterJSONAccept(req.Header.Get("Accept")))
 		query := privileged.URL.Query()
-		if selector, ok := watchSelector(query.Get("labelSelector"), set); ok {
+		callerSelector = query.Get("labelSelector")
+		if selector, ok := watchSelector(callerSelector, set); ok {
 			query.Set("labelSelector", selector)
 			privileged.URL.RawQuery = query.Encode()
-			selected = true
+			selected, watchLabelSelector = true, selector
 		}
 	} else {
 		query := privileged.URL.Query()
@@ -113,7 +114,7 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 			writer = filterWatchUpgrade(req.Context(), filtered, allow, s.logger, s.watches, s.metrics, cluster)
 		}
 		if selected && writer != nil {
-			go s.watchProjects(req.Context(), cluster, req.Header, set.projects, writer)
+			go s.endOnSelectorChange(req.Context(), cluster, req.Header, callerSelector, watchLabelSelector, writer)
 		}
 	}
 	result.outcome, result.status, result.count = outcomeFiltered, filtered.StatusCode, len(set.names)
@@ -174,14 +175,15 @@ func watchSelector(caller string, set allowedSet) (string, bool) {
 	}
 }
 
-// watchProjects ends the watch stream of writer once the project set of the
-// caller differs from projects. A watch with a selector gets no event outside
-// that selector, so the event filter cannot show a project that Rancher
-// grants later. The client re-lists and re-watches after the end of the
-// stream, and the new watch gets a selector for the new project set. The
-// re-read of the allowed set goes through the cache of a plain list, so it
-// adds no request beyond the one fetch per cache TTL.
-func (s *Service) watchProjects(ctx context.Context, cluster string, header http.Header, projects []string, writer *io.PipeWriter) {
+// endOnSelectorChange ends the watch stream of writer once the selector that
+// the allowed set of the caller gives differs from selector. A watch with a
+// selector gets no event outside that selector, so the event filter cannot
+// show a namespace that Rancher grants later. The client re-lists and
+// re-watches after the end of the stream, and the new watch gets the selector
+// of the new allowed set. The re-read of the allowed set goes through the
+// cache of a plain list, so it adds no request beyond the one fetch per cache
+// TTL.
+func (s *Service) endOnSelectorChange(ctx context.Context, cluster string, header http.Header, caller, selector string, writer *io.PipeWriter) {
 	done := s.watches.done(writer)
 	ticker := time.NewTicker(s.cache.ttl)
 	defer ticker.Stop()
@@ -199,10 +201,13 @@ func (s *Service) watchProjects(ctx context.Context, cluster string, header http
 		if denied != nil {
 			_ = denied.Body.Close()
 		}
-		if denied != nil || err != nil || slices.Equal(set.projects, projects) {
+		if denied != nil || err != nil {
 			continue
 		}
-		s.logger.InfoContext(ctx, "ended a namespace watch, because the projects of the caller changed", "cluster", cluster)
+		if current, ok := watchSelector(caller, set); ok && current == selector {
+			continue
+		}
+		s.logger.InfoContext(ctx, "ended a namespace watch, because the selector of the caller changed", "cluster", cluster)
 		s.watches.end(writer)
 		return
 	}

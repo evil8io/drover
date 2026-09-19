@@ -430,6 +430,32 @@ func steveLabeledHandler(namespaces ...steveNamespace) http.HandlerFunc {
 	}
 }
 
+// namespaceSet is the Steve namespace collection that an upstream handler
+// answers. A test changes it while a watch runs.
+type namespaceSet struct {
+	mu         sync.Mutex
+	namespaces []steveNamespace
+}
+
+func newNamespaceSet(namespaces ...steveNamespace) *namespaceSet {
+	return &namespaceSet{namespaces: namespaces}
+}
+
+func (n *namespaceSet) set(namespaces ...steveNamespace) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.namespaces = namespaces
+}
+
+func (n *namespaceSet) handler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		n.mu.Lock()
+		namespaces := slices.Clone(n.namespaces)
+		n.mu.Unlock()
+		steveLabeledHandler(namespaces...)(w, r)
+	}
+}
+
 func namespaceListHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Source", "privileged")
