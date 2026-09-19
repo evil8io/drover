@@ -40,6 +40,12 @@ type Config struct {
 	Labels []string
 	// Annotations are the annotation keys of a project that the service copies.
 	Annotations []string
+	// NameLabel is the label key that gets the display name of the project.
+	// Empty turns the label off.
+	NameLabel string
+	// NameAnnotation is the annotation key that gets the display name of the
+	// project. Empty turns the annotation off.
+	NameAnnotation string
 	// Interval is the time between two runs. Zero selects 60 s.
 	Interval time.Duration
 	// Logger gets one line per namespace, and one summary line per run. Nil selects slog.Default.
@@ -56,25 +62,27 @@ type Config struct {
 
 // Syncer reconciles the namespaces of every project that the service user sees.
 type Syncer struct {
-	rancher     *url.URL
-	tokenFile   string
-	labels      []string
-	annotations []string
-	interval    time.Duration
-	timeout     time.Duration
-	userAgent   string
-	logger      *slog.Logger
-	client      *http.Client
-	metrics     *metrics
-	tracer      trace.Tracer
+	rancher        *url.URL
+	tokenFile      string
+	labels         []string
+	annotations    []string
+	nameLabel      string
+	nameAnnotation string
+	interval       time.Duration
+	timeout        time.Duration
+	userAgent      string
+	logger         *slog.Logger
+	client         *http.Client
+	metrics        *metrics
+	tracer         trace.Tracer
 
 	// tokenMissing keeps the last state of the token file, so that the service
 	// logs one warning per state change.
 	tokenMissing bool
 }
 
-// New returns a syncer for the configuration. It needs at least one label key or
-// one annotation key.
+// New returns a syncer for the configuration. It needs at least one label key,
+// annotation key, name label key, or name annotation key.
 func New(cfg Config) (*Syncer, error) {
 	if cfg.RancherURL == nil {
 		return nil, errors.New("the Rancher URL is required")
@@ -91,10 +99,16 @@ func New(cfg Config) (*Syncer, error) {
 	if cfg.TokenFile == "" {
 		return nil, errors.New("the token file is required")
 	}
-	if len(cfg.Labels)+len(cfg.Annotations) == 0 {
-		return nil, errors.New("at least one label key or one annotation key is required")
+	if len(cfg.Labels)+len(cfg.Annotations) == 0 && cfg.NameLabel == "" && cfg.NameAnnotation == "" {
+		return nil, errors.New("at least one label key, annotation key, name label key, or name annotation key is required")
 	}
-	for _, key := range slices.Concat(cfg.Labels, cfg.Annotations) {
+	keys := slices.Concat(cfg.Labels, cfg.Annotations)
+	for _, key := range []string{cfg.NameLabel, cfg.NameAnnotation} {
+		if key != "" {
+			keys = append(keys, key)
+		}
+	}
+	for _, key := range keys {
 		if err := checkKey(key); err != nil {
 			return nil, err
 		}
@@ -136,17 +150,19 @@ func New(cfg Config) (*Syncer, error) {
 	}
 
 	return &Syncer{
-		rancher:     &rancher,
-		tokenFile:   cfg.TokenFile,
-		labels:      slices.Clone(cfg.Labels),
-		annotations: slices.Clone(cfg.Annotations),
-		interval:    interval,
-		timeout:     min(interval, maxTimeout),
-		userAgent:   "drover/" + version,
-		logger:      logger,
-		client:      &http.Client{Transport: rancherclient.WrapTransport(transport, meterProvider)},
-		metrics:     m,
-		tracer:      tracerProvider.Tracer(tracerName),
+		rancher:        &rancher,
+		tokenFile:      cfg.TokenFile,
+		labels:         slices.Clone(cfg.Labels),
+		annotations:    slices.Clone(cfg.Annotations),
+		nameLabel:      cfg.NameLabel,
+		nameAnnotation: cfg.NameAnnotation,
+		interval:       interval,
+		timeout:        min(interval, maxTimeout),
+		userAgent:      "drover/" + version,
+		logger:         logger,
+		client:         &http.Client{Transport: rancherclient.WrapTransport(transport, meterProvider)},
+		metrics:        m,
+		tracer:         tracerProvider.Tracer(tracerName),
 	}, nil
 }
 
@@ -268,6 +284,7 @@ func (s *Syncer) syncCluster(ctx context.Context, token, cluster string, project
 	}
 	run.namespaces += len(items)
 
+	nameLabels := make(map[string]string)
 	for _, item := range items {
 		name := item.Metadata.Name
 		projectName := item.Metadata.Labels[projectLabel]
@@ -278,7 +295,8 @@ func (s *Syncer) syncCluster(ctx context.Context, token, cluster string, project
 			continue
 		}
 
-		change := desired(source, item, s.labels, s.annotations)
+		nameLabelValue := s.nameLabelValue(ctx, cluster, source, nameLabels)
+		change := desired(source, item, s.labels, s.annotations, s.nameLabel, s.nameAnnotation, nameLabelValue)
 		if change.empty() {
 			s.logger.DebugContext(ctx, "namespace unchanged",
 				"cluster", cluster, "namespace", name, "project", projectName)
@@ -296,6 +314,25 @@ func (s *Syncer) syncCluster(ctx context.Context, token, cluster string, project
 			"labels", keysOf(change.labels), "annotations", keysOf(change.annotations))
 		s.metrics.namespacePatched(ctx)
 	}
+}
+
+// nameLabelValue returns the sanitised label value of the project's display
+// name, cached in cache by project id. It logs one warning per project id when
+// the display name has no valid label value. An off name label returns "".
+func (s *Syncer) nameLabelValue(ctx context.Context, cluster string, source project, cache map[string]string) string {
+	if s.nameLabel == "" {
+		return ""
+	}
+	if value, ok := cache[source.ID]; ok {
+		return value
+	}
+	value := sanitizeLabelValue(source.Name)
+	cache[source.ID] = value
+	if value == "" {
+		s.logger.WarnContext(ctx, "the project display name has no valid label value",
+			"cluster", cluster, "project", source.ID)
+	}
+	return value
 }
 
 // patch is the metadata that one namespace needs from its project.
@@ -320,12 +357,36 @@ func (p patch) body() ([]byte, error) {
 	return json.Marshal(document)
 }
 
-// desired returns the keys that the namespace needs from the project.
-func desired(source project, target namespace, labels, annotations []string) patch {
-	return patch{
-		labels:      changes(source.Labels, target.Metadata.Labels, labels),
-		annotations: changes(source.Annotations, target.Metadata.Annotations, annotations),
+// desired returns the keys that the namespace needs from the project. nameLabel
+// and nameAnnotation are the configured name keys, empty when off.
+// nameLabelValue is the sanitised label value; an empty value skips the label.
+func desired(source project, target namespace, labels, annotations []string, nameLabel, nameAnnotation, nameLabelValue string) patch {
+	sourceLabels, labelKeys := source.Labels, labels
+	if nameLabel != "" && nameLabelValue != "" {
+		sourceLabels = withKey(sourceLabels, nameLabel, nameLabelValue)
+		labelKeys = append(slices.Clone(labels), nameLabel)
 	}
+	sourceAnnotations, annotationKeys := source.Annotations, annotations
+	if nameAnnotation != "" {
+		sourceAnnotations = withKey(sourceAnnotations, nameAnnotation, source.Name)
+		annotationKeys = append(slices.Clone(annotations), nameAnnotation)
+	}
+	return patch{
+		labels:      changes(sourceLabels, target.Metadata.Labels, labelKeys),
+		annotations: changes(sourceAnnotations, target.Metadata.Annotations, annotationKeys),
+	}
+}
+
+// withKey returns a copy of m with key set to value. An empty key or an empty
+// value returns m unchanged.
+func withKey(m map[string]string, key, value string) map[string]string {
+	if key == "" || value == "" {
+		return m
+	}
+	out := make(map[string]string, len(m)+1)
+	maps.Copy(out, m)
+	out[key] = value
+	return out
 }
 
 // changes returns every key of source in keys that target does not have with the

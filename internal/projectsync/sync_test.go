@@ -85,6 +85,28 @@ func TestReconcileSetsAMissingKeyAndOverwritesADifferentValue(t *testing.T) {
 	}
 }
 
+func TestReconcileSetsTheProjectDisplayName(t *testing.T) {
+	t.Parallel()
+	rancher := newFakeRancher(t)
+	syncer, _ := newSyncer(t, rancher, tokenFile(t, serviceToken+"\n"), func(cfg *Config) {
+		cfg.Labels = nil
+		cfg.Annotations = nil
+		cfg.NameLabel = "example.com/project-name"
+		cfg.NameAnnotation = "example.com/project-display-name"
+	})
+	syncer.reconcile(context.Background())
+
+	patches := requestsOfPath(rancher, alphaTwoPath)
+	if len(patches) != 1 {
+		t.Fatalf("patch requests of %s = %d, want 1", alphaTwoPath, len(patches))
+	}
+	want := `{"metadata":{"labels":{"example.com/project-name":"Alpha"},` +
+		`"annotations":{"example.com/project-display-name":"Alpha"}}}`
+	if got := patches[0].body; got != want {
+		t.Errorf("patch of %s = %s, want %s", alphaTwoPath, got, want)
+	}
+}
+
 func TestReconcileKeepsAKeyThatTheProjectDoesNotHave(t *testing.T) {
 	t.Parallel()
 	rancher, _ := reconcileOnce(t)

@@ -80,3 +80,34 @@ func TestNewChecksTheKeys(t *testing.T) {
 		})
 	}
 }
+
+func TestNewAcceptsANameKeyAlone(t *testing.T) {
+	t.Parallel()
+	target, err := url.Parse("https://rancher.example.com")
+	if err != nil {
+		t.Fatalf("parse the URL: %v", err)
+	}
+
+	tests := []struct {
+		name           string
+		nameLabel      string
+		nameAnnotation string
+	}{
+		{name: "a name label alone", nameLabel: "example.com/project-name"},
+		{name: "a name annotation alone", nameAnnotation: "example.com/project-name"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := New(Config{
+				RancherURL:     target,
+				TokenFile:      tokenFile(t, serviceToken),
+				NameLabel:      test.nameLabel,
+				NameAnnotation: test.nameAnnotation,
+			})
+			if err != nil {
+				t.Errorf("New returned an error: %v", err)
+			}
+		})
+	}
+}
