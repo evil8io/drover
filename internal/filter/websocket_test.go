@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -18,12 +19,9 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
-const (
-	opcodeContinuation = 0x0
-	opcodeText         = 0x1
-	opcodeBinary       = 0x2
-	opcodePing         = 0x9
-)
+// opcodePing is the ping opcode of RFC 6455. The filter forwards a ping
+// frame, and it sends none itself.
+const opcodePing = 0x9
 
 // wsFrame builds one RFC 6455 frame with no mask, like a frame of a server.
 func wsFrame(fin bool, opcode byte, payload []byte) []byte {
@@ -56,6 +54,25 @@ func wsMaskedFrame(opcode byte, mask [4]byte, payload []byte) []byte {
 	header := len(frame) - len(payload)
 	frame[1] |= 0x80
 	return append(append(frame[:header:header], mask[:]...), masked...)
+}
+
+// wsMessage builds the frame of one message that has slice, a part of the
+// watch stream. The API server sends at most 2048 bytes of the stream per
+// message, on no event boundary.
+func wsMessage(subprotocol string, slice []byte) []byte {
+	if subprotocol == base64Subprotocol {
+		return wsFrame(true, opcodeText, []byte(base64.StdEncoding.EncodeToString(slice)))
+	}
+	return wsFrame(true, opcodeBinary, slice)
+}
+
+// wsStream builds the frames of one message per slice.
+func wsStream(subprotocol string, slices ...[]byte) []byte {
+	var out []byte
+	for _, slice := range slices {
+		out = append(out, wsMessage(subprotocol, slice)...)
+	}
+	return out
 }
 
 // wsTestFrame is one unmasked frame that a test reads from the filter.
@@ -98,6 +115,12 @@ func addedEvent(name string) []byte {
 	return []byte(`{"type":"ADDED","object":{"metadata":{"name":"` + name + `"}}}`)
 }
 
+// eventLine returns the ADDED event of the namespace, with the newline that
+// separates two events in the watch stream.
+func eventLine(name string) []byte {
+	return append(addedEvent(name), '\n')
+}
+
 // allowNames returns an allow function that accepts the given names only.
 func allowNames(names ...string) func(string, map[string]string) bool {
 	return func(name string, _ map[string]string) bool {
@@ -108,6 +131,19 @@ func allowNames(names ...string) func(string, map[string]string) bool {
 		}
 		return false
 	}
+}
+
+// subprotocols are the two payload encodings of a watch upgrade. An empty
+// value is the binary case, where the message has the stream bytes as they
+// are.
+var subprotocols = []string{"", base64Subprotocol}
+
+// subprotocolName names a subprotocol for a subtest.
+func subprotocolName(subprotocol string) string {
+	if subprotocol == "" {
+		return "binary"
+	}
+	return "base64"
 }
 
 // recordingMetrics returns the filter metrics on a manual reader, so a test
@@ -163,6 +199,13 @@ type upgradeHarness struct {
 
 func newUpgradeHarness(t *testing.T, source io.Reader, allow func(string, map[string]string) bool, m *metrics, subprotocol string) *upgradeHarness {
 	t.Helper()
+	return newUpgradeHarnessWith(t, source, allow, m, subprotocol, "")
+}
+
+// newUpgradeHarnessWith is newUpgradeHarness with the websocket extensions of
+// the 101 answer.
+func newUpgradeHarnessWith(t *testing.T, source io.Reader, allow func(string, map[string]string) bool, m *metrics, subprotocol, extensions string) *upgradeHarness {
+	t.Helper()
 	upstream := &fakeUpgrade{source: source, done: make(chan struct{})}
 	resp := &http.Response{
 		StatusCode: http.StatusSwitchingProtocols,
@@ -171,6 +214,9 @@ func newUpgradeHarness(t *testing.T, source io.Reader, allow func(string, map[st
 	}
 	if subprotocol != "" {
 		resp.Header.Set("Sec-WebSocket-Protocol", subprotocol)
+	}
+	if extensions != "" {
+		resp.Header.Set(extensionsHeader, extensions)
 	}
 	registry := newWatchRegistry()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -194,6 +240,30 @@ func (h *upgradeHarness) next(t *testing.T) wsTestFrame {
 	return frame
 }
 
+// nextMessage reads the next message that reaches the caller, and returns the
+// event in it. The filter sends one final frame per event.
+func (h *upgradeHarness) nextMessage(t *testing.T, subprotocol string) string {
+	t.Helper()
+	frame := h.next(t)
+	if !frame.fin {
+		t.Fatalf("frame = %+v, want a final frame", frame)
+	}
+	if subprotocol != base64Subprotocol {
+		if frame.opcode != opcodeBinary {
+			t.Fatalf("opcode = %#x, want the binary opcode %#x", frame.opcode, opcodeBinary)
+		}
+		return string(frame.payload)
+	}
+	if frame.opcode != opcodeText {
+		t.Fatalf("opcode = %#x, want the text opcode %#x", frame.opcode, opcodeText)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(string(frame.payload))
+	if err != nil {
+		t.Fatalf("decode the message: %v", err)
+	}
+	return string(decoded)
+}
+
 // wantEnd checks that no further frame reaches the caller.
 func (h *upgradeHarness) wantEnd(t *testing.T) {
 	t.Helper()
@@ -202,145 +272,198 @@ func (h *upgradeHarness) wantEnd(t *testing.T) {
 	}
 }
 
-func TestUpgradeForwardsAllowedFrame(t *testing.T) {
+// TestUpgradeSplitsOneMessageWithTwoEvents checks that the filter decides per
+// event when one message has two events.
+func TestUpgradeSplitsOneMessageWithTwoEvents(t *testing.T) {
 	t.Parallel()
-	event := addedEvent("a")
-	h := newUpgradeHarness(t, bytes.NewReader(wsFrame(true, opcodeBinary, event)), allowNames("a"), testMetrics(t), "")
+	for _, subprotocol := range subprotocols {
+		t.Run(subprotocolName(subprotocol), func(t *testing.T) {
+			t.Parallel()
+			allowed := eventLine("a")
+			message := append(eventLine("z"), allowed...)
+			h := newUpgradeHarness(t, bytes.NewReader(wsStream(subprotocol, message)), allowNames("a"), testMetrics(t), subprotocol)
 
-	frame := h.next(t)
-	if frame.opcode != opcodeBinary || !frame.fin {
-		t.Errorf("opcode = %#x, fin = %v, want %#x and true", frame.opcode, frame.fin, opcodeBinary)
+			if got := h.nextMessage(t, subprotocol); got != string(allowed) {
+				t.Errorf("message = %q, want the allowed event %q", got, allowed)
+			}
+			h.wantEnd(t)
+		})
 	}
-	if string(frame.payload) != string(event) {
-		t.Errorf("payload = %q, want %q", frame.payload, event)
-	}
-	h.wantEnd(t)
 }
 
-func TestUpgradeDropsDeniedFrame(t *testing.T) {
+// TestUpgradeJoinsEventAcrossThreeMessages checks that the filter keeps the
+// bytes of an event that three messages carry.
+func TestUpgradeJoinsEventAcrossThreeMessages(t *testing.T) {
 	t.Parallel()
-	allowed := addedEvent("a")
-	source := bytes.NewReader(append(
-		wsFrame(true, opcodeBinary, addedEvent("z")),
-		wsFrame(true, opcodeBinary, allowed)...))
-	h := newUpgradeHarness(t, source, allowNames("a"), testMetrics(t), "")
+	for _, subprotocol := range subprotocols {
+		t.Run(subprotocolName(subprotocol), func(t *testing.T) {
+			t.Parallel()
+			allowed := eventLine("a")
+			source := wsStream(subprotocol, allowed[:10], allowed[10:30], allowed[30:])
+			h := newUpgradeHarness(t, bytes.NewReader(source), allowNames("a"), testMetrics(t), subprotocol)
 
-	if got := string(h.next(t).payload); got != string(allowed) {
-		t.Errorf("payload = %q, want the allowed event %q", got, allowed)
+			if got := h.nextMessage(t, subprotocol); got != string(allowed) {
+				t.Errorf("message = %q, want the whole event %q", got, allowed)
+			}
+			h.wantEnd(t)
+		})
 	}
-	h.wantEnd(t)
 }
 
-// TestUpgradeUnmasksFrame checks that the filter reads the payload of a
-// masked frame, and that it forwards the frame bytes as they arrived.
-func TestUpgradeUnmasksFrame(t *testing.T) {
+// TestUpgradeDropsEventAcrossMessages checks that the filter drops an event
+// whose name a message boundary splits.
+func TestUpgradeDropsEventAcrossMessages(t *testing.T) {
 	t.Parallel()
-	frame := wsMaskedFrame(opcodeBinary, [4]byte{0x11, 0x22, 0x33, 0x44}, addedEvent("a"))
-	h := newUpgradeHarness(t, bytes.NewReader(frame), allowNames("a"), testMetrics(t), "")
+	for _, subprotocol := range subprotocols {
+		t.Run(subprotocolName(subprotocol), func(t *testing.T) {
+			t.Parallel()
+			denied, allowed := eventLine("z"), eventLine("a")
+			stream := append(denied, allowed...)
+			cut := bytes.Index(stream, []byte(`"z"`)) + 1
+			h := newUpgradeHarness(t, bytes.NewReader(wsStream(subprotocol, stream[:cut], stream[cut:])), allowNames("a"), testMetrics(t), subprotocol)
 
-	got := make([]byte, len(frame))
-	if _, err := io.ReadFull(h.reader, got); err != nil {
-		t.Fatalf("read the frame: %v", err)
+			if got := h.nextMessage(t, subprotocol); got != string(allowed) {
+				t.Errorf("message = %q, want the allowed event %q", got, allowed)
+			}
+			h.wantEnd(t)
+		})
 	}
-	if !bytes.Equal(got, frame) {
-		t.Errorf("frame = %x, want the original bytes %x", got, frame)
-	}
-	h.wantEnd(t)
-}
-
-func TestUpgradeDecodesBase64Subprotocol(t *testing.T) {
-	t.Parallel()
-	allowed := []byte(base64.StdEncoding.EncodeToString(addedEvent("a")))
-	denied := []byte(base64.StdEncoding.EncodeToString(addedEvent("z")))
-	source := bytes.NewReader(append(
-		wsFrame(true, opcodeText, denied),
-		wsFrame(true, opcodeText, allowed)...))
-	h := newUpgradeHarness(t, source, allowNames("a"), testMetrics(t), base64Subprotocol)
-
-	if got := string(h.next(t).payload); got != string(allowed) {
-		t.Errorf("payload = %q, want the base64 bytes of the allowed event %q", got, allowed)
-	}
-	h.wantEnd(t)
-}
-
-// TestUpgradeAssemblesContinuationFrame checks that the filter decides on the
-// whole message, and that it forwards every frame of a message that passes.
-func TestUpgradeAssemblesContinuationFrame(t *testing.T) {
-	t.Parallel()
-	denied, allowed := addedEvent("z"), addedEvent("a")
-	var source []byte
-	for _, event := range [][]byte{denied, allowed} {
-		source = append(source, wsFrame(false, opcodeText, event[:10])...)
-		source = append(source, wsFrame(true, opcodeContinuation, event[10:])...)
-	}
-	h := newUpgradeHarness(t, bytes.NewReader(source), allowNames("a"), testMetrics(t), "")
-
-	first := h.next(t)
-	if first.fin || first.opcode != opcodeText || string(first.payload) != string(allowed[:10]) {
-		t.Errorf("first frame = %+v, want the head of the allowed event", first)
-	}
-	second := h.next(t)
-	if !second.fin || second.opcode != opcodeContinuation || string(second.payload) != string(allowed[10:]) {
-		t.Errorf("second frame = %+v, want the tail of the allowed event", second)
-	}
-	h.wantEnd(t)
 }
 
 // TestUpgradeForwardsPingWhileBuffering checks that a ping frame reaches the
-// caller while the filter still assembles a message.
+// caller while the filter still waits for the rest of an event.
 func TestUpgradeForwardsPingWhileBuffering(t *testing.T) {
 	t.Parallel()
-	denied := addedEvent("z")
-	source := wsFrame(false, opcodeText, denied[:10])
+	allowed := eventLine("a")
+	source := wsMessage("", allowed[:12])
 	source = append(source, wsFrame(true, opcodePing, []byte("keepalive"))...)
-	source = append(source, wsFrame(true, opcodeContinuation, denied[10:])...)
+	source = append(source, wsMessage("", allowed[12:])...)
 	h := newUpgradeHarness(t, bytes.NewReader(source), allowNames("a"), testMetrics(t), "")
 
 	frame := h.next(t)
 	if frame.opcode != opcodePing || string(frame.payload) != "keepalive" {
 		t.Errorf("frame = %+v, want the ping frame", frame)
 	}
+	if got := h.nextMessage(t, ""); got != string(allowed) {
+		t.Errorf("message = %q, want the whole event %q", got, allowed)
+	}
 	h.wantEnd(t)
 }
 
-// TestUpgradeForwardsMessageAboveTheCap checks that a message above 1 MiB
-// reaches the caller without a decision, and that the filter counts it.
-func TestUpgradeForwardsMessageAboveTheCap(t *testing.T) {
+// TestUpgradePassesEventWithoutADecision checks that a BOOKMARK event and a
+// value that is no watch event reach the caller.
+func TestUpgradePassesEventWithoutADecision(t *testing.T) {
 	t.Parallel()
-	event := []byte(`{"type":"ADDED","object":{"metadata":{"name":"z","annotations":{"pad":"` +
-		strings.Repeat("x", maxMessage) + `"}}}}`)
+	bookmark := `{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"7"}}}`
+	other := `["not an event"]`
+	stream := []byte(bookmark + "\n" + other + "\n")
+	h := newUpgradeHarness(t, bytes.NewReader(wsStream("", stream)), allowNames(), testMetrics(t), "")
+
+	for _, want := range []string{bookmark, other} {
+		if got := h.nextMessage(t, ""); got != want+"\n" {
+			t.Errorf("message = %q, want %q", got, want+"\n")
+		}
+	}
+	h.wantEnd(t)
+}
+
+// TestUpgradeAssemblesContinuationFrame checks that the filter reads a
+// message that arrives as a first frame plus a continuation frame.
+func TestUpgradeAssemblesContinuationFrame(t *testing.T) {
+	t.Parallel()
+	allowed := eventLine("a")
+	source := wsFrame(false, opcodeBinary, allowed[:10])
+	source = append(source, wsFrame(true, opcodeContinuation, allowed[10:])...)
+	h := newUpgradeHarness(t, bytes.NewReader(source), allowNames("a"), testMetrics(t), "")
+
+	if got := h.nextMessage(t, ""); got != string(allowed) {
+		t.Errorf("message = %q, want the whole event %q", got, allowed)
+	}
+	h.wantEnd(t)
+}
+
+// TestUpgradeUnmasksFrame checks that the filter reads the payload of a
+// masked frame. A server sends no masked frame, so this is a tolerance.
+func TestUpgradeUnmasksFrame(t *testing.T) {
+	t.Parallel()
+	allowed := eventLine("a")
+	frame := wsMaskedFrame(opcodeBinary, [4]byte{0x11, 0x22, 0x33, 0x44}, allowed)
+	h := newUpgradeHarness(t, bytes.NewReader(frame), allowNames("a"), testMetrics(t), "")
+
+	if got := h.nextMessage(t, ""); got != string(allowed) {
+		t.Errorf("message = %q, want the event %q", got, allowed)
+	}
+	h.wantEnd(t)
+}
+
+// TestUpgradeReadsSlicesOfTheStream checks a long stream that arrives in
+// 2048-byte slices, the slice size of the API server.
+func TestUpgradeReadsSlicesOfTheStream(t *testing.T) {
+	t.Parallel()
+	var stream []byte
+	var names, want []string
+	for i := range 200 {
+		name := fmt.Sprintf("z-%03d", i)
+		if i%2 == 0 {
+			name = fmt.Sprintf("a-%03d", i)
+			names = append(names, name)
+			want = append(want, string(eventLine(name)))
+		}
+		stream = append(stream, eventLine(name)...)
+	}
+
+	var source []byte
+	for start := 0; start < len(stream); start += 2048 {
+		source = append(source, wsMessage("", stream[start:min(start+2048, len(stream))])...)
+	}
+	h := newUpgradeHarness(t, bytes.NewReader(source), allowNames(names...), testMetrics(t), "")
+
+	for _, event := range want {
+		if got := h.nextMessage(t, ""); got != event {
+			t.Fatalf("message = %q, want %q", got, event)
+		}
+	}
+	h.wantEnd(t)
+}
+
+// TestUpgradeEndsOnWebsocketExtension checks that an answer with an extension
+// ends the stream with a close frame, that no event reaches the caller, and
+// that the filter counts the stream.
+func TestUpgradeEndsOnWebsocketExtension(t *testing.T) {
+	t.Parallel()
 	m, reader := recordingMetrics(t)
-	h := newUpgradeHarness(t, bytes.NewReader(wsFrame(true, opcodeText, event)), allowNames("a"), m, "")
+	source := bytes.NewReader(wsStream("", eventLine("z")))
+	h := newUpgradeHarnessWith(t, source, allowNames("a"), m, "", "permessage-deflate")
 
 	frame := h.next(t)
-	if !bytes.Equal(frame.payload, event) {
-		t.Errorf("payload has %d bytes, want the %d bytes of the message", len(frame.payload), len(event))
+	if frame.opcode != opcodeClose || !bytes.Equal(frame.payload, []byte{0x03, 0xe8}) {
+		t.Errorf("frame = %+v, want the close frame with status 1000", frame)
 	}
 	h.wantEnd(t)
 
-	wantUnfiltered(t, reader, 1)
+	wantRejected(t, reader, 1)
 }
 
-// TestUpgradeForwardsUnparsedMessage checks that a message that is no watch
-// event reaches the caller, and that the filter counts it.
-func TestUpgradeForwardsUnparsedMessage(t *testing.T) {
+// TestUpgradeEndsAboveTheBufferBound checks that a stream that never
+// completes an event ends once the buffer passes the bound.
+func TestUpgradeEndsAboveTheBufferBound(t *testing.T) {
 	t.Parallel()
-	m, reader := recordingMetrics(t)
-	h := newUpgradeHarness(t, bytes.NewReader(wsFrame(true, opcodeText, []byte("not json"))), allowNames("a"), m, "")
+	head := []byte(`{"type":"ADDED","object":{"metadata":{"name":"`)
+	pad := bytes.Repeat([]byte("x"), 400*1024)
+	source := wsStream("", append(head, pad...), pad, pad)
+	h := newUpgradeHarness(t, bytes.NewReader(source), allowNames("a"), testMetrics(t), "")
 
-	if got := string(h.next(t).payload); got != "not json" {
-		t.Errorf("payload = %q, want the unchanged message", got)
+	_, err := h.reader.ReadByte()
+	if err == nil || !strings.Contains(err.Error(), "without a complete event") {
+		t.Fatalf("read = %v, want the error of the buffer bound", err)
 	}
-	h.wantEnd(t)
-
-	wantUnfiltered(t, reader, 1)
 }
 
 // TestUpgradeEndsOnCloseFrame checks that the close frame reaches the caller,
 // and that the stream ends there.
 func TestUpgradeEndsOnCloseFrame(t *testing.T) {
 	t.Parallel()
-	source := append(wsFrame(true, opcodeClose, []byte{0x03, 0xe8}), wsFrame(true, opcodeText, addedEvent("a"))...)
+	source := append(wsFrame(true, opcodeClose, []byte{0x03, 0xe8}), wsStream("", eventLine("a"))...)
 	h := newUpgradeHarness(t, bytes.NewReader(source), allowNames("a"), testMetrics(t), "")
 
 	frame := h.next(t)
@@ -400,18 +523,18 @@ func TestDrainEndsUpgradedWatch(t *testing.T) {
 	}
 }
 
-// wantUnfiltered checks the value of drover.filter.frames.unfiltered.
-func wantUnfiltered(t *testing.T, reader *sdkmetric.ManualReader, want int64) {
+// wantRejected checks the value of drover.filter.watches.rejected.
+func wantRejected(t *testing.T, reader *sdkmetric.ManualReader, want int64) {
 	t.Helper()
 	var data metricdata.ResourceMetrics
 	if err := reader.Collect(context.Background(), &data); err != nil {
 		t.Fatalf("collect metrics: %v", err)
 	}
-	sum := findSum(t, data, "drover.filter.frames.unfiltered")
+	sum := findSum(t, data, "drover.filter.watches.rejected")
 	if len(sum.DataPoints) != 1 {
 		t.Fatalf("data points = %d, want 1", len(sum.DataPoints))
 	}
 	if got := sum.DataPoints[0].Value; got != want {
-		t.Errorf("drover.filter.frames.unfiltered = %d, want %d", got, want)
+		t.Errorf("drover.filter.watches.rejected = %d, want %d", got, want)
 	}
 }

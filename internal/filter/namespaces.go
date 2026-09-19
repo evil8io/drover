@@ -69,6 +69,9 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 	privileged := req.Clone(req.Context())
 	privileged.Header.Set("Authorization", "Bearer "+token)
 	privileged.Header.Del("Cookie")
+	// The filter reads no compressed payload. Rancher then negotiates no
+	// extension, and the client gets that same answer.
+	privileged.Header.Del(extensionsHeader)
 
 	selected := false
 	if watch {

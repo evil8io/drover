@@ -38,7 +38,11 @@ A watch request streams over chunked HTTP, or over a websocket connection after 
 
 The service ends a watch with a selector when the projects of the caller change. A timer re-reads the allowed set of the caller once per cache TTL, from the cache of a plain list, so it adds no request. A different project set ends the stream with a clean end of the stream. The client then re-lists and re-watches, and the new watch gets a selector for the new projects. An upgraded stream gets a websocket close frame with status 1000 first, so the client reports a normal closure. A watch with no selector needs no timer, because the event filter shows a new project by itself.
 
-On a websocket connection the events arrive as RFC 6455 frames. The filter assembles a text or a binary message from its continuation frames, and it decides on the whole message. It forwards a close, a ping, and a pong frame unchanged, also while a message is incomplete. With the `base64.binary.k8s.io` subprotocol it decodes the message before the decision, and it forwards the original bytes. A message above 1 MiB reaches the client without a decision, and so does a message that is no watch event. The filter counts each one, and it writes a `warn` line.
+On a websocket connection the watch stream arrives as RFC 6455 frames. One message is a slice of at most 2048 bytes of the stream, and not one event. A message contains a part of an event, several events, or the tail of one event and the head of the next.
+
+The filter assembles a text or a binary message from its continuation frames, decodes it, and appends the bytes to a stream buffer. It takes one complete event at a time from that buffer, and it applies the rule of the chunked path to each event. It writes each event that passes as a new message of its own, with a newline after the event. With the `base64.binary.k8s.io` subprotocol it decodes each message with `base64.StdEncoding`, and it encodes each event that it sends. It forwards a close, a ping, and a pong frame unchanged, also while a message is incomplete.
+
+The upgrade offers no websocket extension, because the filter reads no compressed payload. The service deletes `Sec-WebSocket-Extensions` from the privileged request. When the 101 answer still names an extension, the service ends the stream at once with a close frame. It counts that stream in `drover.filter.watches.rejected`. The service also ends the stream when a message does not decode, or when the buffer passes 1 MiB without a complete event. The position in the stream is lost in both cases.
 
 **Review access**
 
@@ -113,8 +117,8 @@ The service continues an incoming `traceparent` on every request. It starts a sp
 | `drover.filter.requests` | Counter | `1` | `outcome`, `cluster`, `watch` |
 | `drover.filter.request.duration` | Histogram | `s` | `outcome`, `cluster`, `watch` |
 | `drover.filter.watches.open` | Up-down counter | `1` | |
+| `drover.filter.watches.rejected` | Counter | `1` | `cluster` |
 | `drover.filter.events.dropped` | Counter | `1` | `cluster` |
-| `drover.filter.frames.unfiltered` | Counter | `1` | `cluster` |
 | `drover.filter.fetch.throttled` | Counter | `1` | |
 
 ### Shutdown
