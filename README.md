@@ -33,7 +33,7 @@ A watch request streams over chunked HTTP. A websocket upgrade streams the same 
 
 **Review access**
 
-The service reads the body of a `selfsubjectaccessreviews` request. When the review asks about a list or a watch on the namespaces resource, the service sends the request with the caller's own credentials. A review may name a namespace, because kubectl sends the namespace of the kubeconfig context even for this cluster-scoped resource. The service ignores that attribute. A denied response then gets `allowed: true`, and every other review passes through unchanged. The service reads a JSON review or a Kubernetes protobuf review, and it answers an intercepted review in JSON.
+The service reads the body of a `selfsubjectaccessreviews` request. When the review asks about a list or a watch on the namespaces resource, the service sends the request with the caller's own credentials. A review may name a namespace, because kubectl sends the namespace of the kubeconfig context even for this cluster-scoped resource. The service ignores that attribute. A denied response gets `allowed: true` only when the caller has at least one allowed namespace. Every other review passes through unchanged. The service reads a JSON review or a Kubernetes protobuf review, and it answers an intercepted review in JSON.
 
 ### Requirements
 
@@ -73,7 +73,7 @@ A Helm chart for drover is published separately.
 | Cache delay | A role change becomes visible after the cache TTL, on top of Rancher's own delay. |
 | Field selector | A field selector on a name outside the allowed set returns an empty list. A `get` on that name returns Forbidden. |
 | Namespace cap | A caller with more than 20,000 allowed namespace names gets an error, not a list. |
-| Self-check | `kubectl auth can-i list namespaces` returns yes, while RBAC returns no. |
+| Self-check | `kubectl auth can-i list namespaces` returns yes when the caller has at least one allowed namespace, while RBAC returns no. |
 | Trust level | The service is a privileged component. It uses the cluster-owner token for the filtered namespace list and for the watch stream. |
 
 ### Logging

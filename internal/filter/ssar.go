@@ -97,11 +97,24 @@ func (s *Service) roundTripReview(req *http.Request, cluster string) (*http.Resp
 	}
 	_ = resp.Body.Close()
 
+	if !reviewDenied(answer) {
+		return s.nativeReview(req.Context(), cluster, resp, answer)
+	}
+
+	set, denied, err := s.allowed(req.Context(), cluster, req.Header)
+	if denied != nil {
+		_ = denied.Body.Close()
+	}
+	if err != nil {
+		s.logger.WarnContext(req.Context(), "selfsubjectaccessreview", "cluster", cluster, "error", err.Error())
+	}
+	if denied != nil || err != nil || len(set.names) == 0 {
+		return s.nativeReview(req.Context(), cluster, resp, answer)
+	}
+
 	granted, ok := grantReview(answer)
 	if !ok {
-		resp.Body = io.NopCloser(bytes.NewReader(answer))
-		s.logReview(req.Context(), cluster, outcomeNative, resp.StatusCode)
-		return resp, nil
+		return s.nativeReview(req.Context(), cluster, resp, answer)
 	}
 
 	resp.Body = io.NopCloser(bytes.NewReader(granted))
@@ -109,6 +122,14 @@ func (s *Service) roundTripReview(req *http.Request, cluster string) (*http.Resp
 	resp.TransferEncoding = nil
 	resp.Header.Set("Content-Length", strconv.Itoa(len(granted)))
 	s.logReview(req.Context(), cluster, outcomeGrant, resp.StatusCode)
+	return resp, nil
+}
+
+// nativeReview returns the review answer of the upstream unchanged, and logs
+// the native outcome.
+func (s *Service) nativeReview(ctx context.Context, cluster string, resp *http.Response, answer []byte) (*http.Response, error) {
+	resp.Body = io.NopCloser(bytes.NewReader(answer))
+	s.logReview(ctx, cluster, outcomeNative, resp.StatusCode)
 	return resp, nil
 }
 
@@ -184,6 +205,23 @@ func reviewJSON(attributes resourceAttributes) ([]byte, error) {
 		Kind:       "SelfSubjectAccessReview",
 		Spec:       spec{ResourceAttributes: attributes},
 	})
+}
+
+// reviewDenied reports whether the review answer has a well-formed status
+// with allowed set to false.
+func reviewDenied(body []byte) bool {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	var object map[string]any
+	if err := decoder.Decode(&object); err != nil {
+		return false
+	}
+	status, ok := object["status"].(map[string]any)
+	if !ok {
+		return false
+	}
+	allowed, ok := status["allowed"].(bool)
+	return ok && !allowed
 }
 
 // grantReview sets status.allowed to true. It reports whether it changed the body.
