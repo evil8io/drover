@@ -383,7 +383,7 @@ func TestListWatchWebsocketUpgrade(t *testing.T) {
 	read := make(chan struct{})
 	defer close(read)
 
-	allowed := addedEvent("a")
+	allowed := eventLine("a")
 	h := newHarness(t, listUpstream(steveHandler("a"), func(w http.ResponseWriter, r *http.Request) {
 		hijacker, ok := w.(http.Hijacker)
 		if !ok {
@@ -397,8 +397,7 @@ func TestListWatchWebsocketUpgrade(t *testing.T) {
 		}
 		defer func() { _ = conn.Close() }()
 		_, _ = buffered.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-		_, _ = buffered.Write(wsFrame(true, opcodeText, addedEvent("z")))
-		_, _ = buffered.Write(wsFrame(true, opcodeText, allowed))
+		_, _ = buffered.Write(wsStream("", eventLine("z"), allowed))
 		_, _ = buffered.Write(wsFrame(true, opcodeClose, nil))
 		if err := buffered.Flush(); err != nil {
 			t.Errorf("write the upgrade response: %v", err)
@@ -417,11 +416,12 @@ func TestListWatchWebsocketUpgrade(t *testing.T) {
 	}
 
 	req := h.request(t, http.MethodGet, listPath+"?watch=true", nil, http.Header{
-		"Authorization":         []string{callerToken},
-		"Connection":            []string{"Upgrade"},
-		"Upgrade":               []string{"websocket"},
-		"Sec-WebSocket-Key":     []string{"dGhlIHNhbXBsZSBub25jZQ=="},
-		"Sec-WebSocket-Version": []string{"13"},
+		"Authorization":            []string{callerToken},
+		"Connection":               []string{"Upgrade"},
+		"Upgrade":                  []string{"websocket"},
+		"Sec-WebSocket-Key":        []string{"dGhlIHNhbXBsZSBub25jZQ=="},
+		"Sec-WebSocket-Version":    []string{"13"},
+		"Sec-WebSocket-Extensions": []string{"permessage-deflate"},
 	})
 	if err := req.Write(conn); err != nil {
 		t.Fatalf("write the request: %v", err)
@@ -470,6 +470,9 @@ func TestListWatchWebsocketUpgrade(t *testing.T) {
 	}
 	if got := privileged.header.Get("Connection"); !strings.EqualFold(got, "Upgrade") {
 		t.Errorf("privileged Connection = %q, want Upgrade", got)
+	}
+	if got := privileged.header.Get(extensionsHeader); got != "" {
+		t.Errorf("privileged %s = %q, want no extension", extensionsHeader, got)
 	}
 }
 
@@ -669,7 +672,7 @@ func TestUpgradedWatchEndsOnProjectChange(t *testing.T) {
 	read := make(chan struct{})
 	defer close(read)
 
-	event := addedEvent("a")
+	event := eventLine("a")
 	projects := newProjectSet("p-1")
 	h := newHarnessOpt(t, listUpstreamWithProjects(
 		steveLabeledHandler(steveNamespace{name: "a", project: "p-1"}),
@@ -687,7 +690,7 @@ func TestUpgradedWatchEndsOnProjectChange(t *testing.T) {
 			}
 			defer func() { _ = conn.Close() }()
 			_, _ = buffered.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-			_, _ = buffered.Write(wsFrame(true, opcodeText, event))
+			_, _ = buffered.Write(wsMessage("", event))
 			if err := buffered.Flush(); err != nil {
 				t.Errorf("write the upgrade response: %v", err)
 				return

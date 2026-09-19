@@ -17,8 +17,8 @@ type metrics struct {
 	requests         metric.Int64Counter
 	requestDur       metric.Float64Histogram
 	watchesOpen      metric.Int64UpDownCounter
+	watchesRejected  metric.Int64Counter
 	eventsDropped    metric.Int64Counter
-	framesUnfiltered metric.Int64Counter
 	fetchesThrottled metric.Int64Counter
 }
 
@@ -45,6 +45,12 @@ func newMetrics(provider metric.MeterProvider) (*metrics, error) {
 	if err != nil {
 		return nil, err
 	}
+	watchesRejected, err := meter.Int64Counter("drover.filter.watches.rejected",
+		metric.WithDescription("Upgraded namespace watch streams that the filter ends at once, because the websocket connection has an extension."),
+		metric.WithUnit("1"))
+	if err != nil {
+		return nil, err
+	}
 	eventsDropped, err := meter.Int64Counter("drover.filter.events.dropped",
 		metric.WithDescription("Namespace watch events that the filter drops, because the caller may not see the object."),
 		metric.WithUnit("1"))
@@ -58,19 +64,12 @@ func newMetrics(provider metric.MeterProvider) (*metrics, error) {
 		return nil, err
 	}
 
-	framesUnfiltered, err := meter.Int64Counter("drover.filter.frames.unfiltered",
-		metric.WithDescription("Websocket watch messages that the filter forwards without a decision, because the payload is above the size limit or does not parse."),
-		metric.WithUnit("1"))
-	if err != nil {
-		return nil, err
-	}
-
 	return &metrics{
 		requests:         requests,
 		requestDur:       requestDur,
 		watchesOpen:      watchesOpen,
+		watchesRejected:  watchesRejected,
 		eventsDropped:    eventsDropped,
-		framesUnfiltered: framesUnfiltered,
 		fetchesThrottled: fetchesThrottled,
 	}, nil
 }
@@ -99,15 +98,15 @@ func (m *metrics) watchClosed(ctx context.Context) {
 	m.watchesOpen.Add(ctx, -1)
 }
 
+// watchRejected records one upgraded watch stream that the filter ends at
+// once, for the cluster.
+func (m *metrics) watchRejected(ctx context.Context, cluster string) {
+	m.watchesRejected.Add(ctx, 1, metric.WithAttributes(attribute.String("cluster", cluster)))
+}
+
 // eventDropped records one dropped watch event, for the cluster.
 func (m *metrics) eventDropped(ctx context.Context, cluster string) {
 	m.eventsDropped.Add(ctx, 1, metric.WithAttributes(attribute.String("cluster", cluster)))
-}
-
-// frameUnfiltered records one websocket watch message that reaches the caller
-// without a filter decision, for the cluster.
-func (m *metrics) frameUnfiltered(ctx context.Context, cluster string) {
-	m.framesUnfiltered.Add(ctx, 1, metric.WithAttributes(attribute.String("cluster", cluster)))
 }
 
 // fetchThrottled records one fetch that the rate limit throttles, with a 429 answer.
