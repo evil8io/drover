@@ -116,6 +116,66 @@ func TestFilterMetricsCountRequests(t *testing.T) {
 	}
 }
 
+// TestListLogsAndSpanHaveCallerName checks that a resolved caller identity
+// reaches the namespace list log line and the drover.user span attribute.
+func TestListLogsAndSpanHaveCallerName(t *testing.T) {
+	t.Parallel()
+	h, exporter := newHarnessWithSpans(t, listUpstreamFull(steveHandler("a"), projectsHandler(),
+		selfSubjectReviewHandler("u-alice"), namespaceListHandler))
+
+	resp, _ := h.doDirect(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if !strings.Contains(h.logs.String(), "user=u-alice") {
+		t.Errorf("logs have no user=u-alice line: %s", h.logs.String())
+	}
+
+	span := requestSpan(t, exporter)
+	got, ok := spanAttributeString(span, "drover.user")
+	if !ok || got != "u-alice" {
+		t.Errorf("drover.user attribute = %q, ok=%v, want u-alice", got, ok)
+	}
+}
+
+// TestFilterMetricsHaveNoCallerName checks that a resolved caller identity
+// never reaches a metric attribute, because a user name has an unbounded
+// value set.
+func TestFilterMetricsHaveNoCallerName(t *testing.T) {
+	t.Parallel()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	h := newHarnessOpt(t, listUpstreamFull(steveHandler("a"), projectsHandler(),
+		selfSubjectReviewHandler("u-alice"), namespaceListHandler), func(cfg *Config) {
+		cfg.MeterProvider = provider
+	})
+
+	resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var data metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &data); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	found := 0
+	for _, scope := range data.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			for _, key := range metricAttributeKeys(m) {
+				found++
+				if key == "user" || key == "drover.user" {
+					t.Errorf("metric %s has a %s attribute, want no caller identity on a metric", m.Name, key)
+				}
+			}
+		}
+	}
+	if found == 0 {
+		t.Fatal("no metric attribute found, the test checks nothing")
+	}
+}
+
 // findSum returns the metricdata.Sum[int64] of the metric named name, from
 // the first scope that has it.
 func findSum(t *testing.T, data metricdata.ResourceMetrics, name string) metricdata.Sum[int64] {

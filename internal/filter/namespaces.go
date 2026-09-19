@@ -11,6 +11,9 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/evil8io/drover/internal/rancherclient"
 )
 
@@ -55,6 +58,7 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 	case err != nil:
 		return s.statusError(req, start, result, err), nil
 	}
+	result.user = set.user
 	s.logger.DebugContext(req.Context(), "allowed namespaces", "cluster", cluster, "names", set.names)
 
 	token, err := rancherclient.ReadToken(s.tokenFile)
@@ -230,6 +234,7 @@ type listResult struct {
 	status  int
 	count   int
 	watch   bool
+	user    string
 	err     error
 }
 
@@ -255,6 +260,9 @@ func (s *Service) logList(ctx context.Context, start time.Time, result listResul
 	if result.outcome == outcomeFiltered {
 		attrs = append(attrs, "count", result.count)
 	}
+	if result.user != "" {
+		attrs = append(attrs, "user", result.user)
+	}
 	attrs = append(attrs, "watch", result.watch, "duration_ms", duration.Milliseconds())
 
 	level := slog.LevelInfo
@@ -270,4 +278,15 @@ func (s *Service) logList(ctx context.Context, start time.Time, result listResul
 		}
 	}
 	s.logger.Log(ctx, level, "namespaces", attrs...)
+	setCallerAttribute(ctx, result.user)
+}
+
+// setCallerAttribute sets drover.user on the span of ctx, when user is not
+// empty. A metric never has this attribute. A user name has an unbounded
+// value set, and a metric attribute with that shape is a cardinality fault.
+func setCallerAttribute(ctx context.Context, user string) {
+	if user == "" {
+		return
+	}
+	trace.SpanFromContext(ctx).SetAttributes(attribute.String("drover.user", user))
 }

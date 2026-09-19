@@ -96,6 +96,8 @@ A namespace list log line has these fields: `cluster`, `outcome` (`native`, `fil
 
 A review log line has these fields: `cluster`, `outcome` (`passthrough`, `native`, or `granted`), and `status`.
 
+Both log lines have the field `user`, the caller's Rancher user id from a SelfSubjectReview, only when the service resolves it. No metric attribute has the name, because a user name has an unbounded value set and that shape is a cardinality fault.
+
 The service never logs a token, a cookie, a header value, or a request body. It logs a namespace name at the `debug` level only.
 
 The service writes a `warn` line when the privileged list request gets a 403 error. The cause is a `cluster-owner` binding that the service user does not have.
