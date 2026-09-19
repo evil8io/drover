@@ -37,7 +37,8 @@ type steveCollection struct {
 	Data     []struct {
 		ID       string `json:"id"`
 		Metadata struct {
-			Name string `json:"name"`
+			Name   string            `json:"name"`
+			Labels map[string]string `json:"labels"`
 		} `json:"metadata"`
 	} `json:"data"`
 }
@@ -50,18 +51,13 @@ type projectCollection struct {
 	} `json:"data"`
 }
 
-// allowedSet is the cached view of one caller: the namespace names it may
-// list, and the ids of the projects it may see.
+// allowedSet is the cached view of one caller. It has the namespace names the
+// caller may list, and the ids of the projects it may see. extras is the
+// subset of names whose project label is not one of those project ids.
 type allowedSet struct {
 	names    []string
 	projects []string
-}
-
-// allowedNamespaces returns the namespaces that the caller can get. A non-nil
-// response is the 401 or 403 answer of Steve, for the caller.
-func (s *Service) allowedNamespaces(ctx context.Context, cluster string, header http.Header) ([]string, *http.Response, error) {
-	set, denied, err := s.allowed(ctx, cluster, header)
-	return set.names, denied, err
+	extras   []string
 }
 
 // allowedNamespace reports whether the caller may see the namespace: its name
@@ -101,7 +97,7 @@ func (s *Service) fetchAllowed(ctx context.Context, cluster, auth, cookie string
 	ctx, cancel := context.WithTimeout(ctx, steveTimeout)
 	defer cancel()
 
-	names, denied, err := s.fetchNamespaceNames(ctx, cluster, auth, cookie)
+	names, projectOf, denied, err := s.fetchNamespaceNames(ctx, cluster, auth, cookie)
 	if denied != nil || err != nil {
 		return allowedSet{}, denied, err
 	}
@@ -111,11 +107,28 @@ func (s *Service) fetchAllowed(ctx context.Context, cluster, auth, cookie string
 		return allowedSet{}, denied, err
 	}
 
-	return allowedSet{names: names, projects: projects}, nil, nil
+	return allowedSet{names: names, projects: projects, extras: extraNames(names, projectOf, projects)}, nil, nil
 }
 
-func (s *Service) fetchNamespaceNames(ctx context.Context, cluster, auth, cookie string) ([]string, *http.Response, error) {
+// extraNames returns the names among names whose project label, from
+// projectOf, is not one of projects. A name with no project label counts as
+// outside.
+func extraNames(names []string, projectOf map[string]string, projects []string) []string {
+	var extras []string
+	for _, name := range names {
+		project := projectOf[name]
+		if project == "" || !slices.Contains(projects, project) {
+			extras = append(extras, name)
+		}
+	}
+	return extras
+}
+
+// fetchNamespaceNames reads the namespace names of the caller, and the
+// project label of each name that has one.
+func (s *Service) fetchNamespaceNames(ctx context.Context, cluster, auth, cookie string) ([]string, map[string]string, *http.Response, error) {
 	names := make(map[string]struct{})
+	projectOf := make(map[string]string)
 	token := ""
 	for page := 0; page < maxStevePages; page++ {
 		target := *s.upstream
@@ -127,7 +140,7 @@ func (s *Service) fetchNamespaceNames(ctx context.Context, cluster, auth, cookie
 		target.RawQuery = query.Encode()
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if auth != "" {
 			req.Header.Set("Authorization", auth)
@@ -139,25 +152,25 @@ func (s *Service) fetchNamespaceNames(ctx context.Context, cluster, auth, cookie
 
 		resp, err := s.base.RoundTrip(req)
 		if err != nil {
-			return nil, nil, fmt.Errorf("allowed set request failed: %w", err)
+			return nil, nil, nil, fmt.Errorf("allowed set request failed: %w", err)
 		}
 
 		if resp.StatusCode != http.StatusOK {
 			body, tooLarge, err := readLimited(resp.Body, maxSteveBody)
 			_ = resp.Body.Close()
 			if err != nil {
-				return nil, nil, fmt.Errorf("allowed set response: %w", err)
+				return nil, nil, nil, fmt.Errorf("allowed set response: %w", err)
 			}
 			if tooLarge {
-				return nil, nil, fmt.Errorf("allowed set response is larger than %d bytes", maxSteveBody)
+				return nil, nil, nil, fmt.Errorf("allowed set response is larger than %d bytes", maxSteveBody)
 			}
 			switch resp.StatusCode {
 			case http.StatusUnauthorized, http.StatusForbidden:
 				resp.Body = io.NopCloser(bytes.NewReader(body))
 				resp.ContentLength = int64(len(body))
-				return nil, resp, nil
+				return nil, nil, resp, nil
 			default:
-				return nil, nil, fmt.Errorf("allowed set request returned %s", resp.Status)
+				return nil, nil, nil, fmt.Errorf("allowed set request returned %s", resp.Status)
 			}
 		}
 
@@ -166,9 +179,9 @@ func (s *Service) fetchNamespaceNames(ctx context.Context, cluster, auth, cookie
 		_ = resp.Body.Close()
 		if decodeErr != nil {
 			if errors.Is(decodeErr, io.ErrUnexpectedEOF) {
-				return nil, nil, fmt.Errorf("allowed set response is larger than %d bytes", maxSteveBody)
+				return nil, nil, nil, fmt.Errorf("allowed set response is larger than %d bytes", maxSteveBody)
 			}
-			return nil, nil, fmt.Errorf("allowed set response: %w", decodeErr)
+			return nil, nil, nil, fmt.Errorf("allowed set response: %w", decodeErr)
 		}
 		for _, item := range collection.Data {
 			name := item.Metadata.Name
@@ -177,17 +190,20 @@ func (s *Service) fetchNamespaceNames(ctx context.Context, cluster, auth, cookie
 			}
 			if name != "" {
 				names[name] = struct{}{}
+				if project := item.Metadata.Labels[projectLabel]; project != "" {
+					projectOf[name] = project
+				}
 			}
 		}
 		if len(names) > maxAllowedNames {
-			return nil, nil, fmt.Errorf("allowed set has more than %d names", maxAllowedNames)
+			return nil, nil, nil, fmt.Errorf("allowed set has more than %d names", maxAllowedNames)
 		}
 		if collection.Continue == "" {
-			return slices.Sorted(maps.Keys(names)), nil, nil
+			return slices.Sorted(maps.Keys(names)), projectOf, nil, nil
 		}
 		token = collection.Continue
 	}
-	return nil, nil, fmt.Errorf("allowed set has more than %d pages", maxStevePages)
+	return nil, nil, nil, fmt.Errorf("allowed set has more than %d pages", maxStevePages)
 }
 
 // fetchProjectIDs reads the projects that the caller may see, as the part of

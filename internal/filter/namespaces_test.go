@@ -133,6 +133,86 @@ func TestListEmptySet(t *testing.T) {
 	}
 }
 
+func TestListProjectSelector(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstreamWithProjects(
+		steveLabeledHandler(steveNamespace{name: "a", project: "p-1"}, steveNamespace{name: "b", project: "p-1"}),
+		projectsHandler("p-1"),
+		namespaceListHandler,
+	))
+
+	resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	privileged := h.upstream.all()[3]
+	want := "field.cattle.io/projectId in (p-1)"
+	if got := privileged.query.Get("labelSelector"); got != want {
+		t.Errorf("labelSelector = %q, want %q", got, want)
+	}
+}
+
+func TestListMergesCallerSelectorIntoProjectSelector(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstreamWithProjects(
+		steveLabeledHandler(steveNamespace{name: "a", project: "p-1"}),
+		projectsHandler("p-1"),
+		namespaceListHandler,
+	))
+
+	resp, _ := h.do(t, h.request(t, http.MethodGet, listPath+"?labelSelector=team%3Dx", nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	privileged := h.upstream.all()[3]
+	want := "team=x,field.cattle.io/projectId in (p-1)"
+	if got := privileged.query.Get("labelSelector"); got != want {
+		t.Errorf("labelSelector = %q, want %q", got, want)
+	}
+}
+
+func TestListNameSelectorOnMismatchedProject(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstreamWithProjects(
+		steveLabeledHandler(steveNamespace{name: "a", project: "p-1"}, steveNamespace{name: "z", project: "p-2"}),
+		projectsHandler("p-1"),
+		namespaceListHandler,
+	))
+
+	resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	privileged := h.upstream.all()[3]
+	want := "kubernetes.io/metadata.name in (a,z)"
+	if got := privileged.query.Get("labelSelector"); got != want {
+		t.Errorf("labelSelector = %q, want %q", got, want)
+	}
+}
+
+func TestListNameSelectorOnMissingProjectLabel(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstreamWithProjects(
+		steveLabeledHandler(steveNamespace{name: "a", project: "p-1"}, steveNamespace{name: "z"}),
+		projectsHandler("p-1"),
+		namespaceListHandler,
+	))
+
+	resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	privileged := h.upstream.all()[3]
+	want := "kubernetes.io/metadata.name in (a,z)"
+	if got := privileged.query.Get("labelSelector"); got != want {
+		t.Errorf("labelSelector = %q, want %q", got, want)
+	}
+}
+
 func TestListImpersonationPassesThrough(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, listUpstream(steveHandler("a"), namespaceListHandler))
