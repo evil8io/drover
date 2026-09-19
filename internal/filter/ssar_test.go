@@ -31,6 +31,24 @@ func reviewUpstream(answer string) http.HandlerFunc {
 	}
 }
 
+// reviewUpstreamWithNames routes the review request to reviewUpstream(answer),
+// and answers the caller's allowed set with the given namespace names and no projects.
+func reviewUpstreamWithNames(answer string, names ...string) http.HandlerFunc {
+	review := reviewUpstream(answer)
+	steve := steveHandler(names...)
+	projects := projectsHandler()
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case stevePath:
+			steve(w, r)
+		case projectsPath:
+			projects(w, r)
+		default:
+			review(w, r)
+		}
+	}
+}
+
 func (h *harness) postReview(t *testing.T, body []byte, header http.Header) (*http.Response, []byte) {
 	t.Helper()
 	all := http.Header{}
@@ -59,7 +77,7 @@ func TestReviewGrantsNamespaceList(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			h := newHarness(t, reviewUpstream(deniedAnswer))
+			h := newHarness(t, reviewUpstreamWithNames(deniedAnswer, "prod"))
 
 			request := fmt.Sprintf(reviewTemplate, test.attributes)
 			resp, body := h.postReview(t, []byte(request), nil)
@@ -99,11 +117,14 @@ func TestReviewGrantsNamespaceList(t *testing.T) {
 			if got := resp.Header.Get("Content-Length"); got != strconv.Itoa(len(body)) {
 				t.Errorf("Content-Length = %q, want %d", got, len(body))
 			}
-
-			sent := h.upstream.all()
-			if len(sent) != 1 {
-				t.Fatalf("upstream requests = %d, want 1", len(sent))
+			if !strings.Contains(h.logs.String(), "outcome=granted") {
+				t.Errorf("logs have no outcome=granted line: %s", h.logs.String())
 			}
+
+			if got := h.upstream.countPath(reviewPath); got != 1 {
+				t.Fatalf("review requests = %d, want 1", got)
+			}
+			sent := h.upstream.all()
 			if string(sent[0].body) != request {
 				t.Errorf("upstream body = %q, want %q", sent[0].body, request)
 			}
@@ -116,7 +137,12 @@ func TestReviewGrantsNamespaceList(t *testing.T) {
 
 func TestReviewKeepsAllowed(t *testing.T) {
 	t.Parallel()
-	h := newHarness(t, reviewUpstream(allowedAnswer))
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == stevePath || r.URL.Path == projectsPath {
+			t.Error("the upstream got an allowed set request")
+		}
+		reviewUpstream(allowedAnswer)(w, r)
+	})
 
 	request := fmt.Sprintf(reviewTemplate, `"verb":"list","resource":"namespaces"`)
 	resp, body := h.postReview(t, []byte(request), nil)
@@ -142,7 +168,7 @@ func TestReviewGrantsProtobufNamespaceList(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			h := newHarness(t, reviewUpstream(deniedAnswer))
+			h := newHarness(t, reviewUpstreamWithNames(deniedAnswer, "prod"))
 
 			header := http.Header{
 				"Content-Type": []string{protobufContentType},
@@ -172,10 +198,10 @@ func TestReviewGrantsProtobufNamespaceList(t *testing.T) {
 				t.Errorf("reason = %v, want %q", status["reason"], grantedReason)
 			}
 
-			sent := h.upstream.all()
-			if len(sent) != 1 {
-				t.Fatalf("upstream requests = %d, want 1", len(sent))
+			if got := h.upstream.countPath(reviewPath); got != 1 {
+				t.Fatalf("review requests = %d, want 1", got)
 			}
+			sent := h.upstream.all()
 			wantAttributes := fmt.Sprintf(`"verb":%q,"resource":"namespaces"`, test.attributes.verb)
 			if test.attributes.namespace != "" {
 				wantAttributes = fmt.Sprintf(`"namespace":%q,%s`, test.attributes.namespace, wantAttributes)
@@ -246,7 +272,12 @@ func TestReviewPassesThrough(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			h := newHarness(t, reviewUpstream(deniedAnswer))
+			h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == stevePath || r.URL.Path == projectsPath {
+					t.Error("the upstream got an allowed set request")
+				}
+				reviewUpstream(deniedAnswer)(w, r)
+			})
 
 			resp, body := h.postReview(t, test.body, test.header)
 			if resp.StatusCode != http.StatusOK {
@@ -297,5 +328,71 @@ func TestReviewBodyTooLarge(t *testing.T) {
 	}
 	if h.upstream.count() != 0 {
 		t.Errorf("upstream requests = %d, want 0", h.upstream.count())
+	}
+}
+
+func TestReviewStaysDeniedWithEmptyAllowedSet(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, reviewUpstreamWithNames(deniedAnswer))
+
+	request := fmt.Sprintf(reviewTemplate, `"verb":"list","resource":"namespaces"`)
+	resp, body := h.postReview(t, []byte(request), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if string(body) != deniedAnswer {
+		t.Errorf("body = %q, want the answer of the upstream", body)
+	}
+	if !strings.Contains(h.logs.String(), "outcome=native") {
+		t.Errorf("logs have no outcome=native line: %s", h.logs.String())
+	}
+}
+
+func TestReviewStaysDeniedOnAllowedSetError(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == stevePath {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		reviewUpstream(deniedAnswer)(w, r)
+	})
+
+	request := fmt.Sprintf(reviewTemplate, `"verb":"list","resource":"namespaces"`)
+	resp, body := h.postReview(t, []byte(request), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if string(body) != deniedAnswer {
+		t.Errorf("body = %q, want the answer of the upstream", body)
+	}
+	if !strings.Contains(h.logs.String(), "outcome=native") {
+		t.Errorf("logs have no outcome=native line: %s", h.logs.String())
+	}
+	if strings.Contains(h.logs.String(), "level=ERROR") {
+		t.Errorf("logs contain an ERROR line, want WARN: %s", h.logs.String())
+	}
+	if !strings.Contains(h.logs.String(), "level=WARN") {
+		t.Errorf("logs have no WARN line: %s", h.logs.String())
+	}
+}
+
+func TestReviewStaysDeniedOnSteveForbidden(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == stevePath {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		reviewUpstream(deniedAnswer)(w, r)
+	})
+
+	request := fmt.Sprintf(reviewTemplate, `"verb":"list","resource":"namespaces"`)
+	resp, body := h.postReview(t, []byte(request), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if string(body) != deniedAnswer {
+		t.Errorf("body = %q, want the answer of the upstream", body)
 	}
 }
