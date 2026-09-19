@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.8.0](https://github.com/evil8io/drover/compare/v0.7.0...v0.8.0) (2026-09-19)
+
+
+### Features
+
+* cap the allowed-set cache and its fetch rate ([#32](https://github.com/evil8io/drover/issues/32)) ([c969cf0](https://github.com/evil8io/drover/commit/c969cf02f340d018ef372966500cddcbf7661428))
+* copy the project display name to a namespace label or annotation ([#28](https://github.com/evil8io/drover/issues/28)) ([f7502ef](https://github.com/evil8io/drover/commit/f7502ef9b9943fad760048566a9b9d8738a6d6cf))
+* give a namespace watch an exact label selector ([#33](https://github.com/evil8io/drover/issues/33)) ([d7b5571](https://github.com/evil8io/drover/commit/d7b557161a229edf5c3fd54a05e8d6d56478c57d))
+* name the caller of a namespace-filter request in logs and spans ([#34](https://github.com/evil8io/drover/issues/34)) ([82c79d2](https://github.com/evil8io/drover/commit/82c79d2fc1f61225123a98288577a9d32fe4b4f4))
+
+
+### Bug Fixes
+
+* filter the namespace watch frames of a websocket upgrade ([#31](https://github.com/evil8io/drover/issues/31)) ([8b4ea2e](https://github.com/evil8io/drover/commit/8b4ea2e61fd34643c83349d501f93dc3eb1bfc09))
+* grant a namespace list review only with an allowed namespace ([#29](https://github.com/evil8io/drover/issues/29)) ([684f7d3](https://github.com/evil8io/drover/commit/684f7d3150b8ab564501891cd3015da96fdb59c1))
+
 ## [0.7.0](https://github.com/evil8io/drover/compare/v0.6.0...v0.7.0) (2026-09-19)
 
 
