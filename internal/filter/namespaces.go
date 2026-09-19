@@ -80,16 +80,22 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 	if filtered.StatusCode == http.StatusForbidden {
 		s.logger.WarnContext(req.Context(), "the service token has no cluster-owner binding", "cluster", cluster)
 	}
-	// A plain watch stream is the only response the event filter reads. An
-	// upgraded connection has no JSON body, and an error status has no events.
-	if watch && filtered.StatusCode == http.StatusOK {
-		filtered.Body = filterWatchBody(req.Context(), filtered.Body, func(name string, labels map[string]string) bool {
+	// A watch answer has the events in a chunked body, or in the websocket
+	// frames of an upgraded connection. An error status has no events.
+	if watch {
+		allow := func(name string, labels map[string]string) bool {
 			return s.allowedNamespace(req.Context(), cluster, req.Header, name, labels)
-		}, s.logger, s.watches, s.metrics, cluster)
-		// A dropped event changes the byte count, so the length of upstream no
-		// longer applies.
-		filtered.ContentLength = -1
-		filtered.Header.Del("Content-Length")
+		}
+		switch filtered.StatusCode {
+		case http.StatusOK:
+			filtered.Body = filterWatchBody(req.Context(), filtered.Body, allow, s.logger, s.watches, s.metrics, cluster)
+			// A dropped event changes the byte count, so the length of upstream
+			// no longer applies.
+			filtered.ContentLength = -1
+			filtered.Header.Del("Content-Length")
+		case http.StatusSwitchingProtocols:
+			filterWatchUpgrade(req.Context(), filtered, allow, s.logger, s.watches, s.metrics, cluster)
+		}
 	}
 	result.outcome, result.status, result.count = outcomeFiltered, filtered.StatusCode, len(set.names)
 	s.logList(req.Context(), start, result)
