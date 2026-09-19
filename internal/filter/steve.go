@@ -23,7 +23,10 @@ const (
 	maxStevePages   = 100
 	maxSteveBody    = 32 << 20
 	maxAllowedNames = 20000
-	maxCacheEntries = 1000
+
+	defaultMaxCacheEntries = 1000
+	defaultFetchRate       = 50
+	fetchWaitCap           = 5 * time.Second
 
 	projectsPath = "/v3/projects"
 	// projectLabel is the label of Rancher on a namespace of a project. Its
@@ -79,7 +82,8 @@ func (s *Service) allowedNamespace(ctx context.Context, cluster string, header h
 }
 
 // allowed returns the cached allowed set of the caller. A non-nil response is
-// the 401 or 403 answer of Steve or of the project list, for the caller.
+// the 401 or 403 answer of Steve or of the project list, or the 429 answer of
+// the fetch rate limit, for the caller.
 func (s *Service) allowed(ctx context.Context, cluster string, header http.Header) (allowedSet, *http.Response, error) {
 	auth := header.Get("Authorization")
 	cookie := header.Get("Cookie")
@@ -87,6 +91,14 @@ func (s *Service) allowed(ctx context.Context, cluster string, header http.Heade
 	key := cluster + "\n" + hex.EncodeToString(sum[:])
 
 	return s.cache.do(ctx, key, func() (allowedSet, *http.Response, error) {
+		if err := s.limiter.wait(ctx, fetchWaitCap); err != nil {
+			if errors.Is(err, errFetchThrottled) {
+				s.metrics.fetchThrottled(ctx)
+				message := serviceName + ": the fetch rate limit has no free token"
+				return allowedSet{}, statusResponse(nil, http.StatusTooManyRequests, reasonThrottled, message), nil
+			}
+			return allowedSet{}, nil, err
+		}
 		return s.fetchAllowed(ctx, cluster, auth, cookie)
 	})
 }
@@ -277,19 +289,21 @@ type cacheEntry struct {
 }
 
 type cache struct {
-	ttl      time.Duration
-	now      func() time.Time
-	mu       sync.Mutex
-	entries  map[string]cacheEntry
-	inflight map[string]chan struct{}
+	ttl        time.Duration
+	maxEntries int
+	now        func() time.Time
+	mu         sync.Mutex
+	entries    map[string]cacheEntry
+	inflight   map[string]chan struct{}
 }
 
-func newCache(ttl time.Duration, now func() time.Time) *cache {
+func newCache(ttl time.Duration, maxEntries int, now func() time.Time) *cache {
 	return &cache{
-		ttl:      ttl,
-		now:      now,
-		entries:  make(map[string]cacheEntry),
-		inflight: make(map[string]chan struct{}),
+		ttl:        ttl,
+		maxEntries: maxEntries,
+		now:        now,
+		entries:    make(map[string]cacheEntry),
+		inflight:   make(map[string]chan struct{}),
 	}
 }
 
@@ -320,8 +334,9 @@ func (c *cache) do(ctx context.Context, key string, fetch func() (allowedSet, *h
 		c.mu.Lock()
 		delete(c.inflight, key)
 		if err == nil && resp == nil {
-			if len(c.entries) > maxCacheEntries {
-				c.removeExpired()
+			c.removeExpired()
+			for len(c.entries) >= c.maxEntries {
+				c.evictEarliest()
 			}
 			c.entries[key] = cacheEntry{set: set, expires: c.now().Add(c.ttl)}
 		}
@@ -337,5 +352,89 @@ func (c *cache) removeExpired() {
 		if !now.Before(entry.expires) {
 			delete(c.entries, key)
 		}
+	}
+}
+
+// evictEarliest deletes the cache entry with the earliest expires. The
+// entries map has at least one entry.
+func (c *cache) evictEarliest() {
+	var oldestKey string
+	var oldest time.Time
+	first := true
+	for key, entry := range c.entries {
+		if first || entry.expires.Before(oldest) {
+			oldestKey, oldest = key, entry.expires
+			first = false
+		}
+	}
+	delete(c.entries, oldestKey)
+}
+
+// errFetchThrottled marks a wait that ends with no free token inside the cap.
+var errFetchThrottled = errors.New("fetch rate limit: no free token")
+
+// limiter is a token bucket that the whole Service shares, to bound the rate
+// of a fetch. It is hand-written, because the module has no external rate
+// package.
+type limiter struct {
+	rate  float64 // tokens added per second
+	burst float64 // maximum tokens held
+	now   func() time.Time
+
+	mu     sync.Mutex
+	tokens float64
+	last   time.Time
+}
+
+// newLimiter returns a limiter with a full bucket of burst tokens.
+func newLimiter(rate, burst float64, now func() time.Time) *limiter {
+	return &limiter{rate: rate, burst: burst, now: now, tokens: burst, last: now()}
+}
+
+// wait takes one token. When no token is free, it blocks up to waitCap,
+// against ctx. A nil error means the wait took a token.
+func (l *limiter) wait(ctx context.Context, waitCap time.Duration) error {
+	l.mu.Lock()
+	l.refill()
+	if l.tokens >= 1 {
+		l.tokens--
+		l.mu.Unlock()
+		return nil
+	}
+	need := time.Duration((1 - l.tokens) / l.rate * float64(time.Second))
+	l.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if need > waitCap {
+		return errFetchThrottled
+	}
+
+	timer := time.NewTimer(need)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.refill()
+	if l.tokens < 1 {
+		return errFetchThrottled
+	}
+	l.tokens--
+	return nil
+}
+
+// refill adds the tokens that the time since the last refill earns, up to
+// burst. The caller holds mu.
+func (l *limiter) refill() {
+	now := l.now()
+	if elapsed := now.Sub(l.last); elapsed > 0 {
+		l.tokens = min(l.burst, l.tokens+elapsed.Seconds()*l.rate)
+		l.last = now
 	}
 }

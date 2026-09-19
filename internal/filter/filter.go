@@ -36,6 +36,12 @@ type Config struct {
 	TokenFile string
 	// CacheTTL is the lifetime of one cached allowed set. Zero selects 15 s.
 	CacheTTL time.Duration
+	// MaxCacheEntries is the hard bound on the cached allowed sets. Zero selects 1000.
+	MaxCacheEntries int
+	// FetchRate is the fetches per second that the shared rate limit allows,
+	// for a fetch of an allowed set. Zero selects 50. The burst is twice the
+	// rate, and at least 1.
+	FetchRate float64
 	// Logger gets one line for each intercepted request. Nil selects slog.Default.
 	Logger *slog.Logger
 	// MeterProvider creates the meter of the filter metrics. Nil selects
@@ -53,6 +59,7 @@ type Service struct {
 	now       func() time.Time
 	base      http.RoundTripper
 	cache     *cache
+	limiter   *limiter
 	proxy     *httputil.ReverseProxy
 	handler   http.Handler
 	metrics   *metrics
@@ -103,6 +110,15 @@ func New(cfg Config) (*Service, error) {
 	if ttl == 0 {
 		ttl = defaultCacheTTL
 	}
+	maxCacheEntries := cfg.MaxCacheEntries
+	if maxCacheEntries == 0 {
+		maxCacheEntries = defaultMaxCacheEntries
+	}
+	fetchRate := cfg.FetchRate
+	if fetchRate == 0 {
+		fetchRate = defaultFetchRate
+	}
+	fetchBurst := max(2*fetchRate, 1)
 	meterProvider := cfg.MeterProvider
 	if meterProvider == nil {
 		meterProvider = otel.GetMeterProvider()
@@ -118,7 +134,8 @@ func New(cfg Config) (*Service, error) {
 		logger:    logger,
 		now:       now,
 		base:      otelhttp.NewTransport(base, otelhttp.WithMeterProvider(meterProvider)),
-		cache:     newCache(ttl, now),
+		cache:     newCache(ttl, maxCacheEntries, now),
+		limiter:   newLimiter(fetchRate, fetchBurst, now),
 		metrics:   m,
 		watches:   newWatchRegistry(),
 	}

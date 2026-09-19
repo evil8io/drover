@@ -53,6 +53,8 @@ The service reads the body of a `selfsubjectaccessreviews` request. When the rev
 | `--upstream-ca-file` | | PEM bundle that verifies an `https` upstream. |
 | `--token-file` | (required) | File with the API token of the Rancher service user. |
 | `--cache-ttl` | `15s` | Lifetime of a cached allowed set. |
+| `--max-cache-entries` | `1000` | Hard bound on the cached allowed sets. |
+| `--fetch-rate` | `50` | Fetches per second that the shared rate limit allows, for a fetch of an allowed set. The burst is twice the rate. |
 | `--log-level` | `info` | One of `debug`, `info`, `warn`, or `error`. |
 | `--shutdown-grace` | `20s` | Grace period for the shutdown after SIGTERM or SIGINT. |
 | `--otlp-endpoint` | `$OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint, `host:port` or a URL. Empty turns telemetry off. |
@@ -76,6 +78,7 @@ A Helm chart for drover is published separately.
 | Field selector | A field selector on a name outside the allowed set returns an empty list. A `get` on that name returns Forbidden. |
 | Namespace cap | A caller with more than 20,000 allowed namespace names gets an error, not a list. |
 | Self-check | `kubectl auth can-i list namespaces` returns yes when the caller has at least one allowed namespace, while RBAC returns no. |
+| Fetch rate | A fetch of an allowed set past `--fetch-rate` waits up to 5 s for a free token, then gets a 429 Status. |
 | Trust level | The service is a privileged component. It uses the cluster-owner token for the filtered namespace list and for the watch stream. |
 
 ### Logging
@@ -103,6 +106,7 @@ The service continues an incoming `traceparent` on every request. It starts a sp
 | `drover.filter.watches.open` | Up-down counter | `1` | |
 | `drover.filter.events.dropped` | Counter | `1` | `cluster` |
 | `drover.filter.frames.unfiltered` | Counter | `1` | `cluster` |
+| `drover.filter.fetch.throttled` | Counter | `1` | |
 
 ### Shutdown
 
