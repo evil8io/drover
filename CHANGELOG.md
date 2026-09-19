@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/evil8io/drover/compare/v0.8.1...v0.9.0) (2026-09-19)
+
+
+### Features
+
+* watch namespaces, and track the keys that the sync owns ([#37](https://github.com/evil8io/drover/issues/37)) ([35a0999](https://github.com/evil8io/drover/commit/35a09993a8109a6cb525336a5ad23c1652cc2d25))
+
 ## [0.8.1](https://github.com/evil8io/drover/compare/v0.8.0...v0.8.1) (2026-09-19)
 
 
