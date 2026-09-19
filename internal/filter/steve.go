@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -21,6 +22,7 @@ const (
 	steveTimeout    = 30 * time.Second
 	maxStevePages   = 100
 	maxSteveBody    = 32 << 20
+	maxAllowedNames = 20000
 	maxCacheEntries = 1000
 
 	projectsPath = "/v3/projects"
@@ -118,9 +120,11 @@ func (s *Service) fetchNamespaceNames(ctx context.Context, cluster, auth, cookie
 	for page := 0; page < maxStevePages; page++ {
 		target := *s.upstream
 		target.Path = "/k8s/clusters/" + cluster + "/v1/namespaces"
+		query := url.Values{"exclude": []string{"metadata.managedFields"}}
 		if token != "" {
-			target.RawQuery = url.Values{"continue": []string{token}}.Encode()
+			query.Set("continue", token)
 		}
+		target.RawQuery = query.Encode()
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 		if err != nil {
 			return nil, nil, err
@@ -137,28 +141,34 @@ func (s *Service) fetchNamespaceNames(ctx context.Context, cluster, auth, cookie
 		if err != nil {
 			return nil, nil, fmt.Errorf("allowed set request failed: %w", err)
 		}
-		body, tooLarge, err := readLimited(resp.Body, maxSteveBody)
-		_ = resp.Body.Close()
-		if err != nil {
-			return nil, nil, fmt.Errorf("allowed set response: %w", err)
-		}
-		if tooLarge {
-			return nil, nil, fmt.Errorf("allowed set response is larger than %d bytes", maxSteveBody)
-		}
 
-		switch resp.StatusCode {
-		case http.StatusOK:
-		case http.StatusUnauthorized, http.StatusForbidden:
-			resp.Body = io.NopCloser(bytes.NewReader(body))
-			resp.ContentLength = int64(len(body))
-			return nil, resp, nil
-		default:
-			return nil, nil, fmt.Errorf("allowed set request returned %s", resp.Status)
+		if resp.StatusCode != http.StatusOK {
+			body, tooLarge, err := readLimited(resp.Body, maxSteveBody)
+			_ = resp.Body.Close()
+			if err != nil {
+				return nil, nil, fmt.Errorf("allowed set response: %w", err)
+			}
+			if tooLarge {
+				return nil, nil, fmt.Errorf("allowed set response is larger than %d bytes", maxSteveBody)
+			}
+			switch resp.StatusCode {
+			case http.StatusUnauthorized, http.StatusForbidden:
+				resp.Body = io.NopCloser(bytes.NewReader(body))
+				resp.ContentLength = int64(len(body))
+				return nil, resp, nil
+			default:
+				return nil, nil, fmt.Errorf("allowed set request returned %s", resp.Status)
+			}
 		}
 
 		var collection steveCollection
-		if err := json.Unmarshal(body, &collection); err != nil {
-			return nil, nil, fmt.Errorf("allowed set response: %w", err)
+		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, maxSteveBody)).Decode(&collection)
+		_ = resp.Body.Close()
+		if decodeErr != nil {
+			if errors.Is(decodeErr, io.ErrUnexpectedEOF) {
+				return nil, nil, fmt.Errorf("allowed set response is larger than %d bytes", maxSteveBody)
+			}
+			return nil, nil, fmt.Errorf("allowed set response: %w", decodeErr)
 		}
 		for _, item := range collection.Data {
 			name := item.Metadata.Name
@@ -168,6 +178,9 @@ func (s *Service) fetchNamespaceNames(ctx context.Context, cluster, auth, cookie
 			if name != "" {
 				names[name] = struct{}{}
 			}
+		}
+		if len(names) > maxAllowedNames {
+			return nil, nil, fmt.Errorf("allowed set has more than %d names", maxAllowedNames)
 		}
 		if collection.Continue == "" {
 			return slices.Sorted(maps.Keys(names)), nil, nil
@@ -200,28 +213,34 @@ func (s *Service) fetchProjectIDs(ctx context.Context, auth, cookie string) ([]s
 	if err != nil {
 		return nil, nil, fmt.Errorf("project list request failed: %w", err)
 	}
-	body, tooLarge, err := readLimited(resp.Body, maxSteveBody)
-	_ = resp.Body.Close()
-	if err != nil {
-		return nil, nil, fmt.Errorf("project list response: %w", err)
-	}
-	if tooLarge {
-		return nil, nil, fmt.Errorf("project list response is larger than %d bytes", maxSteveBody)
-	}
 
-	switch resp.StatusCode {
-	case http.StatusOK:
-	case http.StatusUnauthorized, http.StatusForbidden:
-		resp.Body = io.NopCloser(bytes.NewReader(body))
-		resp.ContentLength = int64(len(body))
-		return nil, resp, nil
-	default:
-		return nil, nil, fmt.Errorf("project list request returned %s", resp.Status)
+	if resp.StatusCode != http.StatusOK {
+		body, tooLarge, err := readLimited(resp.Body, maxSteveBody)
+		_ = resp.Body.Close()
+		if err != nil {
+			return nil, nil, fmt.Errorf("project list response: %w", err)
+		}
+		if tooLarge {
+			return nil, nil, fmt.Errorf("project list response is larger than %d bytes", maxSteveBody)
+		}
+		switch resp.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			resp.Body = io.NopCloser(bytes.NewReader(body))
+			resp.ContentLength = int64(len(body))
+			return nil, resp, nil
+		default:
+			return nil, nil, fmt.Errorf("project list request returned %s", resp.Status)
+		}
 	}
 
 	var collection projectCollection
-	if err := json.Unmarshal(body, &collection); err != nil {
-		return nil, nil, fmt.Errorf("project list response: %w", err)
+	decodeErr := json.NewDecoder(io.LimitReader(resp.Body, maxSteveBody)).Decode(&collection)
+	_ = resp.Body.Close()
+	if decodeErr != nil {
+		if errors.Is(decodeErr, io.ErrUnexpectedEOF) {
+			return nil, nil, fmt.Errorf("project list response is larger than %d bytes", maxSteveBody)
+		}
+		return nil, nil, fmt.Errorf("project list response: %w", decodeErr)
 	}
 	ids := make(map[string]struct{}, len(collection.Data))
 	for _, item := range collection.Data {
