@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.2](https://github.com/evil8io/drover/compare/v0.10.1...v0.10.2) (2026-09-20)
+
+
+### Bug Fixes
+
+* keep the kind of a custom resource list in the merged answer ([#45](https://github.com/evil8io/drover/issues/45)) ([1e95e72](https://github.com/evil8io/drover/commit/1e95e72e312cacef0835bf4a9b6e97632d96b69b))
+
 ## [0.10.1](https://github.com/evil8io/drover/compare/v0.10.0...v0.10.1) (2026-09-20)
 
 
