@@ -19,6 +19,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/evil8io/drover/internal/rancherclient"
@@ -209,6 +210,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // serve is the traced entry point behind ServeHTTP.
 func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
+	setRouteAttribute(r)
 	if r.Method == http.MethodGet {
 		switch r.URL.Path {
 		case "/healthz":
@@ -224,6 +226,19 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.proxy.ServeHTTP(w, r)
+}
+
+// setRouteAttribute puts the path template of the request on its span, as
+// http.route. A collector that rebuilds a span name from the semantic
+// conventions reads that attribute, and it gives the span the method alone
+// when the attribute is absent. The name that the span formatter writes at
+// the source and the name that such a collector writes are then the same.
+func setRouteAttribute(r *http.Request) {
+	span := trace.SpanFromContext(r.Context())
+	if !span.IsRecording() {
+		return
+	}
+	span.SetAttributes(semconv.HTTPRoute(pathTemplate(r.URL.Path)))
 }
 
 func writePlain(w http.ResponseWriter, code int, body string) {
