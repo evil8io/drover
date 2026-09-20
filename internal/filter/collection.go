@@ -217,3 +217,21 @@ func maxResourceVersion(a, b string) string {
 		return b
 	}
 }
+
+// apiResourceList is the part of a discovery answer that the empty collection
+// needs.
+type apiResourceList struct {
+	GroupVersion string `json:"groupVersion"`
+	Resources    []struct {
+		Name       string `json:"name"`
+		Kind       string `json:"kind"`
+		Namespaced bool   `json:"namespaced"`
+	} `json:"resources"`
+}
+
+// emptyCollectionJSON returns an empty List of the kind, with no element.
+func emptyCollectionJSON(kind, apiVersion string) []byte {
+	return []byte(`{"kind":` + strconv.Quote(kind) +
+		`,"apiVersion":` + strconv.Quote(apiVersion) +
+		`,"metadata":{},"items":[]}`)
+}
