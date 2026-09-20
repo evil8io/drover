@@ -149,7 +149,7 @@ func (s *Service) fanout(req *http.Request, target collectionTarget, names []str
 
 		_ = denied.Body.Close()
 		reader, writer := io.Pipe()
-		go s.streamFanout(ctx, writer, scanner, answers[i+1:], slots, target)
+		go s.streamFanout(req, writer, scanner, answers[i+1:], slots, target)
 
 		result.outcome, result.status, result.count = outcomeFannedOut, http.StatusOK, len(names)
 		s.logList(ctx, start, result)
@@ -323,16 +323,17 @@ func namespacedRequest(req *http.Request, target collectionTarget, name string) 
 // the elements of every answer, and the metadata last. A read error of an
 // answer ends the body with that error, because a half-written collection is
 // not valid JSON.
-func (s *Service) streamFanout(ctx context.Context, writer *io.PipeWriter, first *collectionScanner, rest []chan *http.Response, slots chan struct{}, target collectionTarget) {
+func (s *Service) streamFanout(req *http.Request, writer *io.PipeWriter, first *collectionScanner, rest []chan *http.Response, slots chan struct{}, target collectionTarget) {
+	ctx := req.Context()
 	defer func() { _ = writer.Close() }()
 
-	version := ""
+	merged := collectionHeader{arrayKey: first.header.arrayKey}
 	written := 0
 
 	consume := func(scanner *collectionScanner) error {
 		defer func() {
 			scanner.finish()
-			version = maxResourceVersion(version, scanner.header.resourceVersion)
+			mergeHeader(&merged, scanner.header)
 			scanner.close()
 			<-slots
 		}()
@@ -341,7 +342,7 @@ func (s *Service) streamFanout(ctx context.Context, writer *io.PipeWriter, first
 		return err
 	}
 
-	if err := writeCollectionHeader(writer, first.header); err != nil {
+	if err := writeCollectionHeader(writer, first.header.arrayKey); err != nil {
 		first.close()
 		<-slots
 		drainAnswers(rest, slots)
@@ -370,12 +371,35 @@ func (s *Service) streamFanout(ctx context.Context, writer *io.PipeWriter, first
 		}
 	}
 
-	if err := writeCollectionFooter(writer, version); err != nil {
+	if merged.kind == "" {
+		// An answer without a kind leaves the merge without one, and a client
+		// that reads the kind then fails. Discovery is the last source.
+		if kind, apiVersion, _, ok := s.discoverResource(req, target); ok {
+			merged.kind, merged.apiVersion = kind+"List", apiVersion
+		}
+	}
+	if err := writeCollectionFooter(writer, merged); err != nil {
 		_ = writer.CloseWithError(err)
 		return
 	}
 	s.logger.DebugContext(ctx, "merged a collection",
-		"cluster", target.cluster, "resource", target.resource, "items", written, "resource_version", version)
+		"cluster", target.cluster, "resource", target.resource, "kind", merged.kind,
+		"items", written, "resource_version", merged.resourceVersion)
+}
+
+// mergeHeader takes the fields of one answer that the merged answer still
+// needs, and the highest resourceVersion of the answers so far.
+func mergeHeader(merged *collectionHeader, answer collectionHeader) {
+	if merged.kind == "" {
+		merged.kind = answer.kind
+	}
+	if merged.apiVersion == "" {
+		merged.apiVersion = answer.apiVersion
+	}
+	if len(merged.columns) == 0 {
+		merged.columns = answer.columns
+	}
+	merged.resourceVersion = maxResourceVersion(merged.resourceVersion, answer.resourceVersion)
 }
 
 // skipNamespace drops one answer that the merge cannot read.

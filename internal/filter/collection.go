@@ -126,9 +126,11 @@ func (c *collectionScanner) next() (json.RawMessage, bool, error) {
 	return element, true, nil
 }
 
-// finish reads the fields that stand after the elements, so a body that puts
-// metadata last also gives its resourceVersion. It ignores a read error,
-// because the elements are already through.
+// finish reads the fields that stand after the elements. A custom resource
+// serializes as an unstructured object, whose keys are in alphabetical
+// order, so apiVersion comes first and items comes before kind and metadata.
+// The kind of such a list is therefore known only after its elements. It
+// ignores a read error, because the elements are already through.
 func (c *collectionScanner) finish() {
 	for c.decoder.More() {
 		token, err := c.decoder.Token()
@@ -139,14 +141,20 @@ func (c *collectionScanner) finish() {
 		if !ok {
 			return
 		}
-		if key == "metadata" {
-			if err := c.readMetadata(); err != nil {
-				return
-			}
-			continue
+		switch key {
+		case "kind":
+			err = c.decoder.Decode(&c.header.kind)
+		case "apiVersion":
+			err = c.decoder.Decode(&c.header.apiVersion)
+		case "columnDefinitions":
+			err = c.decoder.Decode(&c.header.columns)
+		case "metadata":
+			err = c.readMetadata()
+		default:
+			var skipped json.RawMessage
+			err = c.decoder.Decode(&skipped)
 		}
-		var skipped json.RawMessage
-		if err := c.decoder.Decode(&skipped); err != nil {
+		if err != nil {
 			return
 		}
 	}
@@ -156,10 +164,27 @@ func (c *collectionScanner) close() {
 	_ = c.body.Close()
 }
 
-// writeCollectionHeader writes the start of the merged answer, up to and
-// including the open bracket of the elements.
-func writeCollectionHeader(w io.Writer, header collectionHeader) error {
-	var fields []string
+// writeCollectionHeader writes the start of the merged answer: the open
+// brace and the open bracket of the elements. Every other field stands after
+// the elements, see writeCollectionFooter.
+func writeCollectionHeader(w io.Writer, arrayKey string) error {
+	if arrayKey == "" {
+		arrayKey = "items"
+	}
+	_, err := io.WriteString(w, "{"+strconv.Quote(arrayKey)+":[")
+	return err
+}
+
+// writeCollectionFooter closes the elements and writes every other field of
+// the merged answer. They all stand after the elements, for two reasons. The
+// resourceVersion of the merge is the highest of the answers, and the merge
+// streams, so that value is known at the end only. The kind of a custom
+// resource list also stands after its elements upstream, because an
+// unstructured object serializes its keys in alphabetical order, so the
+// merge knows it at the end as well. A JSON object has no significant key
+// order, and every Kubernetes client parses it as such.
+func writeCollectionFooter(w io.Writer, header collectionHeader) error {
+	fields := []string{}
 	if header.kind != "" {
 		fields = append(fields, strconv.Quote("kind")+":"+strconv.Quote(header.kind))
 	}
@@ -169,28 +194,13 @@ func writeCollectionHeader(w io.Writer, header collectionHeader) error {
 	if len(header.columns) > 0 {
 		fields = append(fields, strconv.Quote("columnDefinitions")+":"+string(header.columns))
 	}
-	key := header.arrayKey
-	if key == "" {
-		key = "items"
+	metadata := "{}"
+	if header.resourceVersion != "" {
+		metadata = "{" + strconv.Quote("resourceVersion") + ":" + strconv.Quote(header.resourceVersion) + "}"
 	}
-	fields = append(fields, strconv.Quote(key)+":[")
+	fields = append(fields, strconv.Quote("metadata")+":"+metadata)
 
-	_, err := io.WriteString(w, "{"+strings.Join(fields, ","))
-	return err
-}
-
-// writeCollectionFooter closes the elements and writes the metadata of the
-// merged answer. The metadata stands after the elements, because the
-// resourceVersion of the merge is the highest of the answers, and the merge
-// streams, so that value is known at the end only. A JSON object has no
-// significant key order, and every Kubernetes client parses it as such.
-func writeCollectionFooter(w io.Writer, resourceVersion string) error {
-	out := []byte(`],"metadata":{`)
-	if resourceVersion != "" {
-		out = append(out, []byte(`"resourceVersion":`+strconv.Quote(resourceVersion))...)
-	}
-	out = append(out, '}', '}')
-	_, err := w.Write(out)
+	_, err := io.WriteString(w, "],"+strings.Join(fields, ",")+"}")
 	return err
 }
 

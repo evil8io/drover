@@ -927,3 +927,68 @@ func TestCollectionWithANotFoundNamespaceKeepsNative(t *testing.T) {
 		t.Errorf("body = %q, want the native answer", body)
 	}
 }
+
+// unstructuredJSON is a List of a custom resource. The api server serializes
+// such a list as an unstructured object, whose keys stand in alphabetical
+// order, so kind and metadata come after items.
+func unstructuredJSON(kind, apiVersion, namespace, name, resourceVersion string) string {
+	return fmt.Sprintf(`{"apiVersion":%q,`+
+		`"items":[{"apiVersion":%q,"kind":%q,"metadata":{"name":%q,"namespace":%q}}],`+
+		`"kind":%q,"metadata":{"continue":"","resourceVersion":%q}}`,
+		apiVersion, apiVersion, strings.TrimSuffix(kind, "List"), name, namespace,
+		kind, resourceVersion)
+}
+
+func TestCollectionMergesAnUnstructuredList(t *testing.T) {
+	t.Parallel()
+	const apiVersion = "gateway.networking.k8s.io/v1"
+	h := newHarnessOpt(t, collectionUpstream(
+		steveHandler("a", "b"),
+		namespaceLists(map[string]string{
+			"a": unstructuredJSON("HTTPRouteList", apiVersion, "a", "route-a", "5"),
+			"b": unstructuredJSON("HTTPRouteList", apiVersion, "b", "route-b", "12"),
+		}),
+	), withFanout)
+
+	routesPath := "/k8s/clusters/c-1/apis/gateway.networking.k8s.io/v1/httproutes"
+	resp, body := h.do(t, h.request(t, http.MethodGet, routesPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	list := parseList(t, body)
+	if list.Kind != "HTTPRouteList" {
+		t.Errorf("kind = %q, want HTTPRouteList, from a key that stands after the items", list.Kind)
+	}
+	if list.APIVersion != apiVersion {
+		t.Errorf("apiVersion = %q, want %q", list.APIVersion, apiVersion)
+	}
+	if got := list.names(); !slices.Equal(got, []string{"route-a", "route-b"}) {
+		t.Errorf("names = %v, want route-a and route-b", got)
+	}
+	if list.Metadata.ResourceVersion != "12" {
+		t.Errorf("resourceVersion = %q, want 12", list.Metadata.ResourceVersion)
+	}
+}
+
+func TestCollectionMergeTakesTheKindFromDiscoveryWhenNoAnswerHasOne(t *testing.T) {
+	t.Parallel()
+	h := newHarnessOpt(t, collectionUpstreamWithDiscovery(
+		steveHandler("a"),
+		namespaceLists(map[string]string{
+			"a": `{"apiVersion":"v1","items":[{"metadata":{"name":"pod-a","namespace":"a"}}],"metadata":{"resourceVersion":"9"}}`,
+		}),
+		coreDiscovery(),
+	), withFanout)
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, podsPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	list := parseList(t, body)
+	if list.Kind != "PodList" {
+		t.Errorf("kind = %q, want PodList from discovery", list.Kind)
+	}
+	if got := list.names(); !slices.Equal(got, []string{"pod-a"}) {
+		t.Errorf("names = %v, want pod-a", got)
+	}
+}
