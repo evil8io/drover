@@ -57,6 +57,11 @@ type Config struct {
 	// that run at a time. Zero selects 16. It also bounds the answers that
 	// the merge holds.
 	FanoutConcurrency int
+	// FanoutMaxWatchNamespaces is the count of allowed namespaces above which
+	// a cluster-wide watch answers 403. Zero selects 50. A merged watch holds
+	// one upstream connection per namespace for its whole life, so its bound
+	// is below the bound of a list.
+	FanoutMaxWatchNamespaces int
 	// Logger gets one line for each intercepted request. Nil selects slog.Default.
 	Logger *slog.Logger
 	// MeterProvider creates the meter of the filter metrics. Nil selects
@@ -82,9 +87,10 @@ type Service struct {
 	handler   http.Handler
 	metrics   *metrics
 
-	fanoutEnabled       bool
-	fanoutMaxNamespaces int
-	fanoutConcurrency   int
+	fanoutEnabled            bool
+	fanoutMaxNamespaces      int
+	fanoutConcurrency        int
+	fanoutMaxWatchNamespaces int
 
 	draining atomic.Bool
 	watches  *watchRegistry
@@ -149,6 +155,10 @@ func New(cfg Config) (*Service, error) {
 	if fanoutConcurrency <= 0 {
 		fanoutConcurrency = defaultFanoutConcurrency
 	}
+	fanoutMaxWatchNamespaces := cfg.FanoutMaxWatchNamespaces
+	if fanoutMaxWatchNamespaces <= 0 {
+		fanoutMaxWatchNamespaces = defaultFanoutMaxWatchNamespaces
+	}
 	meterProvider := cfg.MeterProvider
 	if meterProvider == nil {
 		meterProvider = otel.GetMeterProvider()
@@ -177,9 +187,10 @@ func New(cfg Config) (*Service, error) {
 		metrics: m,
 		watches: newWatchRegistry(),
 
-		fanoutEnabled:       cfg.Fanout,
-		fanoutMaxNamespaces: fanoutMaxNamespaces,
-		fanoutConcurrency:   fanoutConcurrency,
+		fanoutEnabled:            cfg.Fanout,
+		fanoutMaxNamespaces:      fanoutMaxNamespaces,
+		fanoutConcurrency:        fanoutConcurrency,
+		fanoutMaxWatchNamespaces: fanoutMaxWatchNamespaces,
 	}
 	svc.proxy = &httputil.ReverseProxy{
 		Rewrite:       svc.rewrite,

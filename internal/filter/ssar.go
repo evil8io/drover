@@ -162,17 +162,17 @@ func (s *Service) filteredVerb(spec reviewSpec) bool {
 	return namespaceList(spec) || (s.fanoutEnabled && collectionList(spec))
 }
 
-// collectionList reports whether the review asks for a cluster-wide list of
-// another resource. The filter grants it on the allowed set alone: a check
-// per namespace would cost one request per namespace, and the list itself
-// applies the real permission, so a grant that the permission does not carry
-// gives an empty answer instead of an error.
+// collectionList reports whether the review asks for a cluster-wide list or
+// watch of another resource. The filter grants it on the allowed set alone: a
+// check per namespace would cost one request per namespace, and the list and
+// the watch apply the real permission themselves, so a grant that the
+// permission does not carry gives an empty answer instead of an error.
 func collectionList(spec reviewSpec) bool {
 	if spec.nonResource || spec.resource == nil {
 		return false
 	}
 	attributes := spec.resource
-	if attributes.Verb != "list" {
+	if attributes.Verb != "list" && attributes.Verb != "watch" {
 		return false
 	}
 	if attributes.Namespace != "" && attributes.Namespace != "*" {

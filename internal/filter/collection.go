@@ -177,7 +177,7 @@ func writeCollectionHeader(w io.Writer, arrayKey string) error {
 
 // writeCollectionFooter closes the elements and writes every other field of
 // the merged answer. They all stand after the elements, for two reasons. The
-// resourceVersion of the merge is the highest of the answers, and the merge
+// resourceVersion of the merge is the lowest of the answers, and the merge
 // streams, so that value is known at the end only. The kind of a custom
 // resource list also stands after its elements upstream, because an
 // unstructured object serializes its keys in alphabetical order, so the
@@ -204,11 +204,16 @@ func writeCollectionFooter(w io.Writer, header collectionHeader) error {
 	return err
 }
 
-// maxResourceVersion returns the higher of two resource versions. A Kubernetes
-// resourceVersion is the etcd revision, which counts up over the whole
-// cluster, so the highest of the answers is the revision that every answer
-// reached.
-func maxResourceVersion(a, b string) string {
+// lowestResourceVersion returns the lower of two resource versions. A
+// Kubernetes resourceVersion is the etcd revision, which counts up over the
+// whole cluster. The answers of a merge arrive at different revisions, and a
+// client starts its watch from the revision of the merged answer. A watch from
+// the highest of them loses every change that a namespace of a lower revision
+// got in between. A watch from the lowest loses nothing, and it repeats the
+// changes of that window for the other namespaces. A client takes a repeated
+// change as an update of an object it holds already, and a lost change leaves
+// it with a stale object, so the lowest revision is the safe one.
+func lowestResourceVersion(a, b string) string {
 	left, leftErr := strconv.ParseUint(a, 10, 64)
 	right, rightErr := strconv.ParseUint(b, 10, 64)
 	switch {
@@ -221,7 +226,7 @@ func maxResourceVersion(a, b string) string {
 		return b
 	case rightErr != nil:
 		return a
-	case left >= right:
+	case left <= right:
 		return a
 	default:
 		return b

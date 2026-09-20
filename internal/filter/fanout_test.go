@@ -280,11 +280,11 @@ func TestCollectionMergesCoreList(t *testing.T) {
 	if want := []string{"pod-a", "pod-b"}; !slices.Equal(list.names(), want) {
 		t.Errorf("items = %v, want %v", list.names(), want)
 	}
-	if list.Metadata.ResourceVersion != "12" {
-		t.Errorf("resourceVersion = %q, want 12", list.Metadata.ResourceVersion)
+	if list.Metadata.ResourceVersion != "5" {
+		t.Errorf("resourceVersion = %q, want the lowest answer 5", list.Metadata.ResourceVersion)
 	}
 
-	// The resourceVersion of the merge is the highest of the answers, which
+	// The resourceVersion of the merge is the lowest of the answers, which
 	// the stream knows at the end only, so the metadata stands last.
 	merged := string(body)
 	if last, meta := strings.LastIndex(merged, `"pod-b"`), strings.LastIndex(merged, `"metadata"`); meta < last {
@@ -322,8 +322,8 @@ func TestCollectionMergesGroupList(t *testing.T) {
 	if want := []string{"deploy-a", "deploy-b"}; !slices.Equal(list.names(), want) {
 		t.Errorf("items = %v, want %v", list.names(), want)
 	}
-	if list.Metadata.ResourceVersion != "9" {
-		t.Errorf("resourceVersion = %q, want 9", list.Metadata.ResourceVersion)
+	if list.Metadata.ResourceVersion != "4" {
+		t.Errorf("resourceVersion = %q, want the lowest answer 4", list.Metadata.ResourceVersion)
 	}
 
 	want := []string{
@@ -391,7 +391,7 @@ func TestCollectionSkipsForbiddenNamespace(t *testing.T) {
 		t.Errorf("items = %v, want %v", list.names(), want)
 	}
 	if list.Metadata.ResourceVersion != "12" {
-		t.Errorf("resourceVersion = %q, want 12", list.Metadata.ResourceVersion)
+		t.Errorf("resourceVersion = %q, want the single answer 12", list.Metadata.ResourceVersion)
 	}
 	if got := len(namespacedRecords(h.upstream)); got != 2 {
 		t.Errorf("namespaced requests = %d, want 2", got)
@@ -467,27 +467,6 @@ func TestCollectionAboveTheCapIsForbidden(t *testing.T) {
 	}
 	if got := len(namespacedRecords(h.upstream)); got != 0 {
 		t.Errorf("namespaced requests = %d, want 0", got)
-	}
-}
-
-func TestCollectionWatchReturnsNative(t *testing.T) {
-	t.Parallel()
-	h := newHarnessOpt(t, collectionUpstream(
-		steveHandler("a", "b"),
-		namespaceLists(map[string]string{
-			"a": collectionJSON("PodList", "v1", "a", "pod-a", "5"),
-		}),
-	), withFanout)
-
-	resp, body := h.do(t, h.request(t, http.MethodGet, podsPath+"?watch=true", nil, callerHeader()))
-	if resp.StatusCode != http.StatusForbidden {
-		t.Errorf("status = %d, want 403", resp.StatusCode)
-	}
-	if string(body) != nativeForbidden {
-		t.Errorf("body = %q, want the native answer", body)
-	}
-	if h.upstream.count() != 1 {
-		t.Errorf("upstream requests = %d, want the native request only", h.upstream.count())
 	}
 }
 
@@ -673,15 +652,15 @@ func TestCollectionFansOutConcurrently(t *testing.T) {
 	if !slices.Equal(list.namespaces(), names) {
 		t.Errorf("item namespaces = %v, want %v", list.namespaces(), names)
 	}
-	if list.Metadata.ResourceVersion != "112" {
-		t.Errorf("resourceVersion = %q, want 112", list.Metadata.ResourceVersion)
+	if list.Metadata.ResourceVersion != "101" {
+		t.Errorf("resourceVersion = %q, want the lowest answer 101", list.Metadata.ResourceVersion)
 	}
 	if got := gate.highestInFlight(); got != concurrency {
 		t.Errorf("namespaced requests at the same time = %d, want %d", got, concurrency)
 	}
 }
 
-func TestMaxResourceVersion(t *testing.T) {
+func TestLowestResourceVersion(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name string
@@ -689,10 +668,10 @@ func TestMaxResourceVersion(t *testing.T) {
 		b    string
 		want string
 	}{
-		{"left higher", "12", "5", "12"},
-		{"right higher", "5", "12", "12"},
+		{"left lower", "5", "12", "5"},
+		{"right lower", "12", "5", "5"},
 		{"equal", "7", "7", "7"},
-		{"wide", "18446744073709551615", "2", "18446744073709551615"},
+		{"wide", "18446744073709551615", "2", "2"},
 		{"empty left", "", "7", "7"},
 		{"empty right", "7", "", "7"},
 		{"both empty", "", "", ""},
@@ -704,8 +683,8 @@ func TestMaxResourceVersion(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			if got := maxResourceVersion(test.a, test.b); got != test.want {
-				t.Errorf("maxResourceVersion(%q, %q) = %q, want %q", test.a, test.b, got, test.want)
+			if got := lowestResourceVersion(test.a, test.b); got != test.want {
+				t.Errorf("lowestResourceVersion(%q, %q) = %q, want %q", test.a, test.b, got, test.want)
 			}
 		})
 	}
@@ -721,6 +700,8 @@ func TestReviewGrantsCollectionList(t *testing.T) {
 	}{
 		{"cluster-wide list with the fan-out", true, `"verb":"list","resource":"pods"`, true},
 		{"cluster-wide list without the fan-out", false, `"verb":"list","resource":"pods"`, false},
+		{"cluster-wide watch with the fan-out", true, `"verb":"watch","resource":"pods"`, true},
+		{"cluster-wide watch without the fan-out", false, `"verb":"watch","resource":"pods"`, false},
 		{"namespaced list with the fan-out", true, `"verb":"list","resource":"pods","namespace":"a"`, false},
 		{"namespaced list without the fan-out", false, `"verb":"list","resource":"pods","namespace":"a"`, false},
 		{"get with the fan-out", true, `"verb":"get","resource":"pods"`, false},
@@ -965,8 +946,8 @@ func TestCollectionMergesAnUnstructuredList(t *testing.T) {
 	if got := list.names(); !slices.Equal(got, []string{"route-a", "route-b"}) {
 		t.Errorf("names = %v, want route-a and route-b", got)
 	}
-	if list.Metadata.ResourceVersion != "12" {
-		t.Errorf("resourceVersion = %q, want 12", list.Metadata.ResourceVersion)
+	if list.Metadata.ResourceVersion != "5" {
+		t.Errorf("resourceVersion = %q, want the lowest answer 5", list.Metadata.ResourceVersion)
 	}
 }
 

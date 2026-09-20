@@ -6,13 +6,13 @@ drover is a set of tenancy extensions for Rancher. It is one binary, with one su
 
 | Subcommand | Meaning |
 | --- | --- |
-| `api-filter` | A reverse proxy that answers the namespace list, and a cluster-wide list of a namespaced kind, of a Rancher project member. |
+| `api-filter` | A reverse proxy that answers the namespace list, and a cluster-wide list or watch of a namespaced kind, of a Rancher project member. |
 | `rotate-token` | A command that renews the API token of the Rancher service user in a Secret. |
 | `project-sync` | A loop and a namespace watch that copy labels and annotations of a Rancher project to the namespaces of that project. |
 
 ## api-filter
 
-A filter in front of Rancher that lets a tenant list only the namespaces of its projects, with kubectl, k9s, and other Kubernetes clients. With `--fanout` on, it also lists a namespaced kind across those namespaces, cluster-wide, in one call.
+A filter in front of Rancher that lets a tenant list only the namespaces of its projects, with kubectl, k9s, and other Kubernetes clients. With `--fanout` on, it also lists and watches a namespaced kind across those namespaces, cluster-wide, in one call.
 
 Rancher grants a project member `get` on the namespaces of its projects, and no `list`. A `kubectl get ns` request through a Rancher kubeconfig gets a 403 error, while `kubectl get ns <name>` works. This service is an HTTP reverse proxy in front of Rancher. A Gateway or an Ingress routes the paths in Requirements to the service, and every other path goes to Rancher directly.
 
@@ -46,7 +46,7 @@ The upgrade offers no websocket extension, because the filter reads no compresse
 
 **Review access**
 
-The service reads the body of a `selfsubjectaccessreviews` request. It intercepts a review that asks about a list or a watch on the namespaces resource. A review may name a namespace, because kubectl sends the namespace of the kubeconfig context even for this cluster-scoped resource. The service ignores that attribute. With `--fanout` on, the service also intercepts a review that asks about a cluster-wide list of another resource. An intercepted review goes to Rancher with the caller's own credentials. A denied response gets `allowed: true` only when the caller has at least one allowed namespace. Every other review passes through unchanged. The service reads a JSON review or a Kubernetes protobuf review, and it answers an intercepted review in JSON.
+The service reads the body of a `selfsubjectaccessreviews` request. It intercepts a review that asks about a list or a watch on the namespaces resource. A review may name a namespace, because kubectl sends the namespace of the kubeconfig context even for this cluster-scoped resource. The service ignores that attribute. With `--fanout` on, the service also intercepts a review that asks about a cluster-wide list or watch of another resource. An intercepted review goes to Rancher with the caller's own credentials. A denied response gets `allowed: true` only when the caller has at least one allowed namespace. Every other review passes through unchanged. The service reads a JSON review or a Kubernetes protobuf review, and it answers an intercepted review in JSON.
 
 ### Fan-out
 
@@ -58,14 +58,26 @@ With `--fanout` on, the service answers a cluster-wide list of a namespaced kind
 4. A namespace that answers with a status other than 200 drops out of the merge. A 404 error stops the fan-out, because every namespace gives that same answer, and the native 403 error then stands. A cluster-scoped kind, for example `nodes`, always takes that path.
 5. A caller that may see no object of the kind gets an empty collection, not the native 403 error. This covers a caller with no allowed namespace, and a caller whose namespaces all deny the list. A client then shows an empty view instead of an error, as it does for the namespace list. The service reads the kind and the scope of the resource from the discovery document of the api path, with the credentials of the caller, because the merge has no answer to take them from. A cluster-scoped kind keeps its 403 error, and so does a resource that discovery does not name.
 6. The merged answer streams to the client. It holds the elements of at most `--fanout-concurrency` answers at a time. A tenant with hundreds of namespaces then needs no more than that count of answers in memory.
-7. The merged answer puts the `kind`, the `apiVersion` and the `metadata` fields after the elements. The `resourceVersion` of the merge is the highest value of the answers, so the service knows it only after the last answer. The `kind` of a custom resource list also stands after its elements upstream, because an unstructured object serializes its keys in alphabetical order. A JSON object has no fixed field order, so this position is valid. The service asks discovery for the kind when no answer names one.
+7. The merged answer puts the `kind`, the `apiVersion` and the `metadata` fields after the elements. The `resourceVersion` of the merge is the lowest value of the answers, so the service knows it only after the last answer. The `kind` of a custom resource list also stands after its elements upstream, because an unstructured object serializes its keys in alphabetical order. A JSON object has no fixed field order, so this position is valid. The service asks discovery for the kind when no answer names one.
 8. The merge names no `continue` token. It also drops the `limit` and `continue` parameters of the caller. A `continue` token belongs to one namespace only. A client that reads a merged answer reads one page, and it stops there.
 9. The service merges a `List` and a `Table` alike. A merged `Table` keeps the `columnDefinitions` field of the first answer. A table view in kubectl then keeps its columns.
-10. The service does not merge a cluster-wide watch yet. Such a request keeps its native answer.
-
 A caller may see more allowed namespaces than `--fanout-max-namespaces` allows. That cluster-wide list then gets a 403 error, and the service runs no fan-out.
 
-The `selfsubjectaccessreviews` path grants a cluster-wide `list` of any resource when `--fanout` is on and the caller has at least one allowed namespace. The list request applies the real permission on its own. A grant that the permission does not cover then gives an empty answer, not an error.
+The `selfsubjectaccessreviews` path grants a cluster-wide `list` and a cluster-wide `watch` of any resource when `--fanout` is on and the caller has at least one allowed namespace. The list and the watch apply the real permission on their own. A grant that the permission does not cover then gives an empty answer, not an error.
+
+**Merged watch**
+
+With `--fanout` on, the service also answers a cluster-wide watch, for example `kubectl get pods -A --watch`, with one upstream watch per allowed namespace, merged into one stream.
+
+1. The service opens every upstream watch at the same time, on the namespaced path of the kind, with the credentials of the caller. `--fanout-max-watch-namespaces` bounds that set. A caller above the bound gets a 403 error, and the service opens no upstream watch. The bound is below `--fanout-max-namespaces`. A list keeps one upstream request open for the length of that request. A watch keeps one upstream connection open for the whole life of the stream, and each client of the caller has its own set.
+2. Each upstream watch keeps the query of the caller, with its `resourceVersion` and its `timeoutSeconds`. The merged list reports the lowest `resourceVersion` of its answers, so a watch from that value loses no event. A namespace that answered the list at a higher revision repeats the events between the two revisions. A client takes a repeated event as an update of an object that it has already.
+3. A namespace that answers a status other than 200 drops out of the stream. A 404 error gives the native 403 error, because the kind then has no namespace scope. An allowed set whose namespaces all deny the watch gives the native answer too, because a stream without an upstream watch hides a real permission gap.
+4. A caller that may see no namespace gets an open stream without an event, as it gets a collection without an element on the list path.
+5. The merged stream sends no `BOOKMARK` event, and the service drops `allowWatchBookmarks` from the upstream requests. A bookmark names the revision of one namespace, and a client that resumes the merge from it loses the events of every other namespace.
+6. The set of upstream watches is fixed while the stream runs. A timer re-reads the allowed set of the caller once per cache TTL, and a set that changed ends the stream. The client re-lists and re-watches, and the new stream covers the new set. The re-read goes through the cache of a plain list, so it adds no request.
+7. An upstream watch that ends ends the merged stream. The client re-lists, which repairs the gap. A stream that stays open with one dead namespace shows stale data and reports nothing about it.
+8. The service owns the transport of the client on this path, because it relays no single upstream stream. A chunked client gets the events as a newline-delimited JSON stream. A client that asks for a websocket gets the protocol switch from the service itself, and one frame per event: a binary frame for the `binary.k8s.io` subprotocol, and a text frame with base64 text for `base64.binary.k8s.io`. A close frame of the client ends the stream, and a ping frame gets a pong.
+9. Every upstream watch takes the chunked transport. The service deletes the handshake headers of the caller from the upstream request.
 
 ### Requirements
 
@@ -100,6 +112,7 @@ With these routes, the service becomes the data path for most reads of a tenant.
 | `--fanout` | `false` | Answer a cluster-wide list of a namespaced kind with one request per allowed namespace. |
 | `--fanout-max-namespaces` | `200` | Count of allowed namespaces above which such a list answers 403. |
 | `--fanout-concurrency` | `16` | Namespaced requests of one fan-out that run at a time. It also bounds the memory of one fan-out. |
+| `--fanout-max-watch-namespaces` | `50` | Count of allowed namespaces above which a cluster-wide watch answers 403. |
 | `--log-level` | `info` | One of `debug`, `info`, `warn`, or `error`. |
 | `--shutdown-grace` | `20s` | Grace period for the shutdown after SIGTERM or SIGINT. |
 | `--otlp-endpoint` | `$OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint, `host:port` or a URL. Empty turns telemetry off. |
@@ -123,8 +136,11 @@ A Helm chart for drover is published separately.
 | Field selector | A field selector on a name outside the allowed set returns an empty list. A `get` on that name returns Forbidden. |
 | Namespace cap | A caller with more than 20,000 allowed namespace names gets an error, not a list. |
 | Fan-out cap | A cluster-wide list gets a 403 error, with no fan-out, when the caller has more than `--fanout-max-namespaces` allowed namespaces. |
+| Watch cap | A cluster-wide watch gets a 403 error, with no merge, when the caller has more than `--fanout-max-watch-namespaces` allowed namespaces. |
+| Merged watch end | A merged cluster-wide watch ends when one upstream watch ends, and when the allowed set of the caller changes. The client re-lists and re-watches. |
+| Merged watch bookmark | A merged cluster-wide watch sends no `BOOKMARK` event, also when the client asks for one. |
 | Empty answer | A cluster-wide list of a namespaced kind gets an empty collection, not Forbidden, when the caller may see no object of that kind. |
-| Self-check | `kubectl auth can-i list namespaces` returns yes when the caller has at least one allowed namespace, while RBAC returns no. With `--fanout` on, the same holds for `list` on any namespaced kind, cluster-wide. |
+| Self-check | `kubectl auth can-i list namespaces` returns yes when the caller has at least one allowed namespace, while RBAC returns no. With `--fanout` on, the same applies to `list` and `watch` on any namespaced kind, cluster-wide. |
 | Fetch rate | A fetch of an allowed set past `--fetch-rate` waits up to 5 s for a free token, then gets a 429 Status. |
 | Trust level | The service is a privileged component. It uses the cluster-owner token for the filtered namespace list and for the watch stream. |
 
