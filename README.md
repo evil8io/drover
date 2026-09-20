@@ -6,15 +6,15 @@ drover is a set of tenancy extensions for Rancher. It is one binary, with one su
 
 | Subcommand | Meaning |
 | --- | --- |
-| `namespace-filter` | A reverse proxy that answers the namespace list of a Rancher project member. |
+| `api-filter` | A reverse proxy that answers the namespace list, and a cluster-wide list of a namespaced kind, of a Rancher project member. |
 | `rotate-token` | A command that renews the API token of the Rancher service user in a Secret. |
 | `project-sync` | A loop and a namespace watch that copy labels and annotations of a Rancher project to the namespaces of that project. |
 
-## namespace-filter
+## api-filter
 
-A filter in front of Rancher that lets a tenant list only the namespaces of its projects, with kubectl, k9s, and other Kubernetes clients.
+A filter in front of Rancher that lets a tenant list only the namespaces of its projects, with kubectl, k9s, and other Kubernetes clients. With `--fanout` on, it also lists a namespaced kind across those namespaces, cluster-wide, in one call.
 
-Rancher grants a project member `get` on the namespaces of its projects, and no `list`. A `kubectl get ns` request through a Rancher kubeconfig gets a 403 error, while `kubectl get ns <name>` works. This service is an HTTP reverse proxy in front of Rancher. A Gateway or an Ingress routes two paths to the service, and every other path goes to Rancher directly.
+Rancher grants a project member `get` on the namespaces of its projects, and no `list`. A `kubectl get ns` request through a Rancher kubeconfig gets a 403 error, while `kubectl get ns <name>` works. This service is an HTTP reverse proxy in front of Rancher. A Gateway or an Ingress routes the paths in Requirements to the service, and every other path goes to Rancher directly.
 
 ### How it works
 
@@ -46,14 +46,44 @@ The upgrade offers no websocket extension, because the filter reads no compresse
 
 **Review access**
 
-The service reads the body of a `selfsubjectaccessreviews` request. When the review asks about a list or a watch on the namespaces resource, the service sends the request with the caller's own credentials. A review may name a namespace, because kubectl sends the namespace of the kubeconfig context even for this cluster-scoped resource. The service ignores that attribute. A denied response gets `allowed: true` only when the caller has at least one allowed namespace. Every other review passes through unchanged. The service reads a JSON review or a Kubernetes protobuf review, and it answers an intercepted review in JSON.
+The service reads the body of a `selfsubjectaccessreviews` request. It intercepts a review that asks about a list or a watch on the namespaces resource. A review may name a namespace, because kubectl sends the namespace of the kubeconfig context even for this cluster-scoped resource. The service ignores that attribute. With `--fanout` on, the service also intercepts a review that asks about a cluster-wide list of another resource. An intercepted review goes to Rancher with the caller's own credentials. A denied response gets `allowed: true` only when the caller has at least one allowed namespace. Every other review passes through unchanged. The service reads a JSON review or a Kubernetes protobuf review, and it answers an intercepted review in JSON.
+
+### Fan-out
+
+With `--fanout` on, the service answers a cluster-wide list of a namespaced kind, for example `kubectl get pods -A`, with one request per allowed namespace, merged into one collection.
+
+1. A Rancher project member has the list permission inside the namespaces of its projects only, and none at cluster scope. A cluster-wide list then gets a 403 error from Rancher.
+2. The service sends the native request first. The fan-out starts only after that request gets a 403 error.
+3. Each namespaced request of the fan-out uses the credentials of the caller, not the service token. RBAC checks each request on its own. The fan-out then grants no permission beyond what the caller already has.
+4. A namespace that answers with a status other than 200 drops out of the merge. The native 403 error stands when no namespace answers 200. A cluster-scoped kind, for example `nodes`, always takes this path, because a namespaced request for it gets a 404 error. A 404 also stops the fan-out, because every namespace gives that same answer.
+5. The merged answer streams to the client. It holds the elements of at most `--fanout-concurrency` answers at a time. A tenant with hundreds of namespaces then needs no more than that count of answers in memory.
+6. The merged answer puts the `metadata` field after the elements. The `resourceVersion` of the merge is the highest value of the answers, and the service knows that value only after the last answer. A JSON object has no fixed field order, so this position is valid.
+7. The merge names no `continue` token. It also drops the `limit` and `continue` parameters of the caller. A `continue` token belongs to one namespace only. A client that reads a merged answer reads one page, and it stops there.
+8. The service merges a `List` and a `Table` alike. A merged `Table` keeps the `columnDefinitions` field of the first answer. A table view in kubectl then keeps its columns.
+9. The service does not merge a cluster-wide watch yet. Such a request keeps its native answer.
+
+A caller may see more allowed namespaces than `--fanout-max-namespaces` allows. That cluster-wide list then gets a 403 error, and the service runs no fan-out.
+
+The `selfsubjectaccessreviews` path grants a cluster-wide `list` of any resource when `--fanout` is on and the caller has at least one allowed namespace. The list request applies the real permission on its own. A grant that the permission does not cover then gives an empty answer, not an error.
 
 ### Requirements
 
 1. A Rancher service user with a `cluster-owner` binding on every cluster whose tenants use the filter.
 2. An API token of that service user. The token has no scope.
 3. The token in a Secret, mounted into the service.
-4. Two `Exact` path matches per cluster id, on the Rancher hostname, that route to the service.
+4. Route rules on the Rancher hostname for these requests:
+
+   | Match | Method | Path | Target |
+   | --- | --- | --- | --- |
+   | `Exact` | GET | `/k8s/clusters/<id>/api/v1/namespaces` | the service |
+   | `PathPrefix` | GET | `/k8s/clusters/<id>/api/v1/namespaces` | Rancher |
+   | `PathPrefix` | GET | `/k8s/clusters/<id>/api/v1` | the service |
+   | `PathPrefix` | GET | `/k8s/clusters/<id>/apis` | the service |
+   | `Exact` | POST | `/k8s/clusters/<id>/apis/authorization.k8s.io/v1/selfsubjectaccessreviews` | the service |
+
+   A Gateway picks the rule by the specificity of the match, not by the order of the rules. An `Exact` match wins over a `PathPrefix` match, and a longer prefix wins over a shorter one. The namespaces prefix is therefore the rule of every namespaced read, and it keeps `exec`, `attach`, `portforward`, and a log stream on Rancher, off the service. Give the Rancher rule the same unlimited request timeout as the service rule, because those streams stay open for minutes.
+
+With these routes, the service becomes the data path for most reads of a tenant. The tenant then depends on the availability and the latency of the service for those reads.
 
 ### Configuration
 
@@ -66,6 +96,9 @@ The service reads the body of a `selfsubjectaccessreviews` request. When the rev
 | `--cache-ttl` | `15s` | Lifetime of a cached allowed set. |
 | `--max-cache-entries` | `1000` | Hard bound on the cached allowed sets. |
 | `--fetch-rate` | `50` | Fetches per second that the shared rate limit allows, for a fetch of an allowed set. The burst is twice the rate. |
+| `--fanout` | `false` | Answer a cluster-wide list of a namespaced kind with one request per allowed namespace. |
+| `--fanout-max-namespaces` | `200` | Count of allowed namespaces above which such a list answers 403. |
+| `--fanout-concurrency` | `16` | Namespaced requests of one fan-out that run at a time. It also bounds the memory of one fan-out. |
 | `--log-level` | `info` | One of `debug`, `info`, `warn`, or `error`. |
 | `--shutdown-grace` | `20s` | Grace period for the shutdown after SIGTERM or SIGINT. |
 | `--otlp-endpoint` | `$OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint, `host:port` or a URL. Empty turns telemetry off. |
@@ -73,7 +106,7 @@ The service reads the body of a `selfsubjectaccessreviews` request. When the rev
 | `--otlp-metrics` | `true` | Send metrics to the OTLP endpoint. |
 | `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | `service.name` resource attribute. |
 
-The upstream is the Rancher Service inside the cluster, for example `http://rancher.cattle-system.svc`. The public hostname is not a valid upstream, because the route sends the two filtered paths back to the service.
+The upstream is the Rancher Service inside the cluster, for example `http://rancher.cattle-system.svc`. The public hostname is not a valid upstream, because the route sends the filtered paths back to the service.
 
 The service starts with no token file and returns a 502 Status on a filtered request until the file gets a token.
 
@@ -88,7 +121,8 @@ A Helm chart for drover is published separately.
 | Cache delay | A role change becomes visible after the cache TTL, on top of Rancher's own delay. |
 | Field selector | A field selector on a name outside the allowed set returns an empty list. A `get` on that name returns Forbidden. |
 | Namespace cap | A caller with more than 20,000 allowed namespace names gets an error, not a list. |
-| Self-check | `kubectl auth can-i list namespaces` returns yes when the caller has at least one allowed namespace, while RBAC returns no. |
+| Fan-out cap | A cluster-wide list gets a 403 error, with no fan-out, when the caller has more than `--fanout-max-namespaces` allowed namespaces. |
+| Self-check | `kubectl auth can-i list namespaces` returns yes when the caller has at least one allowed namespace, while RBAC returns no. With `--fanout` on, the same holds for `list` on any namespaced kind, cluster-wide. |
 | Fetch rate | A fetch of an allowed set past `--fetch-rate` waits up to 5 s for a free token, then gets a 429 Status. |
 | Trust level | The service is a privileged component. It uses the cluster-owner token for the filtered namespace list and for the watch stream. |
 
@@ -96,7 +130,7 @@ A Helm chart for drover is published separately.
 
 The service writes JSON logs to stderr, one line per intercepted request.
 
-A namespace list log line has these fields: `cluster`, `outcome` (`native`, `filtered`, `passthrough`, `denied`, or `error`), `status`, `count` (only on `filtered`), `watch`, and `duration_ms`.
+A namespace list log line and a collection log line have these fields: `cluster`, `outcome` (`native`, `filtered`, `passthrough`, `denied`, `fanout`, `capped`, or `error`), `status`, `count` (on `filtered`, `fanout`, or `capped` only), `watch`, and `duration_ms`. A collection log line also has `resource`, the kind of the requested collection.
 
 A review log line has these fields: `cluster`, `outcome` (`passthrough`, `native`, or `granted`), and `status`.
 
@@ -114,12 +148,15 @@ The service continues an incoming `traceparent` on every request. It starts a sp
 
 | Metric | Kind | Unit | Attributes |
 | --- | --- | --- | --- |
-| `drover.filter.requests` | Counter | `1` | `outcome`, `cluster`, `watch` |
-| `drover.filter.request.duration` | Histogram | `s` | `outcome`, `cluster`, `watch` |
+| `drover.filter.requests` | Counter | `1` | `path`, `outcome`, `cluster`, `watch` |
+| `drover.filter.request.duration` | Histogram | `s` | `path`, `outcome`, `cluster`, `watch` |
 | `drover.filter.watches.open` | Up-down counter | `1` | |
 | `drover.filter.watches.rejected` | Counter | `1` | `cluster` |
 | `drover.filter.events.dropped` | Counter | `1` | `cluster` |
 | `drover.filter.fetch.throttled` | Counter | `1` | |
+| `drover.filter.fanout.namespaces` | Histogram | `1` | `cluster` |
+| `drover.filter.fanout.capped` | Counter | `1` | `cluster` |
+| `drover.filter.fanout.skipped` | Counter | `1` | `cluster` |
 
 ### Shutdown
 

@@ -60,7 +60,7 @@ func (s *Service) roundTripReview(req *http.Request, cluster string) (*http.Resp
 	out := req.Clone(req.Context())
 	setBody(out, body)
 
-	match, replacement := namespaceListReview(req.Header.Get("Content-Type"), body)
+	match, replacement := s.filteredReview(req.Header.Get("Content-Type"), body)
 	if !match {
 		resp, err := s.base.RoundTrip(out)
 		if err != nil {
@@ -133,13 +133,13 @@ func (s *Service) nativeReview(ctx context.Context, cluster, user string, resp *
 	return resp, nil
 }
 
-// namespaceListReview reports whether the review asks for the list or the watch
-// of the namespaces resource. A protobuf review also gets the JSON body that
-// replaces it, because the filter answers the review in JSON.
-func namespaceListReview(contentType string, body []byte) (match bool, replacement []byte) {
+// filteredReview reports whether the review asks for a verb that the filter
+// answers itself. A protobuf review also gets the JSON body that replaces it,
+// because the filter answers the review in JSON.
+func (s *Service) filteredReview(contentType string, body []byte) (match bool, replacement []byte) {
 	if isProtobuf(contentType) {
 		spec, err := decodeProtobufReview(body)
-		if err != nil || !namespaceList(spec) {
+		if err != nil || !s.filteredVerb(spec) {
 			return false, nil
 		}
 		replacement, err := reviewJSON(*spec.resource)
@@ -153,7 +153,32 @@ func namespaceListReview(contentType string, body []byte) (match bool, replaceme
 	if err != nil {
 		return false, nil
 	}
-	return namespaceList(spec), nil
+	return s.filteredVerb(spec), nil
+}
+
+// filteredVerb reports whether the review asks for the namespace list, or for
+// a cluster-wide list that the fan-out answers.
+func (s *Service) filteredVerb(spec reviewSpec) bool {
+	return namespaceList(spec) || (s.fanoutEnabled && collectionList(spec))
+}
+
+// collectionList reports whether the review asks for a cluster-wide list of
+// another resource. The filter grants it on the allowed set alone: a check
+// per namespace would cost one request per namespace, and the list itself
+// applies the real permission, so a grant that the permission does not carry
+// gives an empty answer instead of an error.
+func collectionList(spec reviewSpec) bool {
+	if spec.nonResource || spec.resource == nil {
+		return false
+	}
+	attributes := spec.resource
+	if attributes.Verb != "list" {
+		return false
+	}
+	if attributes.Namespace != "" && attributes.Namespace != "*" {
+		return false
+	}
+	return attributes.Resource != "" && attributes.Name == "" && attributes.Subresource == ""
 }
 
 func jsonReviewSpec(body []byte) (reviewSpec, error) {

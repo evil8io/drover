@@ -1,5 +1,7 @@
 // Package filter proxies a Rancher server. It answers the namespace list of a
-// caller that has the get permission on a namespace, but no list permission.
+// caller that has the get permission on a namespace, but no list permission,
+// and it answers a cluster-wide list of a namespaced kind with one request
+// per allowed namespace.
 package filter
 
 import (
@@ -43,6 +45,17 @@ type Config struct {
 	// for a fetch of an allowed set. Zero selects 50. The burst is twice the
 	// rate, and at least 1.
 	FetchRate float64
+	// Fanout answers a cluster-wide list of a namespaced kind with one
+	// request per allowed namespace. It is off by default, because it makes
+	// the filter the data path of most reads of a tenant.
+	Fanout bool
+	// FanoutMaxNamespaces is the count of allowed namespaces above which a
+	// fan-out answers 403. Zero selects 200.
+	FanoutMaxNamespaces int
+	// FanoutConcurrency is the count of namespaced requests of one fan-out
+	// that run at a time. Zero selects 16. It also bounds the answers that
+	// the merge holds.
+	FanoutConcurrency int
 	// Logger gets one line for each intercepted request. Nil selects slog.Default.
 	Logger *slog.Logger
 	// MeterProvider creates the meter of the filter metrics. Nil selects
@@ -67,6 +80,10 @@ type Service struct {
 	proxy     *httputil.ReverseProxy
 	handler   http.Handler
 	metrics   *metrics
+
+	fanoutEnabled       bool
+	fanoutMaxNamespaces int
+	fanoutConcurrency   int
 
 	draining atomic.Bool
 	watches  *watchRegistry
@@ -123,6 +140,14 @@ func New(cfg Config) (*Service, error) {
 		fetchRate = defaultFetchRate
 	}
 	fetchBurst := max(2*fetchRate, 1)
+	fanoutMaxNamespaces := cfg.FanoutMaxNamespaces
+	if fanoutMaxNamespaces <= 0 {
+		fanoutMaxNamespaces = defaultFanoutMaxNamespaces
+	}
+	fanoutConcurrency := cfg.FanoutConcurrency
+	if fanoutConcurrency <= 0 {
+		fanoutConcurrency = defaultFanoutConcurrency
+	}
 	meterProvider := cfg.MeterProvider
 	if meterProvider == nil {
 		meterProvider = otel.GetMeterProvider()
@@ -146,6 +171,10 @@ func New(cfg Config) (*Service, error) {
 		limiter:   newLimiter(fetchRate, fetchBurst, now),
 		metrics:   m,
 		watches:   newWatchRegistry(),
+
+		fanoutEnabled:       cfg.Fanout,
+		fanoutMaxNamespaces: fanoutMaxNamespaces,
+		fanoutConcurrency:   fanoutConcurrency,
 	}
 	svc.proxy = &httputil.ReverseProxy{
 		Rewrite:       svc.rewrite,
@@ -153,7 +182,7 @@ func New(cfg Config) (*Service, error) {
 		FlushInterval: -1,
 		ErrorHandler:  svc.handleError,
 	}
-	svc.handler = otelhttp.NewHandler(http.HandlerFunc(svc.serve), "namespace-filter",
+	svc.handler = otelhttp.NewHandler(http.HandlerFunc(svc.serve), "api-filter",
 		otelhttp.WithMeterProvider(meterProvider),
 		otelhttp.WithTracerProvider(tracerProvider),
 		otelhttp.WithFilter(func(r *http.Request) bool {
