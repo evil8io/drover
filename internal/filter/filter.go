@@ -166,11 +166,15 @@ func New(cfg Config) (*Service, error) {
 		tokenFile: cfg.TokenFile,
 		logger:    logger,
 		now:       now,
-		base:      otelhttp.NewTransport(base, otelhttp.WithMeterProvider(meterProvider), otelhttp.WithTracerProvider(tracerProvider)),
-		cache:     newCache(ttl, maxCacheEntries, now),
-		limiter:   newLimiter(fetchRate, fetchBurst, now),
-		metrics:   m,
-		watches:   newWatchRegistry(),
+		base: otelhttp.NewTransport(base,
+			otelhttp.WithMeterProvider(meterProvider),
+			otelhttp.WithTracerProvider(tracerProvider),
+			otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string { return spanName(r) }),
+		),
+		cache:   newCache(ttl, maxCacheEntries, now),
+		limiter: newLimiter(fetchRate, fetchBurst, now),
+		metrics: m,
+		watches: newWatchRegistry(),
 
 		fanoutEnabled:       cfg.Fanout,
 		fanoutMaxNamespaces: fanoutMaxNamespaces,
@@ -185,6 +189,10 @@ func New(cfg Config) (*Service, error) {
 	svc.handler = otelhttp.NewHandler(http.HandlerFunc(svc.serve), "api-filter",
 		otelhttp.WithMeterProvider(meterProvider),
 		otelhttp.WithTracerProvider(tracerProvider),
+		// otelhttp names a server span after the http method, so a span of
+		// the filter would read GET. The path template says what the request
+		// asks for, and it keeps the value set bounded.
+		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string { return spanName(r) }),
 		otelhttp.WithFilter(func(r *http.Request) bool {
 			return r.URL.Path != "/healthz" && r.URL.Path != "/readyz"
 		}),
