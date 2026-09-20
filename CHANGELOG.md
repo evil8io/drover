@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/evil8io/drover/compare/v0.10.0...v0.10.1) (2026-09-20)
+
+
+### Bug Fixes
+
+* answer an empty collection when the caller may see no object ([#43](https://github.com/evil8io/drover/issues/43)) ([41f9e1c](https://github.com/evil8io/drover/commit/41f9e1cd3da27f4080dcc034b8ea0758e185896f))
+
 ## [0.10.0](https://github.com/evil8io/drover/compare/v0.9.1...v0.10.0) (2026-09-20)
 
 
