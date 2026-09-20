@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/evil8io/drover/compare/v0.10.2...v0.11.0) (2026-09-20)
+
+
+### Features
+
+* name a span after the method and a path template ([#47](https://github.com/evil8io/drover/issues/47)) ([bd4d330](https://github.com/evil8io/drover/commit/bd4d3305867cfc16a6dcf090f78ea142b0da62ba))
+
 ## [0.10.2](https://github.com/evil8io/drover/compare/v0.10.1...v0.10.2) (2026-09-20)
 
 
