@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.10.0](https://github.com/evil8io/drover/compare/v0.9.1...v0.10.0) (2026-09-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* the subcommand `namespace-filter` is now `api-filter`.
+
+### Features
+
+* rename the command to api-filter and merge a cluster-wide list ([#41](https://github.com/evil8io/drover/issues/41)) ([2807c2e](https://github.com/evil8io/drover/commit/2807c2e696c16c28c30b72813d965b5df3194e11))
+
 ## [0.9.1](https://github.com/evil8io/drover/compare/v0.9.0...v0.9.1) (2026-09-19)
 
 
