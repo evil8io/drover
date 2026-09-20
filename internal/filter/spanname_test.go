@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 func TestSpanName(t *testing.T) {
@@ -114,5 +116,34 @@ func TestSpanName(t *testing.T) {
 				t.Errorf("spanName = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestServerSpanCarriesTheRouteAttribute(t *testing.T) {
+	h, exporter := newHarnessWithSpans(t, listUpstream(steveHandler("a"), namespaceListHandler))
+	h.doDirect(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+
+	span := requestSpan(t, exporter)
+	want := "/k8s/clusters/{cluster}/api/v1/namespaces"
+	if span.Name != http.MethodGet+" "+want {
+		t.Errorf("span name = %q, want the method and the path template", span.Name)
+	}
+	route, ok := spanAttributeString(span, "http.route")
+	if !ok {
+		t.Fatal("the span has no http.route attribute")
+	}
+	if route != want {
+		t.Errorf("http.route = %q, want %q", route, want)
+	}
+}
+
+func TestHealthEndpointSpanIsNotRecorded(t *testing.T) {
+	h, exporter := newHarnessWithSpans(t, listUpstream(steveHandler("a"), namespaceListHandler))
+	h.doDirect(t, h.request(t, http.MethodGet, "/healthz", nil, nil))
+
+	for _, span := range exporter.GetSpans() {
+		if span.SpanKind == trace.SpanKindServer {
+			t.Errorf("the health endpoint produced a server span %q", span.Name)
+		}
 	}
 }
