@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/evil8io/drover/compare/v0.11.1...v0.12.0) (2026-09-20)
+
+
+### Features
+
+* merge a cluster-wide watch of a namespaced kind ([#51](https://github.com/evil8io/drover/issues/51)) ([9c80dfa](https://github.com/evil8io/drover/commit/9c80dfa2ed17f4284665a88aea8edbea1b247d7c))
+
 ## [0.11.1](https://github.com/evil8io/drover/compare/v0.11.0...v0.11.1) (2026-09-20)
 
 
