@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/evil8io/drover/compare/v0.11.0...v0.11.1) (2026-09-20)
+
+
+### Bug Fixes
+
+* put the path template on the span as http.route ([#49](https://github.com/evil8io/drover/issues/49)) ([f94c01c](https://github.com/evil8io/drover/commit/f94c01cf375ea4eed424d66a6effb82461917dfb))
+
 ## [0.11.0](https://github.com/evil8io/drover/compare/v0.10.2...v0.11.0) (2026-09-20)
 
 
