@@ -24,7 +24,7 @@ const (
 func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.Response, error) {
 	start := s.now()
 	watch, _ := strconv.ParseBool(req.URL.Query().Get("watch"))
-	result := listResult{cluster: cluster, watch: watch}
+	result := listResult{cluster: cluster, path: pathNamespaces, watch: watch}
 
 	if hasImpersonation(req.Header) {
 		resp, err := s.base.RoundTrip(req)
@@ -237,13 +237,15 @@ func mergeProjectSelector(caller string, projects []string) string {
 }
 
 type listResult struct {
-	cluster string
-	outcome string
-	status  int
-	count   int
-	watch   bool
-	user    string
-	err     error
+	cluster  string
+	path     string
+	resource string
+	outcome  string
+	status   int
+	count    int
+	watch    bool
+	user     string
+	err      error
 }
 
 // listError logs the failed request. The caller returns the error, and the
@@ -265,7 +267,10 @@ func (s *Service) logList(ctx context.Context, start time.Time, result listResul
 	s.metrics.recordRequest(ctx, result, duration)
 
 	attrs := []any{"cluster", result.cluster, "outcome", result.outcome, "status", result.status}
-	if result.outcome == outcomeFiltered {
+	if result.resource != "" {
+		attrs = append(attrs, "resource", result.resource)
+	}
+	if result.outcome == outcomeFiltered || result.outcome == outcomeFannedOut || result.outcome == outcomeCapped {
 		attrs = append(attrs, "count", result.count)
 	}
 	if result.user != "" {
@@ -285,7 +290,7 @@ func (s *Service) logList(ctx context.Context, start time.Time, result listResul
 			level = slog.LevelError
 		}
 	}
-	s.logger.Log(ctx, level, "namespaces", attrs...)
+	s.logger.Log(ctx, level, result.path, attrs...)
 	setCallerAttribute(ctx, result.user)
 }
 

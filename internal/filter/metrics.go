@@ -20,6 +20,9 @@ type metrics struct {
 	watchesRejected  metric.Int64Counter
 	eventsDropped    metric.Int64Counter
 	fetchesThrottled metric.Int64Counter
+	fanoutNS         metric.Int64Histogram
+	fanoutsCapped    metric.Int64Counter
+	fanoutsSkipped   metric.Int64Counter
 }
 
 // newMetrics creates the instruments of the filter, on the meter that
@@ -64,6 +67,25 @@ func newMetrics(provider metric.MeterProvider) (*metrics, error) {
 		return nil, err
 	}
 
+	fanoutNS, err := meter.Int64Histogram("drover.filter.fanout.namespaces",
+		metric.WithDescription("Namespaces that one fan-out of a cluster-wide list requests."),
+		metric.WithUnit("1"))
+	if err != nil {
+		return nil, err
+	}
+	fanoutsCapped, err := meter.Int64Counter("drover.filter.fanout.capped",
+		metric.WithDescription("Cluster-wide lists that the filter answers with 403, because the caller may see more namespaces than the fan-out limit."),
+		metric.WithUnit("1"))
+	if err != nil {
+		return nil, err
+	}
+	fanoutsSkipped, err := meter.Int64Counter("drover.filter.fanout.skipped",
+		metric.WithDescription("Namespaces of a fan-out that give no collection, and that the merged answer leaves out."),
+		metric.WithUnit("1"))
+	if err != nil {
+		return nil, err
+	}
+
 	return &metrics{
 		requests:         requests,
 		requestDur:       requestDur,
@@ -71,13 +93,19 @@ func newMetrics(provider metric.MeterProvider) (*metrics, error) {
 		watchesRejected:  watchesRejected,
 		eventsDropped:    eventsDropped,
 		fetchesThrottled: fetchesThrottled,
+		fanoutNS:         fanoutNS,
+		fanoutsCapped:    fanoutsCapped,
+		fanoutsSkipped:   fanoutsSkipped,
 	}, nil
 }
 
-// recordRequest records one namespace list or watch request, with its
-// outcome, cluster and watch attributes, and its duration in seconds.
+// recordRequest records one list or watch request, with its path, outcome,
+// cluster and watch attributes, and its duration in seconds. The resource of
+// a collection request is not an attribute, because a cluster with many
+// custom resources would give the instrument an unbounded attribute set.
 func (m *metrics) recordRequest(ctx context.Context, result listResult, duration time.Duration) {
 	attrs := metric.WithAttributes(
+		attribute.String("path", result.path),
 		attribute.String("outcome", result.outcome),
 		attribute.String("cluster", result.cluster),
 		attribute.Bool("watch", result.watch),
@@ -112,4 +140,19 @@ func (m *metrics) eventDropped(ctx context.Context, cluster string) {
 // fetchThrottled records one fetch that the rate limit throttles, with a 429 answer.
 func (m *metrics) fetchThrottled(ctx context.Context) {
 	m.fetchesThrottled.Add(ctx, 1)
+}
+
+// fanoutNamespaces records the namespace count of one fan-out, for the cluster.
+func (m *metrics) fanoutNamespaces(ctx context.Context, cluster string, count int) {
+	m.fanoutNS.Record(ctx, int64(count), metric.WithAttributes(attribute.String("cluster", cluster)))
+}
+
+// fanoutCapped records one cluster-wide list above the fan-out limit, for the cluster.
+func (m *metrics) fanoutCapped(ctx context.Context, cluster string) {
+	m.fanoutsCapped.Add(ctx, 1, metric.WithAttributes(attribute.String("cluster", cluster)))
+}
+
+// fanoutSkipped records one namespace that the merged answer leaves out, for the cluster.
+func (m *metrics) fanoutSkipped(ctx context.Context, cluster string) {
+	m.fanoutsSkipped.Add(ctx, 1, metric.WithAttributes(attribute.String("cluster", cluster)))
 }

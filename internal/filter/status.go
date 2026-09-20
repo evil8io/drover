@@ -13,6 +13,7 @@ const (
 	reasonInternalError = "InternalError"
 	reasonTooLarge      = "RequestEntityTooLarge"
 	reasonThrottled     = "TooManyRequests"
+	reasonForbidden     = "Forbidden"
 )
 
 type statusBody struct {
