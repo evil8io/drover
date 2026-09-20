@@ -56,10 +56,7 @@ func (s *Service) roundTripCollection(req *http.Request, target collectionTarget
 	if err != nil {
 		return nil, s.listError(req, start, result, err)
 	}
-	// A cluster-wide watch needs one upstream watch per namespace, merged into
-	// one stream. The filter does not do that yet, so the caller keeps the
-	// native answer.
-	if watch || resp.StatusCode != http.StatusForbidden {
+	if resp.StatusCode != http.StatusForbidden {
 		result.outcome, result.status = outcomeNative, resp.StatusCode
 		s.logList(req.Context(), start, result)
 		return resp, nil
@@ -82,6 +79,9 @@ func (s *Service) roundTripCollection(req *http.Request, target collectionTarget
 	}
 	result.user = set.user
 
+	if watch {
+		return s.mergedWatch(req, target, set, denied, start, result), nil
+	}
 	if len(set.names) == 0 {
 		return s.emptyCollection(req, target, denied, start, result), nil
 	}
@@ -232,7 +232,7 @@ func (s *Service) discoverResource(req *http.Request, target collectionTarget) (
 	out.URL.RawQuery = ""
 	out.Header.Set("Accept", jsonContentType)
 	out.Header.Del("Accept-Encoding")
-	out.Header.Del(extensionsHeader)
+	stripUpgrade(out.Header)
 
 	resp, err := s.base.RoundTrip(out)
 	if err != nil {
@@ -388,7 +388,7 @@ func (s *Service) streamFanout(req *http.Request, writer *io.PipeWriter, first *
 }
 
 // mergeHeader takes the fields of one answer that the merged answer still
-// needs, and the highest resourceVersion of the answers so far.
+// needs, and the lowest resourceVersion of the answers so far.
 func mergeHeader(merged *collectionHeader, answer collectionHeader) {
 	if merged.kind == "" {
 		merged.kind = answer.kind
@@ -399,7 +399,7 @@ func mergeHeader(merged *collectionHeader, answer collectionHeader) {
 	if len(merged.columns) == 0 {
 		merged.columns = answer.columns
 	}
-	merged.resourceVersion = maxResourceVersion(merged.resourceVersion, answer.resourceVersion)
+	merged.resourceVersion = lowestResourceVersion(merged.resourceVersion, answer.resourceVersion)
 }
 
 // skipNamespace drops one answer that the merge cannot read.

@@ -19,10 +19,6 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
-// opcodePing is the ping opcode of RFC 6455. The filter forwards a ping
-// frame, and it sends none itself.
-const opcodePing = 0x9
-
 // wsFrame builds one RFC 6455 frame with no mask, like a frame of a server.
 func wsFrame(fin bool, opcode byte, payload []byte) []byte {
 	first := opcode

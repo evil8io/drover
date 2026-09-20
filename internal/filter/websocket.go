@@ -33,6 +33,8 @@ const (
 	// control opcode, so an opcode from this value up is a close, a ping, or
 	// a pong frame.
 	opcodeClose = 0x8
+	opcodePing  = 0x9
+	opcodePong  = 0xA
 
 	// maxBuffer is the largest number of bytes that the filter holds for one
 	// stream, in the message it assembles and in the stream buffer.
