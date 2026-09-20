@@ -398,7 +398,7 @@ func TestCollectionSkipsForbiddenNamespace(t *testing.T) {
 	}
 }
 
-func TestCollectionReturnsNativeWhenEveryNamespaceIsForbidden(t *testing.T) {
+func TestCollectionWithEveryNamespaceForbiddenKeepsNativeWhenDiscoveryFails(t *testing.T) {
 	t.Parallel()
 	h := newHarnessOpt(t, collectionUpstream(
 		steveHandler("a", "b"),
@@ -417,7 +417,7 @@ func TestCollectionReturnsNativeWhenEveryNamespaceIsForbidden(t *testing.T) {
 	}
 }
 
-func TestCollectionReturnsNativeWithEmptyAllowedSet(t *testing.T) {
+func TestCollectionWithoutAnAllowedNamespaceMakesNoNamespacedRequest(t *testing.T) {
 	t.Parallel()
 	h := newHarnessOpt(t, collectionUpstream(
 		steveHandler(),
@@ -782,5 +782,148 @@ func TestCollectionStopsAfterANotFoundNamespace(t *testing.T) {
 	got := len(namespacedRecords(h.upstream))
 	if got < 1 || got > concurrency+1 {
 		t.Errorf("namespaced requests = %d, want 1 to %d of %d namespaces", got, concurrency+1, len(names))
+	}
+}
+
+const (
+	coreDiscoveryPath = "/k8s/clusters/c-1/api/v1"
+	appsDiscoveryPath = "/k8s/clusters/c-1/apis/apps/v1"
+)
+
+// discoveryHandler answers the discovery document of the api path.
+func discoveryHandler(groupVersion string, resources ...string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		entries := make([]string, 0, len(resources))
+		for _, resource := range resources {
+			parts := strings.Split(resource, ":")
+			entries = append(entries, fmt.Sprintf(`{"name":%q,"kind":%q,"namespaced":%s}`, parts[0], parts[1], parts[2]))
+		}
+		w.Header().Set("Content-Type", jsonContentType)
+		_, _ = io.WriteString(w, fmt.Sprintf(
+			`{"kind":"APIResourceList","apiVersion":"v1","groupVersion":%q,"resources":[%s]}`,
+			groupVersion, strings.Join(entries, ",")))
+	}
+}
+
+// collectionUpstreamWithDiscovery is collectionUpstream with a discovery
+// document per api path.
+func collectionUpstreamWithDiscovery(steve, namespaced http.HandlerFunc, discovery map[string]http.HandlerFunc) http.HandlerFunc {
+	base := collectionUpstream(steve, namespaced)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if handler, ok := discovery[r.URL.Path]; ok {
+			handler(w, r)
+			return
+		}
+		base(w, r)
+	}
+}
+
+func coreDiscovery() map[string]http.HandlerFunc {
+	return map[string]http.HandlerFunc{
+		coreDiscoveryPath: discoveryHandler("v1", "pods:Pod:true", "nodes:Node:false"),
+		appsDiscoveryPath: discoveryHandler("apps/v1", "deployments:Deployment:true"),
+	}
+}
+
+func TestCollectionWithoutAnAllowedNamespaceAnswersAnEmptyList(t *testing.T) {
+	t.Parallel()
+	h := newHarnessOpt(t, collectionUpstreamWithDiscovery(
+		steveHandler(), namespaceLists(nil), coreDiscovery(),
+	), withFanout)
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, podsPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	list := parseList(t, body)
+	if list.Kind != "PodList" || list.APIVersion != "v1" {
+		t.Errorf("kind = %q, apiVersion = %q, want PodList and v1", list.Kind, list.APIVersion)
+	}
+	if len(list.Items) != 0 {
+		t.Errorf("items = %d, want 0", len(list.Items))
+	}
+	if !strings.Contains(string(body), `"items":[]`) {
+		t.Errorf("body = %s, want an empty array, not null", body)
+	}
+	if got := len(namespacedRecords(h.upstream)); got != 0 {
+		t.Errorf("namespaced requests = %d, want 0", got)
+	}
+}
+
+func TestCollectionWithoutAnAllowedNamespaceAnswersAnEmptyGroupList(t *testing.T) {
+	t.Parallel()
+	h := newHarnessOpt(t, collectionUpstreamWithDiscovery(
+		steveHandler(), namespaceLists(nil), coreDiscovery(),
+	), withFanout)
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, deploymentsPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	list := parseList(t, body)
+	if list.Kind != "DeploymentList" || list.APIVersion != "apps/v1" {
+		t.Errorf("kind = %q, apiVersion = %q, want DeploymentList and apps/v1", list.Kind, list.APIVersion)
+	}
+}
+
+func TestCollectionWithoutAnAllowedNamespaceKeepsNativeForAClusterScopedKind(t *testing.T) {
+	t.Parallel()
+	h := newHarnessOpt(t, collectionUpstreamWithDiscovery(
+		steveHandler(), namespaceLists(nil), coreDiscovery(),
+	), withFanout)
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, nodesPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", resp.StatusCode)
+	}
+	if string(body) != nativeForbidden {
+		t.Errorf("body = %q, want the native answer", body)
+	}
+}
+
+func TestCollectionWithoutAnAllowedNamespaceKeepsNativeWhenDiscoveryFails(t *testing.T) {
+	t.Parallel()
+	h := newHarnessOpt(t, collectionUpstream(steveHandler(), namespaceLists(nil)), withFanout)
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, podsPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", resp.StatusCode)
+	}
+	if string(body) != nativeForbidden {
+		t.Errorf("body = %q, want the native answer", body)
+	}
+}
+
+func TestCollectionWithEveryNamespaceForbiddenAnswersAnEmptyList(t *testing.T) {
+	t.Parallel()
+	h := newHarnessOpt(t, collectionUpstreamWithDiscovery(
+		steveHandler("a", "b"), namespaceLists(nil), coreDiscovery(),
+	), withFanout)
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, podsPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	list := parseList(t, body)
+	if list.Kind != "PodList" || len(list.Items) != 0 {
+		t.Errorf("kind = %q with %d items, want PodList with 0", list.Kind, len(list.Items))
+	}
+	if got := len(namespacedRecords(h.upstream)); got != 2 {
+		t.Errorf("namespaced requests = %d, want 2", got)
+	}
+}
+
+func TestCollectionWithANotFoundNamespaceKeepsNative(t *testing.T) {
+	t.Parallel()
+	h := newHarnessOpt(t, collectionUpstreamWithDiscovery(
+		steveHandler("a", "b"), notFoundHandler, coreDiscovery(),
+	), withFanout)
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, podsPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", resp.StatusCode)
+	}
+	if string(body) != nativeForbidden {
+		t.Errorf("body = %q, want the native answer", body)
 	}
 }

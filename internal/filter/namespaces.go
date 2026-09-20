@@ -270,7 +270,7 @@ func (s *Service) logList(ctx context.Context, start time.Time, result listResul
 	if result.resource != "" {
 		attrs = append(attrs, "resource", result.resource)
 	}
-	if result.outcome == outcomeFiltered || result.outcome == outcomeFannedOut || result.outcome == outcomeCapped {
+	if result.outcome == outcomeFiltered || result.outcome == outcomeFannedOut || result.outcome == outcomeCapped || result.outcome == outcomeEmpty {
 		attrs = append(attrs, "count", result.count)
 	}
 	if result.user != "" {

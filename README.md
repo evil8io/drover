@@ -26,13 +26,13 @@ The service handles two request patterns from a Rancher kubeconfig. It passes ev
 2. A status other than 403 goes back to the client unchanged.
 3. On a 403 error, the service requests the caller's allowed namespaces from Steve, the Rancher API server in the cluster agent.
 4. A plain list gets a new request with a service token, no cookie, and a label selector. The selector matches `field.cattle.io/projectId` on the caller's projects, when every allowed namespace has that label. It matches the allowed namespace names in every other case. That case includes the selector that matches no namespace, when the caller may see none.
-5. A watch (`?watch=true`) gets a new request with a service token, no cookie, and the caller's own query. The selector of a watch does not change while the stream runs. A name selector on a watch hides a namespace that Rancher puts in a project of the caller later. The watch therefore gets a project selector, or no selector at all. The selector of the caller merges into it, as it does on a list. Three cases apply:
+6. A watch (`?watch=true`) gets a new request with a service token, no cookie, and the caller's own query. The selector of a watch does not change while the stream runs. A name selector on a watch hides a namespace that Rancher puts in a project of the caller later. The watch therefore gets a project selector, or no selector at all. The selector of the caller merges into it, as it does on a list. Three cases apply:
    - A caller with no namespace and no project gets the selector that matches no namespace.
    - A caller whose namespaces are all in its own projects gets a `field.cattle.io/projectId` selector on those projects. A new namespace of such a project matches that selector by itself.
    - A caller with a namespace outside its own projects gets no selector, because no selector holds that namespace and the projects of the caller at the same time.
 
    The request keeps every Accept entry of the caller whose media type is `application/json`, for example a table request from kubectl, and drops every other entry, for example protobuf or CBOR. It sets `application/json` when no entry remains.
-6. The service sends the new request to Rancher, and it streams the response to the client. The event filter runs on every watch, also on a watch with a selector. An event passes only when every namespace in it is in the allowed set, or its `field.cattle.io/projectId` label matches a project of the caller. A server-side table event has one row per namespace, and the filter checks the name and the labels of each row. The filter is the only gate for a watch with no selector. It is the second gate for a watch with a selector.
+7. The service sends the new request to Rancher, and it streams the response to the client. The event filter runs on every watch, also on a watch with a selector. An event passes only when every namespace in it is in the allowed set, or its `field.cattle.io/projectId` label matches a project of the caller. A server-side table event has one row per namespace, and the filter checks the name and the labels of each row. The filter is the only gate for a watch with no selector. It is the second gate for a watch with a selector.
 
 A watch request streams over chunked HTTP, or over a websocket connection after a protocol switch. A namespace that Rancher grants after the start of the watch becomes visible in one of three ways. A project selector matches a new namespace of a project of the caller at once. A watch with no selector gets the event too, because the event filter reads the allowed set through the same cache as a plain list. In every other case the service ends the watch, and the client sees the namespace on its next watch.
 
@@ -55,12 +55,13 @@ With `--fanout` on, the service answers a cluster-wide list of a namespaced kind
 1. A Rancher project member has the list permission inside the namespaces of its projects only, and none at cluster scope. A cluster-wide list then gets a 403 error from Rancher.
 2. The service sends the native request first. The fan-out starts only after that request gets a 403 error.
 3. Each namespaced request of the fan-out uses the credentials of the caller, not the service token. RBAC checks each request on its own. The fan-out then grants no permission beyond what the caller already has.
-4. A namespace that answers with a status other than 200 drops out of the merge. The native 403 error stands when no namespace answers 200. A cluster-scoped kind, for example `nodes`, always takes this path, because a namespaced request for it gets a 404 error. A 404 also stops the fan-out, because every namespace gives that same answer.
-5. The merged answer streams to the client. It holds the elements of at most `--fanout-concurrency` answers at a time. A tenant with hundreds of namespaces then needs no more than that count of answers in memory.
-6. The merged answer puts the `metadata` field after the elements. The `resourceVersion` of the merge is the highest value of the answers, and the service knows that value only after the last answer. A JSON object has no fixed field order, so this position is valid.
-7. The merge names no `continue` token. It also drops the `limit` and `continue` parameters of the caller. A `continue` token belongs to one namespace only. A client that reads a merged answer reads one page, and it stops there.
-8. The service merges a `List` and a `Table` alike. A merged `Table` keeps the `columnDefinitions` field of the first answer. A table view in kubectl then keeps its columns.
-9. The service does not merge a cluster-wide watch yet. Such a request keeps its native answer.
+4. A namespace that answers with a status other than 200 drops out of the merge. A 404 error stops the fan-out, because every namespace gives that same answer, and the native 403 error then stands. A cluster-scoped kind, for example `nodes`, always takes that path.
+5. A caller that may see no object of the kind gets an empty collection, not the native 403 error. This covers a caller with no allowed namespace, and a caller whose namespaces all deny the list. A client then shows an empty view instead of an error, as it does for the namespace list. The service reads the kind and the scope of the resource from the discovery document of the api path, with the credentials of the caller, because the merge has no answer to take them from. A cluster-scoped kind keeps its 403 error, and so does a resource that discovery does not name.
+6. The merged answer streams to the client. It holds the elements of at most `--fanout-concurrency` answers at a time. A tenant with hundreds of namespaces then needs no more than that count of answers in memory.
+7. The merged answer puts the `metadata` field after the elements. The `resourceVersion` of the merge is the highest value of the answers, and the service knows that value only after the last answer. A JSON object has no fixed field order, so this position is valid.
+8. The merge names no `continue` token. It also drops the `limit` and `continue` parameters of the caller. A `continue` token belongs to one namespace only. A client that reads a merged answer reads one page, and it stops there.
+9. The service merges a `List` and a `Table` alike. A merged `Table` keeps the `columnDefinitions` field of the first answer. A table view in kubectl then keeps its columns.
+10. The service does not merge a cluster-wide watch yet. Such a request keeps its native answer.
 
 A caller may see more allowed namespaces than `--fanout-max-namespaces` allows. That cluster-wide list then gets a 403 error, and the service runs no fan-out.
 
@@ -122,6 +123,7 @@ A Helm chart for drover is published separately.
 | Field selector | A field selector on a name outside the allowed set returns an empty list. A `get` on that name returns Forbidden. |
 | Namespace cap | A caller with more than 20,000 allowed namespace names gets an error, not a list. |
 | Fan-out cap | A cluster-wide list gets a 403 error, with no fan-out, when the caller has more than `--fanout-max-namespaces` allowed namespaces. |
+| Empty answer | A cluster-wide list of a namespaced kind gets an empty collection, not Forbidden, when the caller may see no object of that kind. |
 | Self-check | `kubectl auth can-i list namespaces` returns yes when the caller has at least one allowed namespace, while RBAC returns no. With `--fanout` on, the same holds for `list` on any namespaced kind, cluster-wide. |
 | Fetch rate | A fetch of an allowed set past `--fetch-rate` waits up to 5 s for a free token, then gets a 429 Status. |
 | Trust level | The service is a privileged component. It uses the cluster-owner token for the filtered namespace list and for the watch stream. |
@@ -130,7 +132,7 @@ A Helm chart for drover is published separately.
 
 The service writes JSON logs to stderr, one line per intercepted request.
 
-A namespace list log line and a collection log line have these fields: `cluster`, `outcome` (`native`, `filtered`, `passthrough`, `denied`, `fanout`, `capped`, or `error`), `status`, `count` (on `filtered`, `fanout`, or `capped` only), `watch`, and `duration_ms`. A collection log line also has `resource`, the kind of the requested collection.
+A namespace list log line and a collection log line have these fields: `cluster`, `outcome` (`native`, `filtered`, `passthrough`, `denied`, `fanout`, `empty`, `capped`, or `error`), `status`, `count` (on `filtered`, `fanout`, `empty`, or `capped` only), `watch`, and `duration_ms`. A collection log line also has `resource`, the kind of the requested collection.
 
 A review log line has these fields: `cluster`, `outcome` (`passthrough`, `native`, or `granted`), and `status`.
 

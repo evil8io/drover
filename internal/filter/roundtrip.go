@@ -15,6 +15,7 @@ const (
 	outcomePassthrough = "passthrough"
 	outcomeDenied      = "denied"
 	outcomeFannedOut   = "fanout"
+	outcomeEmpty       = "empty"
 	outcomeCapped      = "capped"
 	outcomeError       = "error"
 

@@ -1,7 +1,9 @@
 package filter
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/url"
@@ -81,9 +83,7 @@ func (s *Service) roundTripCollection(req *http.Request, target collectionTarget
 	result.user = set.user
 
 	if len(set.names) == 0 {
-		result.outcome, result.status = outcomeNative, denied.StatusCode
-		s.logList(req.Context(), start, result)
-		return denied, nil
+		return s.emptyCollection(req, target, denied, start, result), nil
 	}
 	if len(set.names) > s.fanoutMaxNamespaces {
 		_ = denied.Body.Close()
@@ -170,9 +170,96 @@ func (s *Service) fanout(req *http.Request, target collectionTarget, names []str
 		}
 	}
 
-	result.outcome, result.status, result.count = outcomeFannedOut, denied.StatusCode, len(names)
+	if stopped.Load() {
+		result.outcome, result.status, result.count = outcomeFannedOut, denied.StatusCode, len(names)
+		s.logList(ctx, start, result)
+		return denied
+	}
+	result.count = len(names)
+	return s.emptyCollection(req, target, denied, start, result)
+}
+
+// emptyCollection answers a caller that may see no object of the kind: an
+// allowed set without a namespace, or a fan-out where every namespace denied
+// the list. The answer is an empty collection, not the native 403, because
+// the namespace path answers an empty list in that same state and a client
+// shows an empty view instead of an error.
+//
+// Discovery gives the kind and the scope of the resource, with the
+// credentials of the caller, because the merge has no answer to take them
+// from. A cluster-scoped kind keeps the native 403: the caller may see no
+// namespace, and the object has none. The native answer also stands when
+// discovery fails.
+func (s *Service) emptyCollection(req *http.Request, target collectionTarget, denied *http.Response, start time.Time, result listResult) *http.Response {
+	ctx := req.Context()
+	kind, apiVersion, namespaced, ok := s.discoverResource(req, target)
+	if !ok || !namespaced {
+		result.outcome, result.status = outcomeNative, denied.StatusCode
+		s.logList(ctx, start, result)
+		return denied
+	}
+	_ = denied.Body.Close()
+
+	body := emptyCollectionJSON(kind+"List", apiVersion)
+	result.outcome, result.status = outcomeEmpty, http.StatusOK
 	s.logList(ctx, start, result)
-	return denied
+	return &http.Response{
+		Status:     "200 OK",
+		StatusCode: http.StatusOK,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header: http.Header{
+			"Content-Type":   []string{jsonContentType},
+			"Content-Length": []string{strconv.Itoa(len(body))},
+		},
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Request:       req,
+	}
+}
+
+// discoverResource reads the kind, the group version and the scope of the
+// resource from the discovery document of its api path.
+func (s *Service) discoverResource(req *http.Request, target collectionTarget) (kind, apiVersion string, namespaced, ok bool) {
+	ctx := req.Context()
+	out := req.Clone(ctx)
+	out.Body = nil
+	out.ContentLength = 0
+	out.GetBody = nil
+	out.URL.Path = target.apiPath
+	out.URL.RawPath = ""
+	out.URL.RawQuery = ""
+	out.Header.Set("Accept", jsonContentType)
+	out.Header.Del("Accept-Encoding")
+	out.Header.Del(extensionsHeader)
+
+	resp, err := s.base.RoundTrip(out)
+	if err != nil {
+		s.logger.DebugContext(ctx, "the discovery request failed",
+			"cluster", target.cluster, "resource", target.resource, "error", err.Error())
+		return "", "", false, false
+	}
+	body, tooLarge, err := readLimited(resp.Body, maxDrainBody)
+	_ = resp.Body.Close()
+	if err != nil || tooLarge || resp.StatusCode != http.StatusOK {
+		s.logger.DebugContext(ctx, "the discovery request gave no document",
+			"cluster", target.cluster, "resource", target.resource, "status", resp.StatusCode)
+		return "", "", false, false
+	}
+
+	var document apiResourceList
+	if err := json.Unmarshal(body, &document); err != nil {
+		s.logger.DebugContext(ctx, "the discovery document does not parse",
+			"cluster", target.cluster, "resource", target.resource, "error", err.Error())
+		return "", "", false, false
+	}
+	for _, resource := range document.Resources {
+		if resource.Name == target.resource && resource.Kind != "" {
+			return resource.Kind, document.GroupVersion, resource.Namespaced, true
+		}
+	}
+	return "", "", false, false
 }
 
 // fetchNamespaced requests the collection in one namespace, and sends the
