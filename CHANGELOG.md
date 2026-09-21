@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.13.0](https://github.com/evil8io/drover/compare/v0.12.1...v0.13.0) (2026-09-21)
+
+
+### Features
+
+* add a flag that skips the certificate verification of Rancher ([#62](https://github.com/evil8io/drover/issues/62)) ([fb77d3c](https://github.com/evil8io/drover/commit/fb77d3c73ff6c599ac67d6b004b928382eea9ccf))
+* **api-filter:** end the initial events of a merged watch-list ([#59](https://github.com/evil8io/drover/issues/59)) ([529bf33](https://github.com/evil8io/drover/commit/529bf3318676f37a28904657b558094a71e8f890))
+* **project-sync:** coalesce the watch events, and reconcile the clusters in parallel ([#63](https://github.com/evil8io/drover/issues/63)) ([30d94fa](https://github.com/evil8io/drover/commit/30d94fa08c7b77df3642b20ca09c2d81713c9447))
+
+
+### Bug Fixes
+
+* **telemetry:** drop the query from url.full on a client span ([#58](https://github.com/evil8io/drover/issues/58)) ([1515891](https://github.com/evil8io/drover/commit/15158911ffbc8395a2c0b8f5c1de07cd29fc8584))
+
 ## [0.12.1](https://github.com/evil8io/drover/compare/v0.12.0...v0.12.1) (2026-09-21)
 
 
