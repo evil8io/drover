@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -227,6 +228,32 @@ func TestReconcileSkipsAForbiddenCluster(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "msg=reconcile clusters=2 projects=2 namespaces=1 patched=1 errors=1") {
 		t.Errorf("no summary line with one error:\n%s", logs.String())
+	}
+}
+
+// TestReconcileSyncsTheClustersInParallel checks that the run syncs the two
+// clusters at the same time. The namespace list of each cluster blocks until
+// the request timeout, so a serial run needs two timeouts.
+func TestReconcileSyncsTheClustersInParallel(t *testing.T) {
+	t.Parallel()
+	const timeout = 300 * time.Millisecond
+	rancher := newFakeRancher(t, hanging("c-1", "c-2"))
+	syncer, logs := newSyncer(t, rancher, tokenFile(t, serviceToken), func(cfg *Config) {
+		cfg.Interval = timeout
+	})
+
+	start := time.Now()
+	syncer.reconcile(context.Background())
+	elapsed := time.Since(start)
+
+	if elapsed < timeout {
+		t.Fatalf("the run took %s, want at least one timeout of %s", elapsed, timeout)
+	}
+	if elapsed >= 2*timeout {
+		t.Errorf("the run took %s, want less than the two timeouts of a serial run", elapsed)
+	}
+	if !strings.Contains(logs.String(), "msg=reconcile clusters=2 projects=2 namespaces=0 patched=0 errors=2") {
+		t.Errorf("no summary line with two errors:\n%s", logs.String())
 	}
 }
 

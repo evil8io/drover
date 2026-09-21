@@ -65,6 +65,9 @@ type fakeRancher struct {
 	paginate bool
 	// forbidden is the cluster whose namespace list returns status 403.
 	forbidden string
+	// hangs are the clusters whose namespace list blocks until the request
+	// ends.
+	hangs map[string]struct{}
 	// events are the watch frames of a cluster, in order. The handler writes
 	// them, then it ends the stream.
 	events map[string][]string
@@ -95,6 +98,17 @@ func paginated() func(*fakeRancher) {
 
 func forbid(cluster string) func(*fakeRancher) {
 	return func(f *fakeRancher) { f.forbidden = cluster }
+}
+
+// hanging blocks the namespace list of every named cluster until the request
+// ends, so that the client hits its own timeout.
+func hanging(clusters ...string) func(*fakeRancher) {
+	return func(f *fakeRancher) {
+		f.hangs = make(map[string]struct{}, len(clusters))
+		for _, cluster := range clusters {
+			f.hangs[cluster] = struct{}{}
+		}
+	}
 }
 
 // watching serves frames as the namespace watch stream of cluster.
@@ -170,6 +184,10 @@ func (f *fakeRancher) serveNamespaces(w http.ResponseWriter, r *http.Request) {
 	cluster := strings.Split(strings.TrimPrefix(r.URL.Path, "/k8s/clusters/"), "/")[0]
 	if cluster == f.forbidden {
 		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if _, ok := f.hangs[cluster]; ok {
+		<-r.Context().Done()
 		return
 	}
 	if r.URL.Query().Get("watch") == "true" {

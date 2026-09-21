@@ -26,8 +26,13 @@ import (
 )
 
 const (
-	defaultInterval = 60 * time.Second
-	maxTimeout      = 30 * time.Second
+	defaultInterval  = 60 * time.Second
+	maxTimeout       = 30 * time.Second
+	defaultPatchRate = 10
+
+	// maxParallelClusters is the count of clusters that one reconcile run
+	// syncs at the same time.
+	maxParallelClusters = 8
 )
 
 // Config configures the syncer that New returns.
@@ -52,6 +57,9 @@ type Config struct {
 	NameAnnotation string
 	// Interval is the time between two runs. Zero selects 60 s.
 	Interval time.Duration
+	// PatchRate is the namespace patches per second that the watch of one
+	// cluster sends. Zero selects 10. The burst is the rate, and at least 1.
+	PatchRate float64
 	// Logger gets one line per namespace, and one summary line per run. Nil selects slog.Default.
 	Logger *slog.Logger
 	// Version is the version in the User-Agent header. An empty value selects dev.
@@ -74,6 +82,7 @@ type Syncer struct {
 	nameAnnotation string
 	interval       time.Duration
 	timeout        time.Duration
+	patchRate      float64
 	userAgent      string
 	logger         *slog.Logger
 	client         *http.Client
@@ -143,6 +152,10 @@ func New(cfg Config) (*Syncer, error) {
 	if interval <= 0 {
 		interval = defaultInterval
 	}
+	patchRate := cfg.PatchRate
+	if patchRate <= 0 {
+		patchRate = defaultPatchRate
+	}
 	version := cfg.Version
 	if version == "" {
 		version = "dev"
@@ -170,6 +183,7 @@ func New(cfg Config) (*Syncer, error) {
 		nameAnnotation: cfg.NameAnnotation,
 		interval:       interval,
 		timeout:        min(interval, maxTimeout),
+		patchRate:      patchRate,
 		userAgent:      "drover/" + version,
 		logger:         logger,
 		client:         &http.Client{Transport: rancherclient.WrapTransport(transport, meterProvider)},
@@ -218,6 +232,14 @@ type counters struct {
 	errors     int
 }
 
+// add merges the numbers of one cluster into the run.
+func (c *counters) add(other counters) {
+	c.projects += other.projects
+	c.namespaces += other.namespaces
+	c.patched += other.patched
+	c.errors += other.errors
+}
+
 func (s *Syncer) reconcile(ctx context.Context) {
 	token, err := rancherclient.ReadToken(s.tokenFile)
 	if err != nil {
@@ -253,10 +275,30 @@ func (s *Syncer) reconcile(ctx context.Context) {
 	names := slices.Sorted(maps.Keys(clusters))
 	// A watcher outlives the run, so it gets the base context, not the span.
 	s.watches.update(base, names)
+	s.watches.resetNames()
+
+	var (
+		group sync.WaitGroup
+		mu    sync.Mutex
+		slots = make(chan struct{}, maxParallelClusters)
+	)
 	for _, cluster := range names {
-		run.projects += len(clusters[cluster])
-		s.syncCluster(ctx, token, cluster, clusters[cluster], &run)
+		slots <- struct{}{}
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			defer func() { <-slots }()
+
+			one := counters{projects: len(clusters[cluster])}
+			s.syncCluster(ctx, token, cluster, clusters[cluster], &one)
+
+			mu.Lock()
+			defer mu.Unlock()
+			run.add(one)
+		}()
 	}
+	group.Wait()
+
 	s.finishReconcile(ctx, span, run, start)
 }
 
