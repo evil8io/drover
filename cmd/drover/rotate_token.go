@@ -37,6 +37,8 @@ type rotateConfig struct {
 	key                       string
 	username                  string
 	password                  string
+	passwordNamespace         string
+	passwordSecret            string
 	ttl                       time.Duration
 	renewBefore               time.Duration
 	keep                      int
@@ -89,22 +91,24 @@ func runRotateToken(args []string) int {
 	defer cancel()
 
 	err = rotate.Run(ctx, rotate.Config{
-		Rancher:       cfg.rancher,
-		RancherClient: rancherClient,
-		Kube:          cfg.kube,
-		KubeClient:    kubeClient,
-		KubeTokenFile: cfg.kubeTokenFile,
-		Namespace:     cfg.namespace,
-		Secret:        cfg.secret,
-		Key:           cfg.key,
-		Username:      cfg.username,
-		Password:      cfg.password,
-		TTL:           cfg.ttl,
-		RenewBefore:   cfg.renewBefore,
-		Keep:          cfg.keep,
-		Description:   cfg.description,
-		UserAgent:     "drover/" + version,
-		Logger:        logger,
+		Rancher:           cfg.rancher,
+		RancherClient:     rancherClient,
+		Kube:              cfg.kube,
+		KubeClient:        kubeClient,
+		KubeTokenFile:     cfg.kubeTokenFile,
+		Namespace:         cfg.namespace,
+		Secret:            cfg.secret,
+		Key:               cfg.key,
+		Username:          cfg.username,
+		Password:          cfg.password,
+		PasswordNamespace: cfg.passwordNamespace,
+		PasswordSecret:    cfg.passwordSecret,
+		TTL:               cfg.ttl,
+		RenewBefore:       cfg.renewBefore,
+		Keep:              cfg.keep,
+		Description:       cfg.description,
+		UserAgent:         "drover/" + version,
+		Logger:            logger,
 	})
 	if err != nil {
 		logger.Error("the rotation failed", "error", err.Error())
@@ -123,6 +127,7 @@ func parseRotateConfig(args []string, output io.Writer, getenv func(string) stri
 		kubeURL        string
 		credentialsDir string
 		tokenSecret    string
+		passwordSecret string
 		serviceAccount string
 		logLevel       string
 	)
@@ -132,6 +137,8 @@ func parseRotateConfig(args []string, output io.Writer, getenv func(string) stri
 	flags.StringVar(&credentialsDir, "credentials-dir", "", "directory with the files username and password")
 	flags.StringVar(&tokenSecret, "token-secret", "", "namespace/name of the Secret with the API token")
 	flags.StringVar(&cfg.key, "token-key", "token", "key of the token inside the Secret")
+	flags.StringVar(&passwordSecret, "password-secret", "",
+		"namespace/name of the Secret with the password hash of the service user, optional")
 	flags.DurationVar(&cfg.ttl, "ttl", 48*time.Hour, "lifetime of a new token")
 	flags.DurationVar(&cfg.renewBefore, "renew-before", 24*time.Hour, "remaining lifetime that starts a rotation")
 	flags.IntVar(&cfg.keep, "keep", 2, "number of tokens to keep, the new token included, at least 2")
@@ -179,8 +186,13 @@ func parseRotateConfig(args []string, output io.Writer, getenv func(string) stri
 		cfg.kubeCAFile = ca
 	}
 
-	if cfg.namespace, cfg.secret, err = parseSecretRef(tokenSecret); err != nil {
+	if cfg.namespace, cfg.secret, err = parseSecretRef("-token-secret", tokenSecret); err != nil {
 		return rotateConfig{}, err
+	}
+	if passwordSecret != "" {
+		if cfg.passwordNamespace, cfg.passwordSecret, err = parseSecretRef("-password-secret", passwordSecret); err != nil {
+			return rotateConfig{}, err
+		}
 	}
 	if cfg.key == "" {
 		return rotateConfig{}, errors.New("-token-key is required")
@@ -234,13 +246,13 @@ func parseServiceURL(name, raw string) (*url.URL, error) {
 	return target, nil
 }
 
-func parseSecretRef(raw string) (namespace, name string, err error) {
+func parseSecretRef(flagName, raw string) (namespace, name string, err error) {
 	if raw == "" {
-		return "", "", errors.New("-token-secret is required")
+		return "", "", fmt.Errorf("%s is required", flagName)
 	}
 	namespace, name, found := strings.Cut(raw, "/")
 	if !found || namespace == "" || name == "" || strings.Contains(name, "/") {
-		return "", "", fmt.Errorf("-token-secret %q is not namespace/name", raw)
+		return "", "", fmt.Errorf("%s %q is not namespace/name", flagName, raw)
 	}
 	return namespace, name, nil
 }

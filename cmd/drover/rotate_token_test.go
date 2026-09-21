@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -61,6 +62,8 @@ func TestParseRotateConfigErrors(t *testing.T) {
 		{"token secret without a namespace", with("--token-secret", "drover-token")},
 		{"token secret with an empty namespace", with("--token-secret", "/drover-token")},
 		{"token secret with two slashes", with("--token-secret", "a/b/c")},
+		{"password secret without a namespace", with("--password-secret", "u-drover")},
+		{"password secret with two slashes", with("--password-secret", "a/b/c")},
 		{"credentials dir without a username file", with("--credentials-dir", partial)},
 		{"credentials dir with an empty password file", with("--credentials-dir", empty)},
 		{"credentials dir that does not exist", with("--credentials-dir", credentials+".missing")},
@@ -285,6 +288,43 @@ func TestParseRotateConfigTelemetryFromEnvironment(t *testing.T) {
 	}
 	if cfg.telemetry.ServiceName != "custom" {
 		t.Errorf("service name = %q, want custom", cfg.telemetry.ServiceName)
+	}
+}
+
+func TestParseRotateConfigPasswordSecret(t *testing.T) {
+	t.Parallel()
+	credentials := credentialsDir(t, map[string]string{"username": "drover\n", "password": "secret\n"})
+	base := []string{
+		"--rancher-url", "https://rancher.example.com",
+		"--credentials-dir", credentials,
+		"--token-secret", "cattle-system/drover-token",
+		"--kube-url", "https://kubernetes.default.svc",
+	}
+	with := func(args ...string) []string { return append(append([]string{}, base...), args...) }
+
+	cfg, err := parseRotateConfig(base, io.Discard, noEnvironment)
+	if err != nil {
+		t.Fatalf("parseRotateConfig: %v", err)
+	}
+	if cfg.passwordNamespace != "" || cfg.passwordSecret != "" {
+		t.Errorf("password secret = %s/%s, and the test expects no value", cfg.passwordNamespace, cfg.passwordSecret)
+	}
+
+	cfg, err = parseRotateConfig(with("--password-secret=cattle-local-user-passwords/u-drover"), io.Discard, noEnvironment)
+	if err != nil {
+		t.Fatalf("parseRotateConfig: %v", err)
+	}
+	if cfg.passwordNamespace != "cattle-local-user-passwords" || cfg.passwordSecret != "u-drover" {
+		t.Errorf("password secret = %s/%s, want cattle-local-user-passwords/u-drover",
+			cfg.passwordNamespace, cfg.passwordSecret)
+	}
+
+	_, err = parseRotateConfig(with("--password-secret=u-drover"), io.Discard, noEnvironment)
+	if err == nil {
+		t.Fatal("parseRotateConfig returned no error for a value without a slash")
+	}
+	if !strings.Contains(err.Error(), "-password-secret") {
+		t.Errorf("the error is %q, and the test expects the flag name", err)
 	}
 }
 

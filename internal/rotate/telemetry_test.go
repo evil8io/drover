@@ -25,6 +25,7 @@ func TestRunProducesARotateSpanWithAChildPerStep(t *testing.T) {
 	token := rancher.addToken("token-old", testDescription, 30*time.Hour, 48*time.Hour, true)
 	kube := newFakeKube(t, map[string]string{testKey: token.value})
 	h := newHarness(t, kube, rancher)
+	withPasswordSecret(h)
 	h.cfg.TracerProvider = tracerProvider
 
 	if err := h.run(); err != nil {
@@ -42,7 +43,10 @@ func TestRunProducesARotateSpanWithAChildPerStep(t *testing.T) {
 		t.Fatal("no span named rotate")
 	}
 
-	wantSteps := []string{stepSecretGet, stepTokenCheck, stepLogin, stepTokenCreate, stepSecretPatch, stepTokenPrune, stepLogout}
+	wantSteps := []string{
+		stepPasswordSync, stepSecretGet, stepTokenCheck, stepLogin,
+		stepTokenCreate, stepSecretPatch, stepTokenPrune, stepLogout,
+	}
 	for _, step := range wantSteps {
 		found := false
 		for _, span := range spans {

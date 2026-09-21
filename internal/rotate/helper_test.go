@@ -31,6 +31,10 @@ const (
 	testKubeToken   = "kube-service-account-token"
 	testUserAgent   = "drover/test"
 	testSecretPath  = "/api/v1/namespaces/" + testNamespace + "/secrets/" + testSecret
+
+	testPasswordNamespace = "cattle-local-user-passwords"
+	testPasswordSecret    = "u-drover"
+	testPasswordPath      = "/api/v1/namespaces/" + testPasswordNamespace + "/secrets/" + testPasswordSecret
 )
 
 var testNow = time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
@@ -350,14 +354,29 @@ func (f *fakeRancher) serveLogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{})
 }
 
-// fakeKube answers the get and the patch of the token Secret. It reads the
-// ServiceAccount token from a file in a temporary directory.
+// fakeSecret is one Secret of the fake Kubernetes API. A value of data is the
+// decoded content of the key, not the base64 form.
+type fakeSecret struct {
+	namespace   string
+	name        string
+	data        map[string]string
+	annotations map[string]string
+	missing     bool
+}
+
+func (s *fakeSecret) path() string {
+	return "/api/v1/namespaces/" + s.namespace + "/secrets/" + s.name
+}
+
+// fakeKube answers the get and the patch of the token Secret and of the
+// password Secret. It reads the ServiceAccount token from a file in a
+// temporary directory.
 type fakeKube struct {
 	server    *httptest.Server
 	mu        sync.Mutex
 	calls     []recordedCall
-	data      map[string]string
-	missing   bool
+	token     *fakeSecret
+	password  *fakeSecret
 	tokenFile string
 	afterGet  func()
 }
@@ -371,7 +390,21 @@ func newFakeKube(t *testing.T, data map[string]string) *fakeKube {
 	if data == nil {
 		data = map[string]string{}
 	}
-	k := &fakeKube{data: data, tokenFile: tokenFile}
+	k := &fakeKube{
+		token: &fakeSecret{
+			namespace:   testNamespace,
+			name:        testSecret,
+			data:        data,
+			annotations: map[string]string{},
+		},
+		password: &fakeSecret{
+			namespace:   testPasswordNamespace,
+			name:        testPasswordSecret,
+			data:        map[string]string{},
+			annotations: map[string]string{},
+		},
+		tokenFile: tokenFile,
+	}
 	k.server = httptest.NewServer(http.HandlerFunc(k.serve))
 	t.Cleanup(k.server.Close)
 	return k
@@ -394,7 +427,19 @@ func (k *fakeKube) routes() []string {
 func (k *fakeKube) value(key string) string {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	return k.data[key]
+	return k.token.data[key]
+}
+
+func (k *fakeKube) passwordValue(key string) string {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.password.data[key]
+}
+
+func (k *fakeKube) passwordAnnotation(key string) string {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.password.annotations[key]
 }
 
 func (k *fakeKube) serve(w http.ResponseWriter, r *http.Request) {
@@ -403,13 +448,20 @@ func (k *fakeKube) serve(w http.ResponseWriter, r *http.Request) {
 	defer k.mu.Unlock()
 	k.calls = append(k.calls, newRecordedCall(r, body))
 
-	if r.URL.Path != testSecretPath || k.missing {
+	var secret *fakeSecret
+	for _, candidate := range []*fakeSecret{k.token, k.password} {
+		if r.URL.Path == candidate.path() && !candidate.missing {
+			secret = candidate
+		}
+	}
+	if secret == nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+
 	switch r.Method {
 	case http.MethodGet:
-		k.writeSecret(w)
+		k.writeSecret(w, secret)
 		if k.afterGet != nil {
 			k.afterGet()
 		}
@@ -419,31 +471,46 @@ func (k *fakeKube) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var patch struct {
+			Metadata struct {
+				Annotations map[string]string `json:"annotations"`
+			} `json:"metadata"`
 			StringData map[string]string `json:"stringData"`
+			Data       map[string]string `json:"data"`
 		}
 		if err := json.Unmarshal(body, &patch); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		for key, value := range patch.StringData {
-			k.data[key] = value
+		maps.Copy(secret.annotations, patch.Metadata.Annotations)
+		maps.Copy(secret.data, patch.StringData)
+		for key, value := range patch.Data {
+			raw, err := base64.StdEncoding.DecodeString(value)
+			if err != nil {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			secret.data[key] = string(raw)
 		}
-		k.writeSecret(w)
+		k.writeSecret(w, secret)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-func (k *fakeKube) writeSecret(w http.ResponseWriter) {
+func (k *fakeKube) writeSecret(w http.ResponseWriter, secret *fakeSecret) {
 	encoded := map[string]string{}
-	for key, value := range k.data {
+	for key, value := range secret.data {
 		encoded[key] = base64.StdEncoding.EncodeToString([]byte(value))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"kind":       "Secret",
 		"apiVersion": "v1",
-		"metadata":   map[string]any{"name": testSecret, "namespace": testNamespace},
-		"data":       encoded,
+		"metadata": map[string]any{
+			"name":        secret.name,
+			"namespace":   secret.namespace,
+			"annotations": secret.annotations,
+		},
+		"data": encoded,
 	})
 }
 

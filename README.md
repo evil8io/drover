@@ -206,6 +206,8 @@ A command that renews the API token of the Rancher service user in a Kubernetes 
 
 The command runs once: it reads the token from the Secret, and it asks Rancher for the expiry. A token that lasts longer than `--renew-before` is valid, and the run ends with no change. For a new token the command logs in as the service user, and it derives a token from that session. The login is a first step only, because Rancher ignores the TTL of a login token. Rancher also reduces a TTL above its own maximum without an error, so a different TTL in the answer gives a warning. Last, the command patches the Secret, deletes the tokens with the same description except the newest `--keep`, and ends the session with a logout.
 
+With `--password-secret`, a run first writes the password hash that Rancher reads at a local login. Rancher names that Secret after the User object, in the namespace `cattle-local-user-passwords`. A run that finds the current hash leaves the Secret unchanged. The ServiceAccount needs `get` and `patch` on that one Secret.
+
 A CronJob is the normal caller, because most runs find a valid token and exit 0.
 
 ### Configuration
@@ -218,6 +220,7 @@ A CronJob is the normal caller, because most runs find a valid token and exit 0.
 | `--credentials-dir` | (required) | Directory with the files `username` and `password` of the service user. |
 | `--token-secret` | (required) | `namespace/name` of the Secret with the API token. |
 | `--token-key` | `token` | Key of the token inside the Secret. |
+| `--password-secret` | | `namespace/name` of the Secret that Rancher reads for the password of the service user. When set, a run first writes the PBKDF2-SHA3-512 hash of the password into it. |
 | `--ttl` | `48h` | Lifetime of a new token. Rancher reduces a value above `auth-token-max-ttl-minutes`. |
 | `--renew-before` | `24h` | Remaining lifetime that starts a rotation. The value must be shorter than `--ttl`. |
 | `--keep` | `2` | Number of tokens with the description to keep. The new token counts. The value must be 2 or more, because a pod reads a mounted Secret with a delay after the patch. |
@@ -254,7 +257,7 @@ The command writes JSON logs to stderr, one line per step. Each line has a `step
 
 ### Telemetry
 
-With `--otlp-endpoint` set, one run produces a span named `rotate`, with a child span for each step: `secret_get`, `token_check`, `login`, `token_create`, `secret_patch`, `token_prune`, and `logout`. The command flushes traces and metrics before it exits, within a 5 s grace period. It exports these metrics:
+With `--otlp-endpoint` set, one run produces a span named `rotate`, with a child span for each step: `password_sync` (with `--password-secret`), `secret_get`, `token_check`, `login`, `token_create`, `secret_patch`, `token_prune`, and `logout`. The command flushes traces and metrics before it exits, within a 5 s grace period. It exports these metrics:
 
 | Metric | Kind | Unit | Attributes |
 | --- | --- | --- | --- |
