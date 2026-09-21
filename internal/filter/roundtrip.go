@@ -2,11 +2,17 @@ package filter
 
 import (
 	"bytes"
+	"errors"
 	"io"
+	"io/fs"
+	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/evil8io/drover/internal/rancherclient"
 )
 
 const (
@@ -78,6 +84,34 @@ func (s *Service) collectionTarget(path string) (collectionTarget, bool) {
 		}, true
 	}
 	return collectionTarget{}, false
+}
+
+// watchRequested reports whether the query asks for a watch, by the rule of
+// the API server: the parameter is present, with a value other than 0 or
+// false. A parse with strconv.ParseBool reads an empty value, or yes, as a
+// list, and the API server then answers a stream that the filter never sees.
+func watchRequested(query url.Values) bool {
+	if !query.Has("watch") {
+		return false
+	}
+	value := query.Get("watch")
+	return value != "0" && !strings.EqualFold(value, "false")
+}
+
+// publicMessage is the text of an error that a client may read. A transport
+// error names an internal address, and a file error names a path, so those
+// go to the log line only.
+func publicMessage(err error) string {
+	var pathErr *fs.PathError
+	var urlErr *url.Error
+	var opErr *net.OpError
+	switch {
+	case errors.Is(err, rancherclient.ErrTokenUnavailable):
+		return rancherclient.ErrTokenUnavailable.Error()
+	case errors.As(err, &pathErr), errors.As(err, &urlErr), errors.As(err, &opErr):
+		return "the upstream request failed"
+	}
+	return err.Error()
 }
 
 func hasImpersonation(header http.Header) bool {

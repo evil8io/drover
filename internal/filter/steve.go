@@ -32,6 +32,11 @@ const (
 	// projectLabel is the label of Rancher on a namespace of a project. Its
 	// value is the part of the project id after the colon.
 	projectLabel = "field.cattle.io/projectId"
+	// sessionCookie is the cookie that Rancher reads when the request has no
+	// Authorization header.
+	sessionCookie = "R_SESS"
+
+	maxKnownClusters = 1024
 )
 
 // steveCollection is the part of a Steve collection that the allowed set needs.
@@ -89,8 +94,8 @@ func (s *Service) allowedNamespace(ctx context.Context, cluster string, header h
 // the fetch rate limit, for the caller.
 func (s *Service) allowed(ctx context.Context, cluster string, header http.Header) (allowedSet, *http.Response, error) {
 	auth := header.Get("Authorization")
-	cookie := header.Get("Cookie")
-	sum := sha256.Sum256([]byte(auth + "\n" + cookie))
+	cookie := strings.Join(header.Values("Cookie"), "; ")
+	sum := sha256.Sum256([]byte(credentialKey(header)))
 	key := cluster + "\n" + hex.EncodeToString(sum[:])
 
 	return s.cache.do(ctx, key, func() (allowedSet, *http.Response, error) {
@@ -106,6 +111,26 @@ func (s *Service) allowed(ctx context.Context, cluster string, header http.Heade
 	})
 }
 
+// credentialKey returns the credential that Rancher reads from the headers:
+// every Authorization value, or the session cookie when the header is absent.
+// Another cookie is not part of the key, so a caller cannot fill the cache
+// with one credential and a changed cookie.
+func credentialKey(header http.Header) string {
+	if values := header.Values("Authorization"); len(values) > 0 {
+		return "authorization\n" + strings.Join(values, "\n")
+	}
+	var sessions []string
+	for _, line := range header.Values("Cookie") {
+		for _, part := range strings.Split(line, ";") {
+			name, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+			if ok && name == sessionCookie {
+				sessions = append(sessions, value)
+			}
+		}
+	}
+	return "cookie\n" + strings.Join(sessions, "\n")
+}
+
 // fetchAllowed reads the namespace names and the project ids of the caller,
 // over Steve and the Rancher project API.
 func (s *Service) fetchAllowed(ctx context.Context, cluster, auth, cookie string) (allowedSet, *http.Response, error) {
@@ -116,8 +141,9 @@ func (s *Service) fetchAllowed(ctx context.Context, cluster, auth, cookie string
 	if denied != nil || err != nil {
 		return allowedSet{}, denied, err
 	}
+	s.clusters.add(cluster)
 
-	projects, denied, err := s.fetchProjectIDs(ctx, auth, cookie)
+	projects, denied, err := s.fetchProjectIDs(ctx, cluster, auth, cookie)
 	if denied != nil || err != nil {
 		return allowedSet{}, denied, err
 	}
@@ -228,12 +254,15 @@ func (s *Service) fetchNamespaceNames(ctx context.Context, cluster, auth, cookie
 	return nil, nil, nil, fmt.Errorf("allowed set has more than %d pages", maxStevePages)
 }
 
-// fetchProjectIDs reads the projects that the caller may see, as the part of
-// the project id after the colon. A non-nil response is the 401 or 403 answer
-// of Rancher, for the caller.
-func (s *Service) fetchProjectIDs(ctx context.Context, auth, cookie string) ([]string, *http.Response, error) {
+// fetchProjectIDs reads the projects of the cluster that the caller may see,
+// as the part of the project id after the colon. The project label of a
+// namespace has that part only, and the part is unique inside one cluster,
+// so a project of another cluster must not reach the selector. A non-nil
+// response is the 401 or 403 answer of Rancher, for the caller.
+func (s *Service) fetchProjectIDs(ctx context.Context, cluster, auth, cookie string) ([]string, *http.Response, error) {
 	target := *s.upstream
 	target.Path = projectsPath
+	target.RawQuery = url.Values{"clusterId": []string{cluster}}.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
@@ -282,15 +311,41 @@ func (s *Service) fetchProjectIDs(ctx context.Context, auth, cookie string) ([]s
 	}
 	ids := make(map[string]struct{}, len(collection.Data))
 	for _, item := range collection.Data {
-		id := item.ID
-		if _, after, ok := strings.Cut(id, ":"); ok {
-			id = after
-		}
-		if id != "" {
+		if id, ok := strings.CutPrefix(item.ID, cluster+":"); ok && id != "" {
 			ids[id] = struct{}{}
 		}
 	}
 	return slices.Sorted(maps.Keys(ids)), nil, nil
+}
+
+// clusterSet is the bounded set of cluster ids that Steve answered a list
+// for. A metric attribute takes a cluster id from this set only, because the
+// path of a request names any string, also before authentication.
+type clusterSet struct {
+	mu  sync.Mutex
+	ids map[string]struct{}
+}
+
+func newClusterSet() *clusterSet {
+	return &clusterSet{ids: make(map[string]struct{})}
+}
+
+func (c *clusterSet) add(id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.ids) < maxKnownClusters {
+		c.ids[id] = struct{}{}
+	}
+}
+
+// attribute returns id when the set has it, and unknown otherwise.
+func (c *clusterSet) attribute(id string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.ids[id]; ok {
+		return id
+	}
+	return "unknown"
 }
 
 // selfSubjectReviewBody is the fixed SelfSubjectReview request that resolves
@@ -415,7 +470,7 @@ func (c *cache) do(ctx context.Context, key string, fetch func() (allowedSet, *h
 		delete(c.inflight, key)
 		if err == nil && resp == nil {
 			c.removeExpired()
-			for len(c.entries) >= c.maxEntries {
+			for len(c.entries) > 0 && len(c.entries) >= c.maxEntries {
 				c.evictEarliest()
 			}
 			c.entries[key] = cacheEntry{set: set, expires: c.now().Add(c.ttl)}

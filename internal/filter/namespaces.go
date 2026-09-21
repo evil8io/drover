@@ -23,7 +23,7 @@ const (
 
 func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.Response, error) {
 	start := s.now()
-	watch, _ := strconv.ParseBool(req.URL.Query().Get("watch"))
+	watch := watchRequested(req.URL.Query())
 	result := listResult{cluster: cluster, path: pathNamespaces, watch: watch}
 
 	if hasImpersonation(req.Header) {
@@ -60,6 +60,10 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 	result.user = set.user
 	s.logger.DebugContext(req.Context(), "allowed namespaces", "cluster", cluster, "names", set.names)
 
+	if watch && s.watches.len() >= s.maxWatches {
+		return s.tooManyWatches(req, start, result), nil
+	}
+
 	token, err := rancherclient.ReadToken(s.tokenFile)
 	if err != nil {
 		return s.statusError(req, start, result, err), nil
@@ -68,6 +72,7 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 	privileged := req.Clone(req.Context())
 	privileged.Header.Set("Authorization", "Bearer "+token)
 	privileged.Header.Del("Cookie")
+	privileged.Header.Del("Accept-Encoding")
 	// The filter reads no compressed payload. Rancher then negotiates no
 	// extension, and the client gets that same answer.
 	privileged.Header.Del(extensionsHeader)
@@ -107,11 +112,16 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 		case http.StatusOK:
 			filtered.Body, writer = filterWatchBody(req.Context(), filtered.Body, allow, s.logger, s.watches, s.metrics, cluster)
 			// A dropped event changes the byte count, so the length of upstream
-			// no longer applies.
+			// no longer applies, and the filter writes plain JSON.
 			filtered.ContentLength = -1
 			filtered.Header.Del("Content-Length")
+			filtered.Header.Del("Content-Encoding")
 		case http.StatusSwitchingProtocols:
-			writer = filterWatchUpgrade(req.Context(), filtered, allow, s.logger, s.watches, s.metrics, cluster)
+			writer, err = filterWatchUpgrade(req.Context(), filtered, allow, s.logger, s.watches, s.metrics, cluster)
+			if err != nil {
+				_ = filtered.Body.Close()
+				return s.statusError(req, start, result, err), nil
+			}
 		}
 		if selected && writer != nil {
 			go s.endOnSelectorChange(req.Context(), cluster, req.Header, callerSelector, watchLabelSelector, writer)
@@ -259,12 +269,22 @@ func (s *Service) listError(req *http.Request, start time.Time, result listResul
 func (s *Service) statusError(req *http.Request, start time.Time, result listResult, err error) *http.Response {
 	result.outcome, result.status, result.err = outcomeError, http.StatusBadGateway, err
 	s.logList(req.Context(), start, result)
-	return statusResponse(req, http.StatusBadGateway, reasonInternalError, serviceName+": "+err.Error())
+	return statusResponse(req, http.StatusBadGateway, reasonInternalError, serviceName+": "+publicMessage(err))
+}
+
+// tooManyWatches answers 503, because the open watch streams of the service
+// are at the bound. The client retries, and a stream that ended in between
+// frees a slot.
+func (s *Service) tooManyWatches(req *http.Request, start time.Time, result listResult) *http.Response {
+	result.outcome, result.status = outcomeCapped, http.StatusServiceUnavailable
+	s.logList(req.Context(), start, result)
+	message := serviceName + ": the open watch streams are at the limit of " + strconv.Itoa(s.maxWatches)
+	return statusResponse(req, http.StatusServiceUnavailable, reasonUnavailable, message)
 }
 
 func (s *Service) logList(ctx context.Context, start time.Time, result listResult) {
 	duration := s.now().Sub(start)
-	s.metrics.recordRequest(ctx, result, duration)
+	s.metrics.recordRequest(ctx, result, s.clusters.attribute(result.cluster), duration)
 
 	attrs := []any{"cluster", result.cluster, "outcome", result.outcome, "status", result.status}
 	if result.resource != "" {

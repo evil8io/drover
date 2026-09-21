@@ -34,7 +34,9 @@ The service handles two request patterns from a Rancher kubeconfig. It passes ev
    The request keeps every Accept entry of the caller whose media type is `application/json`, for example a table request from kubectl, and drops every other entry, for example protobuf or CBOR. It sets `application/json` when no entry remains.
 7. The service sends the new request to Rancher, and it streams the response to the client. The event filter runs on every watch, also on a watch with a selector. An event passes only when every namespace in it is in the allowed set, or its `field.cattle.io/projectId` label matches a project of the caller. A server-side table event has one row per namespace, and the filter checks the name and the labels of each row. The filter is the only gate for a watch with no selector. It is the second gate for a watch with a selector.
 
-A watch request streams over chunked HTTP, or over a websocket connection after a protocol switch. A namespace that Rancher grants after the start of the watch becomes visible in one of three ways. A project selector matches a new namespace of a project of the caller at once. A watch with no selector gets the event too, because the event filter reads the allowed set through the same cache as a plain list. In every other case the service ends the watch, and the client sees the namespace on its next watch.
+A request is a watch when its `watch` parameter is present with a value other than `0` or `false`, as the API server reads it. A watch request streams over chunked HTTP, or over a websocket connection after a protocol switch. A namespace that Rancher grants after the start of the watch becomes visible in one of three ways. A project selector matches a new namespace of a project of the caller at once. A watch with no selector gets the event too, because the event filter reads the allowed set through the same cache as a plain list. In every other case the service ends the watch, and the client sees the namespace on its next watch.
+
+The cache of an allowed set has one entry per credential that Rancher reads: the `Authorization` header, or the `R_SESS` cookie when that header is absent. Another cookie is not part of the key.
 
 The service ends a watch with a selector when the selector of the caller changes. A timer re-reads the allowed set of the caller once per cache TTL, from the cache of a plain list, so it adds no request. It builds the selector again from that set. A different selector, or an allowed set that gets no selector at all, ends the stream with a clean end of the stream. The client then re-lists and re-watches, and the new watch gets the selector of the new allowed set. An upgraded stream gets a websocket close frame with status 1000 first, so the client reports a normal closure. A new namespace in a project of the caller keeps the selector the same, so the stream stays open. A watch with no selector needs no timer, because the event filter reads the new allowed set by itself.
 
@@ -63,7 +65,7 @@ With `--fanout` on, the service answers a cluster-wide list of a namespaced kind
 9. The service merges a `List` and a `Table` alike. A merged `Table` keeps the `columnDefinitions` field of the first answer. A table view in kubectl then keeps its columns.
 A caller may see more allowed namespaces than `--fanout-max-namespaces` allows. That cluster-wide list then gets a 403 error, and the service runs no fan-out.
 
-The `selfsubjectaccessreviews` path grants a cluster-wide `list` and a cluster-wide `watch` of any resource when `--fanout` is on and the caller has at least one allowed namespace. The list and the watch apply the real permission on their own. A grant that the permission does not cover then gives an empty answer, not an error.
+The `selfsubjectaccessreviews` path grants a cluster-wide `list` and a cluster-wide `watch` of any named resource when `--fanout` is on and the caller has at least one allowed namespace. A review of the resource `*` or the group `*` keeps its native answer. The list and the watch apply the real permission on their own. A grant that the permission does not cover then gives an empty answer, not an error.
 
 **Merged watch**
 
@@ -113,6 +115,7 @@ With these routes, the service becomes the data path for most reads of a tenant.
 | `--fanout-max-namespaces` | `200` | Count of allowed namespaces above which such a list answers 403. |
 | `--fanout-concurrency` | `16` | Namespaced requests of one fan-out that run at a time. It also bounds the memory of one fan-out. |
 | `--fanout-max-watch-namespaces` | `50` | Count of allowed namespaces above which a cluster-wide watch answers 403. |
+| `--max-watches` | `1000` | Count of open watch streams above which a new watch answers 503. |
 | `--log-level` | `info` | One of `debug`, `info`, `warn`, or `error`. |
 | `--shutdown-grace` | `20s` | Grace period for the shutdown after SIGTERM or SIGINT. |
 | `--otlp-endpoint` | `$OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint, `host:port` or a URL. Empty turns telemetry off. |
@@ -137,18 +140,20 @@ A Helm chart for drover is published separately.
 | Namespace cap | A caller with more than 20,000 allowed namespace names gets an error, not a list. |
 | Fan-out cap | A cluster-wide list gets a 403 error, with no fan-out, when the caller has more than `--fanout-max-namespaces` allowed namespaces. |
 | Watch cap | A cluster-wide watch gets a 403 error, with no merge, when the caller has more than `--fanout-max-watch-namespaces` allowed namespaces. |
+| Stream cap | A namespace watch or a cluster-wide watch gets a 503 error when the service has `--max-watches` open watch streams. The client retries. |
 | Merged watch end | A merged cluster-wide watch ends when one upstream watch ends, and when the allowed set of the caller changes. The client re-lists and re-watches. |
 | Merged watch bookmark | A merged cluster-wide watch sends no `BOOKMARK` event, also when the client asks for one. |
 | Empty answer | A cluster-wide list of a namespaced kind gets an empty collection, not Forbidden, when the caller may see no object of that kind. |
-| Self-check | `kubectl auth can-i list namespaces` returns yes when the caller has at least one allowed namespace, while RBAC returns no. With `--fanout` on, the same applies to `list` and `watch` on any namespaced kind, cluster-wide. |
+| Self-check | `kubectl auth can-i list namespaces` returns yes when the caller has at least one allowed namespace, while RBAC returns no. With `--fanout` on, the same applies to `list` and `watch` on any named resource, cluster-wide, also a cluster-scoped one, whose list then keeps its 403 error. |
 | Fetch rate | A fetch of an allowed set past `--fetch-rate` waits up to 5 s for a free token, then gets a 429 Status. |
 | Trust level | The service is a privileged component. It uses the cluster-owner token for the filtered namespace list and for the watch stream. |
+| Project scope | A project selector has the projects of the requested cluster only. The project part of a Rancher project id is unique inside one cluster, and the namespace label has that part alone. |
 
 ### Logging
 
 The service writes JSON logs to stderr, one line per intercepted request.
 
-A namespace list log line and a collection log line have these fields: `cluster`, `outcome` (`native`, `filtered`, `passthrough`, `denied`, `fanout`, `empty`, `capped`, or `error`), `status`, `count` (on `filtered`, `fanout`, `empty`, or `capped` only), `watch`, and `duration_ms`. A collection log line also has `resource`, the kind of the requested collection.
+A namespace list log line and a collection log line have these fields: `cluster`, `outcome` (`native`, `filtered`, `passthrough`, `denied`, `fanout`, `empty`, `capped`, or `error`), `status`, `count` (on `filtered`, `fanout`, `empty`, or `capped` only), `watch`, and `duration_ms`. A Status body that the service writes for an error names no internal address and no file path. The log line has the full error. A collection log line also has `resource`, the kind of the requested collection.
 
 A review log line has these fields: `cluster`, `outcome` (`passthrough`, `native`, or `granted`), and `status`.
 
@@ -170,7 +175,7 @@ A span of the service is named after the method and a path template, for example
 | --- | --- | --- | --- |
 | `drover.filter.requests` | Counter | `1` | `path`, `outcome`, `cluster`, `watch` |
 | `drover.filter.request.duration` | Histogram | `s` | `path`, `outcome`, `cluster`, `watch` |
-| `drover.filter.watches.open` | Up-down counter | `1` | |
+| `drover.filter.watches.open` | UpDownCounter | `1` | |
 | `drover.filter.watches.rejected` | Counter | `1` | `cluster` |
 | `drover.filter.events.dropped` | Counter | `1` | `cluster` |
 | `drover.filter.fetch.throttled` | Counter | `1` | |
@@ -178,13 +183,15 @@ A span of the service is named after the method and a path template, for example
 | `drover.filter.fanout.capped` | Counter | `1` | `cluster` |
 | `drover.filter.fanout.skipped` | Counter | `1` | `cluster` |
 
+The `cluster` attribute of the two request metrics names a cluster once Steve answered a namespace list for it. Every other request records `unknown`, because the path of a request names any string, also before authentication, and a metric attribute with an unbounded value set is a cardinality fault.
+
 ### Shutdown
 
 On SIGTERM or SIGINT, the service drains before it stops:
 
 1. It marks itself not ready. `/readyz` answers 503 from that point on.
 2. It ends every open watch stream with a clean end of the stream. An upgraded stream gets a websocket close frame with status 1000 first. A client re-lists and re-watches, with no error.
-3. It stops the HTTP server, within the `--shutdown-grace` period.
+3. It stops the HTTP server, within the `--shutdown-grace` period. The close frame of an upgraded stream waits at most 5 s for the client, before the server stops.
 
 The exit code is non-zero only when the server does not stop in time.
 

@@ -14,6 +14,7 @@ const (
 	reasonTooLarge      = "RequestEntityTooLarge"
 	reasonThrottled     = "TooManyRequests"
 	reasonForbidden     = "Forbidden"
+	reasonUnavailable   = "ServiceUnavailable"
 )
 
 type statusBody struct {

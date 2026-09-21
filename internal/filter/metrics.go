@@ -102,12 +102,14 @@ func newMetrics(provider metric.MeterProvider) (*metrics, error) {
 // recordRequest records one list or watch request, with its path, outcome,
 // cluster and watch attributes, and its duration in seconds. The resource of
 // a collection request is not an attribute, because a cluster with many
-// custom resources would give the instrument an unbounded attribute set.
-func (m *metrics) recordRequest(ctx context.Context, result listResult, duration time.Duration) {
+// custom resources would give the instrument an unbounded attribute set. The
+// cluster attribute comes from the caller, not from the path, for the same
+// reason.
+func (m *metrics) recordRequest(ctx context.Context, result listResult, cluster string, duration time.Duration) {
 	attrs := metric.WithAttributes(
 		attribute.String("path", result.path),
 		attribute.String("outcome", result.outcome),
-		attribute.String("cluster", result.cluster),
+		attribute.String("cluster", cluster),
 		attribute.Bool("watch", result.watch),
 	)
 	m.requests.Add(ctx, 1, attrs)

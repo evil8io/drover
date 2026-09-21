@@ -39,7 +39,7 @@ func (t collectionTarget) namespacedPath(name string) string {
 // credentials.
 func (s *Service) roundTripCollection(req *http.Request, target collectionTarget) (*http.Response, error) {
 	start := s.now()
-	watch, _ := strconv.ParseBool(req.URL.Query().Get("watch"))
+	watch := watchRequested(req.URL.Query())
 	result := listResult{cluster: target.cluster, watch: watch, path: pathCollection, resource: target.resource}
 
 	if hasImpersonation(req.Header) {
@@ -171,7 +171,7 @@ func (s *Service) fanout(req *http.Request, target collectionTarget, names []str
 	}
 
 	if stopped.Load() {
-		result.outcome, result.status, result.count = outcomeFannedOut, denied.StatusCode, len(names)
+		result.outcome, result.status, result.count = outcomeNative, denied.StatusCode, len(names)
 		s.logList(ctx, start, result)
 		return denied
 	}
@@ -329,10 +329,16 @@ func (s *Service) streamFanout(req *http.Request, writer *io.PipeWriter, first *
 
 	merged := collectionHeader{arrayKey: first.header.arrayKey}
 	written := 0
+	// An answer whose tail does not arrive gives no resourceVersion, and a
+	// merge without that value must name none, because a client that watches
+	// from a value above the true lowest loses events.
+	tailLost := false
 
 	consume := func(scanner *collectionScanner) error {
 		defer func() {
-			scanner.finish()
+			if err := scanner.finish(); err != nil {
+				tailLost = true
+			}
 			mergeHeader(&merged, scanner.header)
 			scanner.close()
 			<-slots
@@ -364,6 +370,10 @@ func (s *Service) streamFanout(req *http.Request, writer *io.PipeWriter, first *
 			s.skipNamespace(ctx, target, resp, slots, err)
 			continue
 		}
+		if scanner.header.arrayKey != merged.arrayKey {
+			s.skipNamespace(ctx, target, resp, slots, errMixedCollection)
+			continue
+		}
 		if err := consume(scanner); err != nil {
 			_ = writer.CloseWithError(err)
 			drainAnswers(rest[i+1:], slots)
@@ -371,6 +381,9 @@ func (s *Service) streamFanout(req *http.Request, writer *io.PipeWriter, first *
 		}
 	}
 
+	if tailLost {
+		merged.resourceVersion = ""
+	}
 	if merged.kind == "" {
 		// An answer without a kind leaves the merge without one, and a client
 		// that reads the kind then fails. Discovery is the last source.

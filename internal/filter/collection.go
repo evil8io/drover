@@ -11,6 +11,9 @@ import (
 // errNotCollection marks a body that is not a List and not a Table.
 var errNotCollection = errors.New("the answer is not a collection")
 
+// errMixedCollection marks a Table in a merge of Lists, or the reverse.
+var errMixedCollection = errors.New("the answer is not the same kind of collection as the first answer")
+
 // collectionHeader is the part of a List or a Table that stands before the
 // elements. arrayKey is items for a List, and rows for a Table. It is empty
 // when the body has neither key.
@@ -74,7 +77,7 @@ func openCollection(body io.ReadCloser) (*collectionScanner, error) {
 			return nil, err
 		}
 	}
-	return scanner, nil
+	return nil, errNotCollection
 }
 
 func (c *collectionScanner) readMetadata() error {
@@ -129,17 +132,18 @@ func (c *collectionScanner) next() (json.RawMessage, bool, error) {
 // finish reads the fields that stand after the elements. A custom resource
 // serializes as an unstructured object, whose keys are in alphabetical
 // order, so apiVersion comes first and items comes before kind and metadata.
-// The kind of such a list is therefore known only after its elements. It
-// ignores a read error, because the elements are already through.
-func (c *collectionScanner) finish() {
+// The kind of such a list is therefore known only after its elements. The
+// elements are already through, so a read error only means that the fields
+// after them are unknown.
+func (c *collectionScanner) finish() error {
 	for c.decoder.More() {
 		token, err := c.decoder.Token()
 		if err != nil {
-			return
+			return err
 		}
 		key, ok := token.(string)
 		if !ok {
-			return
+			return errNotCollection
 		}
 		switch key {
 		case "kind":
@@ -155,9 +159,10 @@ func (c *collectionScanner) finish() {
 			err = c.decoder.Decode(&skipped)
 		}
 		if err != nil {
-			return
+			return err
 		}
 	}
+	return nil
 }
 
 func (c *collectionScanner) close() {

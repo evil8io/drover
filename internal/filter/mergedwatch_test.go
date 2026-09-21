@@ -568,3 +568,27 @@ func TestDrainEndsMergedWatch(t *testing.T) {
 		t.Errorf("drover.filter.watches.open = %d, want 0 after the drain", openWatchCount(t, metricReader))
 	}
 }
+
+// TestMergedWatchIsCappedByMaxWatches checks that the MaxWatches bound also
+// caps a merged cluster-wide watch, because it shares the same registry as a
+// namespace watch.
+func TestMergedWatchIsCappedByMaxWatches(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	h := newHarnessOpt(t, collectionUpstream(
+		steveHandler("a"),
+		namespaceWatches(release, map[string][]string{"a": {podEvent("a")}}),
+	), withFanout, func(cfg *Config) { cfg.MaxWatches = 1 })
+
+	startMergedWatch(t, h, podsPath+"?watch=true")
+	if got := h.svc.watches.len(); got != 1 {
+		t.Fatalf("watches open = %d, want 1", got)
+	}
+
+	resp, _ := h.do(t, h.request(t, http.MethodGet, podsPath+"?watch=true", nil, callerHeader()))
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", resp.StatusCode)
+	}
+}

@@ -32,9 +32,9 @@ func TestListWithoutTokenFile(t *testing.T) {
 	if status.Code != http.StatusBadGateway {
 		t.Errorf("code = %d, want 502", status.Code)
 	}
-	want := "drover: the token file is not available yet: "
-	if !strings.HasPrefix(status.Message, want) {
-		t.Errorf("message = %q, want prefix %q", status.Message, want)
+	want := "drover: the token file is not available yet"
+	if status.Message != want {
+		t.Errorf("message = %q, want %q", status.Message, want)
 	}
 
 	if strings.Contains(h.logs.String(), "level=ERROR") {

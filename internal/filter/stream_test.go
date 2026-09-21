@@ -2,6 +2,7 @@ package filter
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -807,5 +808,162 @@ func TestWatchStaysOpenOnNamespaceInsideProjects(t *testing.T) {
 	case err := <-ended:
 		t.Fatalf("the stream ended with %v, want an open stream", err)
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestWatchIsRegisteredWhileOpen checks that watch=yes opens a watch, that
+// the privileged request keeps that literal query value, and that the stream
+// is registered while it is open.
+func TestWatchIsRegisteredWhileOpen(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	h := newHarness(t, listUpstream(steveHandler("a"), openWatch(release)))
+
+	resp, err := h.proxy.Client().Do(h.request(t, http.MethodGet, listPath+"?watch=yes", nil, callerHeader()))
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	if got := h.svc.watches.len(); got != 1 {
+		t.Errorf("watches open = %d, want 1, the stream must be registered while it is open", got)
+	}
+
+	privileged := h.upstream.privileged(t)
+	if got := privileged.query.Get("watch"); got != "yes" {
+		t.Errorf("privileged watch = %q, want yes", got)
+	}
+}
+
+// TestWatchKeepsQueryValueAndFiltersEvents checks the two truthy forms of
+// watch that carry no explicit value, watch=yes and watch=, on the namespace
+// path: the privileged request keeps the literal value, an event outside the
+// allowed set is dropped, and the log line has watch=true.
+func TestWatchKeepsQueryValueAndFiltersEvents(t *testing.T) {
+	t.Parallel()
+	for _, query := range []string{"watch=yes", "watch="} {
+		t.Run(query, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t, listUpstream(steveHandler("a"), func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, `{"type":"ADDED","object":{"metadata":{"name":"z"}}}`+"\n")
+			}))
+
+			resp, body := h.do(t, h.request(t, http.MethodGet, listPath+"?"+query, nil, callerHeader()))
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200", resp.StatusCode)
+			}
+			if len(body) != 0 {
+				t.Errorf("body = %q, want the event outside the allowed set dropped", body)
+			}
+
+			privileged := h.upstream.privileged(t)
+			if !privileged.query.Has("watch") {
+				t.Fatal("the privileged query has no watch parameter")
+			}
+			if want := strings.TrimPrefix(query, "watch="); privileged.query.Get("watch") != want {
+				t.Errorf("privileged watch = %q, want %q", privileged.query.Get("watch"), want)
+			}
+
+			if !strings.Contains(h.logs.String(), "watch=true") {
+				t.Errorf("logs have no watch=true line: %s", h.logs.String())
+			}
+		})
+	}
+}
+
+// TestWatchStripsAcceptEncodingAndContentEncoding checks that the privileged
+// watch request carries no Accept-Encoding, also when the caller sends one,
+// and that the filtered 200 answer carries no Content-Encoding, also when
+// the upstream sets one.
+func TestWatchStripsAcceptEncodingAndContentEncoding(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstream(steveHandler("a"), func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Accept-Encoding"); got != "" {
+			t.Errorf("privileged Accept-Encoding = %q, want no header", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	header := callerHeader()
+	header.Set("Accept-Encoding", "gzip")
+	resp, _ := h.do(t, h.request(t, http.MethodGet, listPath+"?watch=true", nil, header))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Encoding"); got != "" {
+		t.Errorf("filtered Content-Encoding = %q, want no header", got)
+	}
+}
+
+// TestMaxWatchesCapsANamespaceWatch checks that a namespace watch above
+// MaxWatches answers 503 while an earlier watch stays open, that the log
+// line names the capped outcome, and that a plain list is not capped.
+func TestMaxWatchesCapsANamespaceWatch(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	defer releaseOnce()
+
+	h := newHarnessOpt(t, listUpstream(steveHandler("a"), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !watchRequested(r.URL.Query()) {
+			_, _ = io.WriteString(w, `{"kind":"NamespaceList","items":[]}`)
+			return
+		}
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("the upstream response writer has no flusher")
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		<-release
+	}), func(cfg *Config) { cfg.MaxWatches = 1 })
+
+	resp1, err := h.proxy.Client().Do(h.request(t, http.MethodGet, listPath+"?watch=true", nil, callerHeader()))
+	if err != nil {
+		t.Fatalf("first watch: %v", err)
+	}
+	t.Cleanup(func() { _ = resp1.Body.Close() })
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("first watch status = %d, want 200", resp1.StatusCode)
+	}
+	if got := h.svc.watches.len(); got != 1 {
+		t.Fatalf("watches open = %d, want 1", got)
+	}
+
+	resp2, body2 := h.do(t, h.request(t, http.MethodGet, listPath+"?watch=true", nil, callerHeader()))
+	if resp2.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("second watch status = %d, want 503", resp2.StatusCode)
+	}
+	var status statusBody
+	if err := json.Unmarshal(body2, &status); err != nil {
+		t.Fatalf("parse the response %q: %v", body2, err)
+	}
+	if status.Reason != reasonUnavailable {
+		t.Errorf("reason = %q, want %q", status.Reason, reasonUnavailable)
+	}
+	if !strings.Contains(status.Message, "1") {
+		t.Errorf("message = %q, want it to name the limit 1", status.Message)
+	}
+	if !strings.Contains(h.logs.String(), "outcome=capped") {
+		t.Errorf("logs have no outcome=capped line: %s", h.logs.String())
+	}
+	if !strings.Contains(h.logs.String(), "status=503") {
+		t.Errorf("logs have no status=503 line: %s", h.logs.String())
+	}
+
+	resp3, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp3.StatusCode != http.StatusOK {
+		t.Errorf("plain list status = %d, want 200, the cap must not affect a non-watch request", resp3.StatusCode)
 	}
 }
