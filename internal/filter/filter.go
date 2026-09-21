@@ -38,6 +38,8 @@ type Config struct {
 	Upstream *url.URL
 	// CAFile is a PEM bundle that verifies an https upstream. An empty value selects the system pool.
 	CAFile string
+	// InsecureSkipVerify skips the certificate verification of an https upstream.
+	InsecureSkipVerify bool
 	// TokenFile contains the API token of the Rancher service user.
 	TokenFile string
 	// CacheTTL is the lifetime of one cached allowed set. Zero selects 15 s.
@@ -128,7 +130,7 @@ func New(cfg Config) (*Service, error) {
 	upstream.Path = ""
 	upstream.RawPath = ""
 
-	base, err := rancherclient.Transport(cfg.CAFile)
+	base, err := rancherclient.Transport(cfg.CAFile, cfg.InsecureSkipVerify)
 	if err != nil {
 		return nil, err
 	}

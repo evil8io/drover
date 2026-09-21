@@ -20,18 +20,19 @@ import (
 )
 
 type projectSyncConfig struct {
-	listen         string
-	rancherURL     *url.URL
-	caFile         string
-	tokenFile      string
-	labels         []string
-	annotations    []string
-	nameLabel      string
-	nameAnnotation string
-	interval       time.Duration
-	patchRate      float64
-	logLevel       slog.Level
-	telemetry      telemetry.Config
+	listen             string
+	rancherURL         *url.URL
+	caFile             string
+	insecureSkipVerify bool
+	tokenFile          string
+	labels             []string
+	annotations        []string
+	nameLabel          string
+	nameAnnotation     string
+	interval           time.Duration
+	patchRate          float64
+	logLevel           slog.Level
+	telemetry          telemetry.Config
 }
 
 func runProjectSync(args []string) int {
@@ -44,6 +45,9 @@ func runProjectSync(args []string) int {
 	}
 
 	logger := slog.New(telemetry.NewLogHandler(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.logLevel})))
+	if cfg.insecureSkipVerify {
+		logger.Warn("the certificate of Rancher is not verified")
+	}
 
 	tel, err := telemetry.Setup(context.Background(), cfg.telemetry)
 	if err != nil {
@@ -59,17 +63,18 @@ func runProjectSync(args []string) int {
 	}()
 
 	syncer, err := projectsync.New(projectsync.Config{
-		RancherURL:     cfg.rancherURL,
-		CAFile:         cfg.caFile,
-		TokenFile:      cfg.tokenFile,
-		Labels:         cfg.labels,
-		Annotations:    cfg.annotations,
-		NameLabel:      cfg.nameLabel,
-		NameAnnotation: cfg.nameAnnotation,
-		Interval:       cfg.interval,
-		PatchRate:      cfg.patchRate,
-		Logger:         logger,
-		Version:        version,
+		RancherURL:         cfg.rancherURL,
+		CAFile:             cfg.caFile,
+		InsecureSkipVerify: cfg.insecureSkipVerify,
+		TokenFile:          cfg.tokenFile,
+		Labels:             cfg.labels,
+		Annotations:        cfg.annotations,
+		NameLabel:          cfg.nameLabel,
+		NameAnnotation:     cfg.nameAnnotation,
+		Interval:           cfg.interval,
+		PatchRate:          cfg.patchRate,
+		Logger:             logger,
+		Version:            version,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -94,6 +99,7 @@ func runProjectSync(args []string) int {
 		"version", version,
 		"listen", cfg.listen,
 		"rancher", cfg.rancherURL.Redacted(),
+		"insecure_skip_verify", cfg.insecureSkipVerify,
 		"interval", cfg.interval.String(),
 		"patch_rate", cfg.patchRate,
 		"labels", cfg.labels,
@@ -145,6 +151,7 @@ func parseProjectSyncConfig(args []string, output io.Writer, getenv func(string)
 	flags.StringVar(&cfg.listen, "listen", ":8080", "listen address")
 	flags.StringVar(&rancherURL, "rancher-url", "", "Rancher URL, http:// or https://")
 	flags.StringVar(&cfg.caFile, "rancher-ca-file", "", "PEM bundle that verifies an https Rancher URL")
+	flags.BoolVar(&cfg.insecureSkipVerify, "rancher-insecure-skip-verify", false, "skip the certificate verification of an https Rancher URL")
 	flags.StringVar(&cfg.tokenFile, "token-file", "", "file with the API token of the service user")
 	flags.StringVar(&labels, "labels", "", "comma-separated label keys of a project to copy")
 	flags.StringVar(&annotations, "annotations", "", "comma-separated annotation keys of a project to copy")

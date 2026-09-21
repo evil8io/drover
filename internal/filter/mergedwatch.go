@@ -32,6 +32,10 @@ const (
 	binarySubprotocol = "binary.k8s.io"
 
 	watchBookmark = "BOOKMARK"
+
+	// initialEventsEndAnnotation marks the BOOKMARK event that ends the
+	// initial events of a watch-list.
+	initialEventsEndAnnotation = "k8s.io/initial-events-end"
 )
 
 // upstreamWatch is one open watch of one namespace.
@@ -58,6 +62,15 @@ type watchMerge struct {
 
 	mu     sync.Mutex
 	bodies []io.Closer
+
+	// watchList is true when the caller asked for the initial events. pending
+	// counts the upstream watches whose initial events did not end yet,
+	// endObject is the object of the first end bookmark, and endVersion is the
+	// lowest resourceVersion of the end bookmarks.
+	watchList  bool
+	pending    int
+	endObject  json.RawMessage
+	endVersion string
 }
 
 // mergedWatch answers a cluster-wide watch of a namespaced kind. The caller
@@ -94,8 +107,11 @@ func (s *Service) mergedWatch(req *http.Request, target collectionTarget, set al
 	// A caller that may see no namespace gets a stream without an event, as
 	// the list path gives it a collection without an element. A cluster-scoped
 	// kind keeps the native answer, because such an object has no namespace.
+	var kind, apiVersion string
 	if len(names) == 0 {
-		if _, _, namespaced, ok := s.discoverResource(req, target); !ok || !namespaced {
+		var namespaced, ok bool
+		kind, apiVersion, namespaced, ok = s.discoverResource(req, target)
+		if !ok || !namespaced {
 			result.outcome, result.status = outcomeNative, denied.StatusCode
 			s.logList(ctx, start, result)
 			return denied
@@ -114,11 +130,18 @@ func (s *Service) mergedWatch(req *http.Request, target collectionTarget, set al
 	_ = denied.Body.Close()
 
 	merge, resp := s.newMerge(req, target)
+	merge.watchList = watchListRequested(req.URL.Query())
+	merge.pending = len(streams)
 	for _, stream := range streams {
 		merge.hold(stream.body)
 	}
 	for _, stream := range streams {
 		go merge.follow(ctx, stream)
+	}
+	if merge.watchList && len(streams) == 0 {
+		// No upstream watch sends an end bookmark, so the merge sends one
+		// itself, from the kind that discovery gave.
+		go merge.endInitialEventsWithout(kind, apiVersion)
 	}
 	go merge.finishOnEnd(ctx)
 	go s.endWatchOnAllowedSetChange(ctx, target.cluster, req.Header, names, merge)
@@ -184,7 +207,8 @@ func closeWatches(streams []upstreamWatch) {
 //
 // It drops allowWatchBookmarks. A bookmark names the resourceVersion that one
 // stream reached, and the merged stream has one such value per namespace, so a
-// bookmark of one namespace is not a resume point of the merge.
+// bookmark of one namespace is not a resume point of the merge. A watch-list
+// keeps it, because the bookmark that ends the initial events needs it.
 //
 // It drops the websocket handshake of the caller, because each upstream watch
 // takes the chunked transport. The merge owns the transport of the client, and
@@ -194,7 +218,11 @@ func namespacedWatchRequest(req *http.Request, target collectionTarget, name str
 	stripUpgrade(out.Header)
 
 	query := out.URL.Query()
-	query.Del("allowWatchBookmarks")
+	if watchListRequested(query) {
+		query.Set("allowWatchBookmarks", "true")
+	} else {
+		query.Del("allowWatchBookmarks")
+	}
 	out.URL.RawQuery = query.Encode()
 	return out
 }
@@ -314,6 +342,11 @@ func (m *watchMerge) follow(ctx context.Context, stream upstreamWatch) {
 			return
 		}
 		if isBookmark(raw) {
+			if m.watchList {
+				if err := m.endInitialEvents(raw); err != nil {
+					return
+				}
+			}
 			continue
 		}
 		if err := m.write(raw); err != nil {
@@ -325,12 +358,106 @@ func (m *watchMerge) follow(ctx context.Context, stream upstreamWatch) {
 // isBookmark reports whether the event is a BOOKMARK. The merged stream
 // sends none, because the resourceVersion of one namespace is no resume point
 // of the merge, and a client that resumes from it loses the events of every
-// other namespace.
+// other namespace. The one exception is the bookmark that ends the initial
+// events of a watch-list, which endInitialEvents merges.
 func isBookmark(raw json.RawMessage) bool {
 	var event struct {
 		Type string `json:"type"`
 	}
 	return json.Unmarshal(raw, &event) == nil && event.Type == watchBookmark
+}
+
+// endInitialEvents counts one upstream watch whose initial events ended, when
+// the bookmark has the end annotation, and it writes the merged end once every
+// upstream watch reached it. The merged bookmark has the object of the first
+// end bookmark, with the lowest resourceVersion of them, for the reason that
+// the merged list reports the lowest value.
+func (m *watchMerge) endInitialEvents(raw json.RawMessage) error {
+	var event struct {
+		Object json.RawMessage `json:"object"`
+	}
+	if json.Unmarshal(raw, &event) != nil {
+		return nil
+	}
+	version, ok := initialEventsEndVersion(event.Object)
+	if !ok {
+		return nil
+	}
+
+	m.mu.Lock()
+	if m.pending == 0 {
+		m.mu.Unlock()
+		return nil
+	}
+	if m.endObject == nil {
+		m.endObject = event.Object
+	}
+	m.endVersion = lowestResourceVersion(m.endVersion, version)
+	m.pending--
+	done := m.pending == 0
+	object, lowest := m.endObject, m.endVersion
+	m.mu.Unlock()
+	if !done {
+		return nil
+	}
+
+	bookmark, err := mergedBookmark(object, lowest)
+	if err != nil {
+		return err
+	}
+	return m.write(bookmark)
+}
+
+// endInitialEventsWithout writes the merged end for a caller with no upstream
+// watch, from the kind and the group version of the resource.
+func (m *watchMerge) endInitialEventsWithout(kind, apiVersion string) {
+	object := []byte(`{"kind":` + strconv.Quote(kind) + `,"apiVersion":` + strconv.Quote(apiVersion) + `,"metadata":{}}`)
+	bookmark, err := mergedBookmark(object, "")
+	if err != nil {
+		return
+	}
+	_ = m.write(bookmark)
+}
+
+// initialEventsEndVersion returns the resourceVersion of a bookmark object
+// that has the end annotation, and reports whether the object has it.
+func initialEventsEndVersion(object json.RawMessage) (string, bool) {
+	var metadata struct {
+		Metadata struct {
+			ResourceVersion string            `json:"resourceVersion"`
+			Annotations     map[string]string `json:"annotations"`
+		} `json:"metadata"`
+	}
+	if json.Unmarshal(object, &metadata) != nil {
+		return "", false
+	}
+	if metadata.Metadata.Annotations[initialEventsEndAnnotation] != "true" {
+		return "", false
+	}
+	return metadata.Metadata.ResourceVersion, true
+}
+
+// mergedBookmark returns the BOOKMARK event that ends the initial events of
+// the merge: the object, with version as its resourceVersion and with the end
+// annotation.
+func mergedBookmark(object json.RawMessage, version string) (json.RawMessage, error) {
+	var fields map[string]any
+	if err := json.Unmarshal(object, &fields); err != nil {
+		return nil, err
+	}
+	metadata, _ := fields["metadata"].(map[string]any)
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	annotations, _ := metadata["annotations"].(map[string]any)
+	if annotations == nil {
+		annotations = map[string]any{}
+	}
+	annotations[initialEventsEndAnnotation] = "true"
+	metadata["annotations"] = annotations
+	metadata["resourceVersion"] = version
+	fields["metadata"] = metadata
+	return json.Marshal(map[string]any{"type": watchBookmark, "object": fields})
 }
 
 // write sends one event to the client, in the encoding of its transport.

@@ -1,0 +1,25 @@
+# The registry had 315 versions on 2026-09-21, and 252 had no tag.
+# Nothing removed them, so this workflow deletes untagged images every week.
+name: cleanup
+
+on:
+  schedule:
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          package: drover
+          delete-untagged: true
+          keep-n-tagged: 30
+          use-regex: true
+          exclude-tags: '^([0-9]+\.[0-9]+(\.[0-9]+)?|latest|main)$'
+          # Add "dry-run: true" here to preview a rule change before a scheduled run applies it.

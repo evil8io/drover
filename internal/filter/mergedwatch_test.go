@@ -592,3 +592,109 @@ func TestMergedWatchIsCappedByMaxWatches(t *testing.T) {
 		t.Errorf("status = %d, want 503", resp.StatusCode)
 	}
 }
+
+// endBookmark is the BOOKMARK event that ends the initial events of one
+// upstream watch-list.
+func endBookmark(version string) string {
+	return `{"type":"BOOKMARK","object":{"kind":"Pod","apiVersion":"v1","metadata":{"resourceVersion":"` + version +
+		`","annotations":{"k8s.io/initial-events-end":"true"}}}}` + "\n"
+}
+
+// decodeBookmark reads the fields of a merged end bookmark that a test checks.
+func decodeBookmark(t *testing.T, line string) (kind, apiVersion, version string, annotations map[string]string) {
+	t.Helper()
+	var event struct {
+		Type   string `json:"type"`
+		Object struct {
+			Kind       string `json:"kind"`
+			APIVersion string `json:"apiVersion"`
+			Metadata   struct {
+				ResourceVersion string            `json:"resourceVersion"`
+				Annotations     map[string]string `json:"annotations"`
+			} `json:"metadata"`
+		} `json:"object"`
+	}
+	if err := json.Unmarshal([]byte(line), &event); err != nil {
+		t.Fatalf("decode %q: %v", line, err)
+	}
+	if event.Type != watchBookmark {
+		t.Fatalf("event %q has the type %q, want BOOKMARK", line, event.Type)
+	}
+	return event.Object.Kind, event.Object.APIVersion, event.Object.Metadata.ResourceVersion, event.Object.Metadata.Annotations
+}
+
+const watchListQuery = "?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&allowWatchBookmarks=true"
+
+// TestMergedWatchListEndsTheInitialEventsOnce checks that a watch-list gets
+// the initial events of every namespace, then one end bookmark with the lowest
+// resourceVersion, and that a plain bookmark still stays out.
+func TestMergedWatchListEndsTheInitialEventsOnce(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	h := newHarnessOpt(t, collectionUpstream(
+		steveHandler("a", "b"),
+		namespaceWatches(release, map[string][]string{
+			"a": {podEvent("a"), bookmarkLine, endBookmark("10")},
+			"b": {podEvent("b"), endBookmark("7")},
+		}),
+	), withFanout)
+
+	_, reader := startMergedWatch(t, h, podsPath+watchListQuery)
+	added := []string{nextEvent(t, reader), nextEvent(t, reader)}
+	slices.Sort(added)
+	if want := []string{podEvent("a"), podEvent("b")}; !slices.Equal(added, want) {
+		t.Errorf("initial events = %q, want %q", added, want)
+	}
+	kind, apiVersion, version, annotations := decodeBookmark(t, nextEvent(t, reader))
+	if kind != "Pod" || apiVersion != "v1" || version != "7" || annotations[initialEventsEndAnnotation] != "true" {
+		t.Errorf("end bookmark = %s %s %q %v, want Pod v1 7 with the end annotation", kind, apiVersion, version, annotations)
+	}
+	wantNoEvent(t, reader)
+
+	for _, record := range namespacedRecords(h.upstream) {
+		if record.query.Get("allowWatchBookmarks") != "true" || record.query.Get("sendInitialEvents") != "true" {
+			t.Errorf("upstream query of %s = %v, want allowWatchBookmarks and sendInitialEvents", record.path, record.query)
+		}
+	}
+}
+
+// TestMergedWatchListWithoutAnAllowedNamespaceEndsAtOnce checks that a caller
+// with no namespace gets the end bookmark from discovery, so a watch-list
+// client does not wait.
+func TestMergedWatchListWithoutAnAllowedNamespaceEndsAtOnce(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	h := newHarnessOpt(t, collectionUpstreamWithDiscovery(
+		steveHandler(), namespaceWatches(release, nil), coreDiscovery(),
+	), withFanout)
+
+	_, reader := startMergedWatch(t, h, podsPath+watchListQuery)
+	kind, apiVersion, version, annotations := decodeBookmark(t, nextEvent(t, reader))
+	if kind != "Pod" || apiVersion != "v1" || version != "" || annotations[initialEventsEndAnnotation] != "true" {
+		t.Errorf("end bookmark = %s %s %q %v, want Pod v1 with no version and the end annotation", kind, apiVersion, version, annotations)
+	}
+	wantNoEvent(t, reader)
+}
+
+// TestMergedWatchDropsAnEndBookmarkWithoutAWatchList checks that the end
+// bookmark of an upstream stays out of a plain watch.
+func TestMergedWatchDropsAnEndBookmarkWithoutAWatchList(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	h := newHarnessOpt(t, collectionUpstream(
+		steveHandler("a"),
+		namespaceWatches(release, map[string][]string{"a": {endBookmark("10"), podEvent("a")}}),
+	), withFanout)
+
+	_, reader := startMergedWatch(t, h, podsPath+"?watch=true")
+	if got := nextEvent(t, reader); got != podEvent("a") {
+		t.Errorf("event = %q, want the ADDED event", got)
+	}
+	wantNoEvent(t, reader)
+}

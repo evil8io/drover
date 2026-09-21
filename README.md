@@ -75,7 +75,7 @@ With `--fanout` on, the service also answers a cluster-wide watch, for example `
 2. Each upstream watch keeps the query of the caller, with its `resourceVersion` and its `timeoutSeconds`. The merged list reports the lowest `resourceVersion` of its answers, so a watch from that value loses no event. A namespace that answered the list at a higher revision repeats the events between the two revisions. A client takes a repeated event as an update of an object that it has already.
 3. A namespace that answers a status other than 200 drops out of the stream. A 404 error gives the native 403 error, because the kind then has no namespace scope. An allowed set whose namespaces all deny the watch gives the native answer too, because a stream without an upstream watch hides a real permission gap.
 4. A caller that may see no namespace gets an open stream without an event, as it gets a collection without an element on the list path.
-5. The merged stream sends no `BOOKMARK` event, and the service drops `allowWatchBookmarks` from the upstream requests. A bookmark names the revision of one namespace, and a client that resumes the merge from it loses the events of every other namespace.
+5. The merged stream sends no `BOOKMARK` event, and the service drops `allowWatchBookmarks` from the upstream requests. A bookmark names the revision of one namespace, and a client that resumes the merge from it loses the events of every other namespace. A watch-list, a watch with `sendInitialEvents=true`, is the exception: each upstream watch keeps `allowWatchBookmarks`, its initial events reach the client, and the merged stream sends one `BOOKMARK` with the annotation `k8s.io/initial-events-end` once every upstream watch sent its own, with the lowest `resourceVersion` of them. A caller with no allowed namespace gets that `BOOKMARK` at once, with no `resourceVersion`.
 6. The set of upstream watches is fixed while the stream runs. A timer re-reads the allowed set of the caller once per cache TTL, and a set that changed ends the stream. The client re-lists and re-watches, and the new stream covers the new set. The re-read goes through the cache of a plain list, so it adds no request.
 7. An upstream watch that ends ends the merged stream. The client re-lists, which repairs the gap. A stream that stays open with one dead namespace shows stale data and reports nothing about it.
 8. The service owns the transport of the client on this path, because it relays no single upstream stream. A chunked client gets the events as a newline-delimited JSON stream. A client that asks for a websocket gets the protocol switch from the service itself, and one frame per event: a binary frame for the `binary.k8s.io` subprotocol, and a text frame with base64 text for `base64.binary.k8s.io`. A close frame of the client ends the stream, and a ping frame gets a pong.
@@ -83,7 +83,7 @@ With `--fanout` on, the service also answers a cluster-wide watch, for example `
 
 ### Requirements
 
-1. A Rancher service user with a `cluster-owner` binding on every cluster whose tenants use the filter.
+1. A Rancher service user with `list` and `watch` on `namespaces` in every cluster whose tenants use the filter. A `cluster-owner` binding also covers that.
 2. An API token of that service user. The token has no scope.
 3. The token in a Secret, mounted into the service.
 4. Route rules on the Rancher hostname for these requests:
@@ -107,6 +107,7 @@ With these routes, the service becomes the data path for most reads of a tenant.
 | `--listen` | `:8080` | Address the service listens on. |
 | `--upstream` | (required) | URL of Rancher. Use `http://` or `https://`. The path must be empty or `/`. |
 | `--upstream-ca-file` | | PEM bundle that verifies an `https` upstream. |
+| `--upstream-insecure-skip-verify` | `false` | Skip the certificate verification of an `https` upstream. |
 | `--token-file` | (required) | File with the API token of the Rancher service user. |
 | `--cache-ttl` | `15s` | Lifetime of a cached allowed set. |
 | `--max-cache-entries` | `1000` | Hard bound on the cached allowed sets. |
@@ -122,6 +123,8 @@ With these routes, the service becomes the data path for most reads of a tenant.
 | `--otlp-traces` | `true` | Send traces to the OTLP endpoint. |
 | `--otlp-metrics` | `true` | Send metrics to the OTLP endpoint. |
 | `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | `service.name` resource attribute. |
+
+`--upstream-insecure-skip-verify` is for an upstream inside the cluster whose certificate comes from a private CA that the deployment does not copy. A network policy must then limit the path to Rancher.
 
 The upstream is the Rancher Service inside the cluster, for example `http://rancher.cattle-system.svc`. The public hostname is not a valid upstream, because the route sends the filtered paths back to the service.
 
@@ -142,11 +145,11 @@ A Helm chart for drover is published separately.
 | Watch cap | A cluster-wide watch gets a 403 error, with no merge, when the caller has more than `--fanout-max-watch-namespaces` allowed namespaces. |
 | Stream cap | A namespace watch or a cluster-wide watch gets a 503 error when the service has `--max-watches` open watch streams. The client retries. |
 | Merged watch end | A merged cluster-wide watch ends when one upstream watch ends, and when the allowed set of the caller changes. The client re-lists and re-watches. |
-| Merged watch bookmark | A merged cluster-wide watch sends no `BOOKMARK` event, also when the client asks for one. |
+| Merged watch bookmark | A merged cluster-wide watch sends no `BOOKMARK` event, also when the client asks for one. A watch-list gets the one `BOOKMARK` that ends its initial events. |
 | Empty answer | A cluster-wide list of a namespaced kind gets an empty collection, not Forbidden, when the caller may see no object of that kind. |
 | Self-check | `kubectl auth can-i list namespaces` returns yes when the caller has at least one allowed namespace, while RBAC returns no. With `--fanout` on, the same applies to `list` and `watch` on any named resource, cluster-wide, also a cluster-scoped one, whose list then keeps its 403 error. |
 | Fetch rate | A fetch of an allowed set past `--fetch-rate` waits up to 5 s for a free token, then gets a 429 Status. |
-| Trust level | The service is a privileged component. It uses the cluster-owner token for the filtered namespace list and for the watch stream. |
+| Trust level | The service is a privileged component. It uses the service token for the filtered namespace list and for the watch stream. |
 | Project scope | A project selector has the projects of the requested cluster only. The project part of a Rancher project id is unique inside one cluster, and the namespace label has that part alone. |
 
 ### Logging
@@ -161,7 +164,7 @@ Both log lines have the field `user`, the caller's Rancher user id from a SelfSu
 
 The service never logs a token, a cookie, a header value, or a request body. It logs a namespace name at the `debug` level only.
 
-The service writes a `warn` line when the privileged list request gets a 403 error. The cause is a `cluster-owner` binding that the service user does not have.
+The service writes a `warn` line when the privileged list request gets a 403 error. The cause is a namespace list permission that the service user does not have.
 
 A log line has `trace_id` and `span_id` when the request has a span.
 
@@ -170,6 +173,8 @@ A log line has `trace_id` and `span_id` when the request has a span.
 The service continues an incoming `traceparent` on every request. It starts a span when the header is absent. A request span has a child span for the Steve call, the project list, the privileged list, and the privileged watch. With `--otlp-endpoint` set, the service also exports these metrics:
 
 A span of the service is named after the method and a path template, for example `GET /k8s/clusters/{cluster}/api/v1/pods`, and the server span carries that template as `http.route`. A collector that rebuilds a span name from the semantic conventions reads that attribute and gives the span the method alone without it, so the two names agree. The cluster id, a namespace name and an object name each become a placeholder, because their value set is unbounded. The api group, the version and the resource name stay, because they say what the request asks for and the api surface of a cluster is bounded. Search a trace on `resource.service.name`, which `--service-name` sets, not on the span name.
+
+A client span records `url.full` without its query, because the query of the privileged list names every allowed namespace of the caller.
 
 | Metric | Kind | Unit | Attributes |
 | --- | --- | --- | --- |
@@ -209,6 +214,7 @@ A CronJob is the normal caller, because most runs find a valid token and exit 0.
 | --- | --- | --- |
 | `--rancher-url` | (required) | URL of Rancher. Use `http://` or `https://`. The path must be empty or `/`. |
 | `--rancher-ca-file` | | PEM bundle that verifies an `https` Rancher URL. |
+| `--rancher-insecure-skip-verify` | `false` | Skip the certificate verification of an `https` Rancher URL. |
 | `--credentials-dir` | (required) | Directory with the files `username` and `password` of the service user. |
 | `--token-secret` | (required) | `namespace/name` of the Secret with the API token. |
 | `--token-key` | `token` | Key of the token inside the Secret. |
@@ -257,13 +263,13 @@ With `--otlp-endpoint` set, one run produces a span named `rotate`, with a child
 
 ## project-sync
 
-This service copies labels and annotations of a Rancher project to every namespace of that project, because Rancher does not copy them. The `--labels` and `--annotations` flags are the allow list of keys. The value of the project wins, and the service overwrites a different value on the namespace. The service polls Rancher at every `--interval`, and it also keeps one namespace watch per cluster open, so that a new namespace gets its keys within a few seconds. One replica is enough, because every run is a full reconcile. A namespace list that returns status 403 means that the service user has no `cluster-owner` binding on that cluster.
+This service copies labels and annotations of a Rancher project to every namespace of that project, because Rancher does not copy them. The `--labels` and `--annotations` flags are the allow list of keys. The value of the project wins, and the service overwrites a different value on the namespace. The service polls Rancher at every `--interval`, and it also keeps one namespace watch per cluster open, so that a new namespace gets its keys within a few seconds. One replica is enough, because every run is a full reconcile. A namespace list that returns status 403 means that the service user may not list namespaces on that cluster.
 
 The service writes a warning with the cluster id and continues with the next cluster.
 
 ### Requirements
 
-1. A Rancher service user with a `cluster-owner` binding on every cluster whose namespaces the service syncs.
+1. A Rancher service user with `get`, `list`, `watch`, and `patch` on `namespaces`, and with `get`, `list`, and `watch` on `projects` of `management.cattle.io`, in every cluster whose namespaces the service syncs. A `cluster-owner` binding also covers that.
 2. An API token of that service user, in a Secret that the service mounts.
 
 ### Configuration
@@ -272,6 +278,7 @@ The service writes a warning with the cluster id and continues with the next clu
 | --- | --- | --- |
 | `--rancher-url` | (required) | URL of Rancher. Use `http://` or `https://`. The path must be empty or `/`. |
 | `--rancher-ca-file` | | PEM bundle that verifies an `https` URL. |
+| `--rancher-insecure-skip-verify` | `false` | Skip the certificate verification of an `https` Rancher URL. |
 | `--token-file` | (required) | File with the API token of the Rancher service user. |
 | `--labels` | | Comma-separated label keys of a project to copy. |
 | `--annotations` | | Comma-separated annotation keys of a project to copy. |

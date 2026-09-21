@@ -41,6 +41,8 @@ type Config struct {
 	RancherURL *url.URL
 	// CAFile is a PEM bundle that verifies an https URL. An empty value selects the system pool.
 	CAFile string
+	// InsecureSkipVerify skips the certificate verification of an https Rancher URL.
+	InsecureSkipVerify bool
 	// TokenFile contains the API token of the Rancher service user.
 	TokenFile string
 	// Labels are the label keys of a project that the service copies.
@@ -133,7 +135,7 @@ func New(cfg Config) (*Syncer, error) {
 		}
 	}
 
-	transport, err := rancherclient.Transport(cfg.CAFile)
+	transport, err := rancherclient.Transport(cfg.CAFile, cfg.InsecureSkipVerify)
 	if err != nil {
 		return nil, err
 	}
