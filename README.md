@@ -278,6 +278,7 @@ The service writes a warning with the cluster id and continues with the next clu
 | `--name-label` | | Label key on the namespace that gets the display name of the project. |
 | `--name-annotation` | | Annotation key on the namespace that gets the display name of the project. |
 | `--interval` | `60s` | Time between two runs. |
+| `--patch-rate` | `10` | Namespace patches per second that the watch of one cluster sends. |
 | `--listen` | `:8080` | Address the service listens on. |
 | `--log-level` | `info` | One of `debug`, `info`, `warn`, or `error`. |
 | `--otlp-endpoint` | `$OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint, `host:port` or a URL. Empty turns telemetry off. |
@@ -303,9 +304,11 @@ The service removes a key that one of these lists names once the project of the 
 
 ### Design
 
-The service polls `GET /v3/projects` at every interval. One call per interval returns every project that the service user sees, because Rancher filters that list by RBAC. The cluster set comes from the `clusterId` of those projects, so the service needs no cluster list of its own.
+The service polls `GET /v3/projects` at every interval. One call per interval returns every project that the service user sees, because Rancher filters that list by RBAC. The cluster set comes from the `clusterId` of those projects, so the service needs no cluster list of its own. One run syncs at most 8 clusters at the same time.
 
 The service also keeps one namespace watch per cluster open, on `GET /k8s/clusters/<id>/api/v1/namespaces?watch=true`. Rancher sets the project label about three seconds after the namespace create, so the service acts on an `ADDED` event and on a `MODIFIED` event. A stream that ends starts again, after a backoff that grows from 1 s to 30 s. An expired resource version starts the stream again without one. The periodic reconcile stays the backstop: it catches a missed event, a dropped watch, and every change on the project side.
+
+The watch puts the namespace of an event into the queue of its cluster, by namespace name. One worker per cluster patches the namespaces of that queue, one at a time. A second event of a namespace replaces the first one in the queue, so a storm of events on one namespace gives one patch. The `--patch-rate` flag bounds the patches per second of one cluster, and the burst equals the rate.
 
 A patch of a namespace that no longer exists, or of a namespace in `Terminating`, is not an error. The service skips it, and the next reconcile run repeats the work.
 

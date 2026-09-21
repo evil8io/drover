@@ -12,7 +12,8 @@ import (
 )
 
 const (
-	alphaNewPath = "/k8s/clusters/c-1/api/v1/namespaces/alpha-new"
+	alphaNewPath   = "/k8s/clusters/c-1/api/v1/namespaces/alpha-new"
+	alphaOtherPath = "/k8s/clusters/c-1/api/v1/namespaces/alpha-other"
 
 	// addedEvent and modifiedEvent are the two events of a new namespace.
 	// Rancher sets the project label after the create, so the ADDED event has
@@ -21,6 +22,10 @@ const (
 		`{"name":"alpha-new","resourceVersion":"30","labels":{},"annotations":{}}}}`
 	modifiedEvent = `{"type":"MODIFIED","object":{"kind":"Namespace","metadata":` +
 		`{"name":"alpha-new","resourceVersion":"31",` +
+		`"labels":{"field.cattle.io/projectId":"p-alpha"},"annotations":{}}}}`
+	// otherEvent is the event of a second namespace of project p-alpha.
+	otherEvent = `{"type":"MODIFIED","object":{"kind":"Namespace","metadata":` +
+		`{"name":"alpha-other","resourceVersion":"33",` +
 		`"labels":{"field.cattle.io/projectId":"p-alpha"},"annotations":{}}}}`
 	bookmarkEvent = `{"type":"BOOKMARK","object":{"kind":"Namespace","metadata":{"resourceVersion":"32"}}}`
 	expiredEvent  = `{"type":"ERROR","object":{"kind":"Status","reason":"Expired",` +
@@ -36,10 +41,56 @@ func streamOnce(t *testing.T, options ...func(*fakeRancher)) (*fakeRancher, *syn
 	t.Helper()
 	rancher := newFakeRancher(t, options...)
 	syncer, logs := newSyncer(t, rancher, tokenFile(t, serviceToken))
-	ctx := context.Background()
-	syncer.reconcile(ctx)
-	version, err := syncer.streamNamespaces(ctx, "c-1", "")
+	syncer.reconcile(context.Background())
+	version, err := watchOnce(t, syncer, "c-1")
 	return rancher, logs, version, err
+}
+
+// watchOnce reads the namespace watch of cluster until the stream ends. One
+// worker patches the namespaces of the queue, and watchOnce returns once that
+// queue is empty.
+func watchOnce(t *testing.T, syncer *Syncer, cluster string) (string, error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	watch := newClusterWatch()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		syncer.patchWorker(ctx, cluster, watch)
+	}()
+
+	version, err := syncer.streamNamespaces(ctx, cluster, "", watch.queue)
+	waitForQueue(t, watch.queue)
+	cancel()
+	<-done
+	return version, err
+}
+
+// waitForQueue waits until the queue has no namespace that waits, and no
+// namespace in a patch.
+func waitForQueue(t *testing.T, queue *patchQueue) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !queue.idle() {
+		if time.Now().After(deadline) {
+			t.Fatal("the patch queue has work after 10 s")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// waitForPatch waits until the fake Rancher has one patch of path.
+func waitForPatch(t *testing.T, rancher *fakeRancher, path string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for len(requestsOfPath(rancher, path)) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("no patch of %s after 10 s", path)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func watchRequests(rancher *fakeRancher) []recorded {
@@ -68,6 +119,81 @@ func TestWatchPatchesTheNamespaceOfAnEvent(t *testing.T) {
 	}
 	if got := patches[0].body; got != alphaTwoBody {
 		t.Errorf("patch of %s = %s, want %s", alphaNewPath, got, alphaTwoBody)
+	}
+}
+
+// TestWatchCoalescesAStormOfEventsOfOneNamespace checks that the queue folds
+// the events of one namespace into the entry of that namespace. The patch rate
+// holds the worker back, so the events that arrive during a patch give one
+// patch together.
+func TestWatchCoalescesAStormOfEventsOfOneNamespace(t *testing.T) {
+	t.Parallel()
+	const events = 30
+	rancher := newFakeRancher(t, watching("c-1", slices.Repeat([]string{modifiedEvent}, events)...))
+	syncer, _ := newSyncer(t, rancher, tokenFile(t, serviceToken), func(cfg *Config) {
+		cfg.PatchRate = 5
+	})
+	syncer.reconcile(context.Background())
+
+	if _, err := watchOnce(t, syncer, "c-1"); err != nil {
+		t.Fatalf("stream the namespace watch: %v", err)
+	}
+
+	patches := requestsOfPath(rancher, alphaNewPath)
+	if len(patches) == 0 {
+		t.Fatalf("patch requests of %s = 0, want at least 1", alphaNewPath)
+	}
+	if len(patches) >= events {
+		t.Errorf("patch requests of %s = %d, want fewer than the %d events", alphaNewPath, len(patches), events)
+	}
+}
+
+func TestWatchPatchesEveryNamespaceOfTheQueue(t *testing.T) {
+	t.Parallel()
+	rancher, _, _, err := streamOnce(t, watching("c-1", modifiedEvent, otherEvent))
+	if err != nil {
+		t.Fatalf("stream the namespace watch: %v", err)
+	}
+
+	for _, path := range []string{alphaNewPath, alphaOtherPath} {
+		if got := len(requestsOfPath(rancher, path)); got != 1 {
+			t.Errorf("patch requests of %s = %d, want 1", path, got)
+		}
+	}
+}
+
+// TestStopEndsTheWatcherAndTheWorker checks that stop returns while the worker
+// waits for a patch token. The rate gives one token every two seconds, and the
+// stop has one second.
+func TestStopEndsTheWatcherAndTheWorker(t *testing.T) {
+	t.Parallel()
+	rancher := newFakeRancher(t, watching("c-1", slices.Repeat([]string{modifiedEvent}, 30)...))
+	syncer, _ := newSyncer(t, rancher, tokenFile(t, serviceToken), func(cfg *Config) {
+		cfg.PatchRate = 0.5
+	})
+	ctx := context.Background()
+	syncer.reconcile(ctx)
+
+	watches := syncer.newWatchSet()
+	watches.update(ctx, []string{"c-1"})
+	waitForPatch(t, rancher, alphaNewPath)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		watches.stop()
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stop did not return within one second")
+	}
+
+	watches.mu.Lock()
+	left := len(watches.watchers)
+	watches.mu.Unlock()
+	if left != 0 {
+		t.Errorf("watchers after stop = %d, want 0", left)
 	}
 }
 

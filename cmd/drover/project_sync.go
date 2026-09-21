@@ -29,6 +29,7 @@ type projectSyncConfig struct {
 	nameLabel      string
 	nameAnnotation string
 	interval       time.Duration
+	patchRate      float64
 	logLevel       slog.Level
 	telemetry      telemetry.Config
 }
@@ -66,6 +67,7 @@ func runProjectSync(args []string) int {
 		NameLabel:      cfg.nameLabel,
 		NameAnnotation: cfg.nameAnnotation,
 		Interval:       cfg.interval,
+		PatchRate:      cfg.patchRate,
 		Logger:         logger,
 		Version:        version,
 	})
@@ -93,6 +95,7 @@ func runProjectSync(args []string) int {
 		"listen", cfg.listen,
 		"rancher", cfg.rancherURL.Redacted(),
 		"interval", cfg.interval.String(),
+		"patch_rate", cfg.patchRate,
 		"labels", cfg.labels,
 		"annotations", cfg.annotations,
 		"name_label", cfg.nameLabel,
@@ -149,6 +152,8 @@ func parseProjectSyncConfig(args []string, output io.Writer, getenv func(string)
 	flags.StringVar(&nameAnnotation, "name-annotation", "",
 		"annotation key on the namespace that gets the display name of the project")
 	flags.DurationVar(&cfg.interval, "interval", 60*time.Second, "time between two runs")
+	flags.Float64Var(&cfg.patchRate, "patch-rate", 10,
+		"namespace patches per second that the watch of one cluster sends")
 	flags.StringVar(&logLevel, "log-level", "info", "debug, info, warn or error")
 	tf := registerTelemetryFlags(flags, getenv)
 

@@ -133,7 +133,7 @@ func TestWatchRecordsTheEventAndTheOpenStream(t *testing.T) {
 	})
 	ctx := context.Background()
 	syncer.reconcile(ctx)
-	if _, err := syncer.streamNamespaces(ctx, "c-1", ""); err != nil {
+	if _, err := watchOnce(t, syncer, "c-1"); err != nil {
 		t.Fatalf("stream the namespace watch: %v", err)
 	}
 
