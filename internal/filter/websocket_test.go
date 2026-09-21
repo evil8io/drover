@@ -221,7 +221,9 @@ func newUpgradeHarnessWith(t *testing.T, source io.Reader, allow func(string, ma
 	}
 	registry := newWatchRegistry()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	filterWatchUpgrade(context.Background(), resp, allow, logger, registry, m, "c-1")
+	if _, err := filterWatchUpgrade(context.Background(), resp, allow, logger, registry, m, "c-1"); err != nil {
+		t.Fatalf("filterWatchUpgrade: %v", err)
+	}
 
 	body, ok := resp.Body.(io.ReadWriteCloser)
 	if !ok {
