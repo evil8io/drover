@@ -207,7 +207,7 @@ A CronJob is the normal caller, because most runs find a valid token and exit 0.
 | `--token-key` | `token` | Key of the token inside the Secret. |
 | `--ttl` | `48h` | Lifetime of a new token. Rancher reduces a value above `auth-token-max-ttl-minutes`. |
 | `--renew-before` | `24h` | Remaining lifetime that starts a rotation. The value must be shorter than `--ttl`. |
-| `--keep` | `2` | Number of tokens with the description to keep. The new token counts. |
+| `--keep` | `2` | Number of tokens with the description to keep. The new token counts. The value must be 2 or more, because a pod reads a mounted Secret with a delay after the patch. |
 | `--description` | `drover rotate-token` | Description of the tokens of this command. It also selects the tokens to delete. |
 | `--kube-url` | (in-cluster) | Kubernetes API URL. The default comes from `KUBERNETES_SERVICE_HOST` and `KUBERNETES_SERVICE_PORT`. |
 | `--kube-service-account-dir` | `/var/run/secrets/kubernetes.io/serviceaccount` | Directory with the ServiceAccount token and `ca.crt`. |

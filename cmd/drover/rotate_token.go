@@ -129,7 +129,7 @@ func parseRotateConfig(args []string, output io.Writer, getenv func(string) stri
 	flags.StringVar(&cfg.key, "token-key", "token", "key of the token inside the Secret")
 	flags.DurationVar(&cfg.ttl, "ttl", 48*time.Hour, "lifetime of a new token")
 	flags.DurationVar(&cfg.renewBefore, "renew-before", 24*time.Hour, "remaining lifetime that starts a rotation")
-	flags.IntVar(&cfg.keep, "keep", 2, "number of tokens to keep, the new token included")
+	flags.IntVar(&cfg.keep, "keep", 2, "number of tokens to keep, the new token included, at least 2")
 	flags.StringVar(&cfg.description, "description", "drover rotate-token", "description of the tokens of this command")
 	flags.StringVar(&kubeURL, "kube-url", "", "Kubernetes API URL, default from the in-cluster environment")
 	flags.StringVar(&serviceAccount, "kube-service-account-dir", defaultServiceAccountDir,

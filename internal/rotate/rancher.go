@@ -243,7 +243,10 @@ func (r *rotator) prune(ctx context.Context, created createdToken, s session) (e
 	}
 
 	mine, sessions := r.selectTokens(collection.Data, s)
-	keep := min(len(mine), r.cfg.Keep)
+	// The new token stays, whatever its position in the list. A tie on the
+	// creation time, or an unparsed time, must never delete it.
+	mine = slices.DeleteFunc(mine, func(item tokenItem) bool { return item.itemName() == created.name })
+	keep := min(len(mine), r.cfg.Keep-1)
 	var errs []error
 	deleted := 0
 	for _, item := range slices.Concat(mine[keep:], sessions) {
@@ -259,7 +262,7 @@ func (r *rotator) prune(ctx context.Context, created createdToken, s session) (e
 		outcome, level = outcomeFailed, slog.LevelWarn
 	}
 	r.logger.Log(ctx, level, "deleted the old tokens", "step", stepTokenPrune, "outcome", outcome,
-		"new_token", created.name, "found", len(mine), "kept", keep,
+		"new_token", created.name, "found", len(mine)+1, "kept", keep+1,
 		"sessions", len(sessions), "deleted", deleted, "failed", len(errs))
 	return errors.Join(errs...)
 }

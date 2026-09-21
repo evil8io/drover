@@ -176,8 +176,8 @@ func newRotator(cfg Config) (*rotator, error) {
 	if cfg.RenewBefore <= 0 {
 		return nil, errors.New("the renew window must be longer than zero")
 	}
-	if cfg.Keep < 1 {
-		return nil, errors.New("the keep count must be 1 or more")
+	if cfg.Keep < 2 {
+		return nil, errors.New("the keep count must be 2 or more, because a mounted Secret updates after a delay")
 	}
 
 	r := &rotator{cfg: cfg, logger: cfg.Logger, now: cfg.Now}
