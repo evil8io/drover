@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/evil8io/drover/compare/v0.13.0...v0.14.0) (2026-09-21)
+
+
+### Features
+
+* **rotate-token:** write the password hash of the service user ([#64](https://github.com/evil8io/drover/issues/64)) ([f629972](https://github.com/evil8io/drover/commit/f6299728b5f9d4dbe3b4586d21277080404e20bd))
+
 ## [0.13.0](https://github.com/evil8io/drover/compare/v0.12.1...v0.13.0) (2026-09-21)
 
 
