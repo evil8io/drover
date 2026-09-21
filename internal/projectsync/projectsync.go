@@ -230,6 +230,7 @@ func (s *Syncer) reconcile(ctx context.Context) {
 		s.logger.InfoContext(ctx, "the token file has a token", "path", s.tokenFile)
 	}
 
+	base := ctx
 	ctx, span := s.tracer.Start(ctx, "reconcile")
 	defer span.End()
 	start := time.Now()
@@ -248,7 +249,8 @@ func (s *Syncer) reconcile(ctx context.Context) {
 	run.clusters = len(clusters)
 
 	names := slices.Sorted(maps.Keys(clusters))
-	s.watches.update(ctx, names)
+	// A watcher outlives the run, so it gets the base context, not the span.
+	s.watches.update(base, names)
 	for _, cluster := range names {
 		run.projects += len(clusters[cluster])
 		s.syncCluster(ctx, token, cluster, clusters[cluster], &run)
@@ -463,8 +465,8 @@ func desired(source project, target namespace, labels, annotations []string, nam
 	change := patch{
 		labels:            changes(wantLabels, target.Metadata.Labels),
 		annotations:       changes(wantAnnotations, target.Metadata.Annotations),
-		removeLabels:      removals(wantLabels, target.Metadata.Labels, managedKeys(target, managedLabelsKey)),
-		removeAnnotations: removals(wantAnnotations, target.Metadata.Annotations, managedKeys(target, managedAnnotationsKey)),
+		removeLabels:      removals(wantLabels, target.Metadata.Labels, managedKeys(target, managedLabelsKey, labels, nameLabel)),
+		removeAnnotations: removals(wantAnnotations, target.Metadata.Annotations, managedKeys(target, managedAnnotationsKey, annotations, nameAnnotation)),
 	}
 	change.trackOwned(target, managedLabelsKey, wantLabels)
 	change.trackOwned(target, managedAnnotationsKey, wantAnnotations)
@@ -544,15 +546,20 @@ func (p *patch) trackOwned(target namespace, key string, want map[string]string)
 }
 
 // managedKeys returns the keys that the service owns on the namespace, from
-// the managed annotation at key.
-func managedKeys(target namespace, key string) []string {
+// the managed annotation at key. A tenant can edit that annotation, so only a
+// key that the service can write counts: a key of configured, or nameKey.
+func managedKeys(target namespace, key string, configured []string, nameKey string) []string {
 	value := target.Metadata.Annotations[key]
 	if value == "" {
 		return nil
 	}
 	var keys []string
 	for _, part := range strings.Split(value, ",") {
-		if part = strings.TrimSpace(part); part != "" {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if part == nameKey || slices.Contains(configured, part) {
 			keys = append(keys, part)
 		}
 	}
