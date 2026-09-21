@@ -3,6 +3,7 @@ package projectsync
 import (
 	"net/url"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -30,6 +31,17 @@ func TestParseKeys(t *testing.T) {
 		{name: "a denied key after a valid key", list: "cost-center,kubernetes.io/metadata.name", wantErr: true},
 		{name: "the managed labels annotation", list: managedLabelsKey, wantErr: true},
 		{name: "the managed annotations annotation", list: managedAnnotationsKey, wantErr: true},
+		{name: "a subdomain of kubernetes.io", list: "pod-security.kubernetes.io/enforce", wantErr: true},
+		{name: "a subdomain of cattle.io", list: "management.cattle.io/project", wantErr: true},
+		{name: "a subdomain of k8s.io", list: "topology.k8s.io/zone", wantErr: true},
+		{name: "a domain that only ends in the reserved text", list: "mykubernetes.io/owner",
+			want: []string{"mykubernetes.io/owner"}},
+		{name: "a name with a space", list: "cost center", wantErr: true},
+		{name: "a name that ends in a dash", list: "cost-", wantErr: true},
+		{name: "a name above 63 characters", list: strings.Repeat("a", 64), wantErr: true},
+		{name: "a prefix with a second slash", list: "example.com/team/owner", wantErr: true},
+		{name: "a name with the allowed inner characters", list: "example.com/Owner_1.a-b",
+			want: []string{"example.com/Owner_1.a-b"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

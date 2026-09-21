@@ -144,6 +144,36 @@ func TestReconcileRemovesAManagedKeyThatTheProjectDropped(t *testing.T) {
 	}
 }
 
+func TestDesiredRemovesOnlyAKeyOfTheAllowList(t *testing.T) {
+	t.Parallel()
+
+	// The tenant wrote a record that names keys the service never writes. Only
+	// tier, a key of the allow list, leaves the namespace. The project sets no
+	// key, so both records go too.
+	var target namespace
+	target.Metadata.Name = "alpha-forged"
+	target.Metadata.Labels = map[string]string{
+		"field.cattle.io/projectId":          "p-alpha",
+		"pod-security.kubernetes.io/enforce": "restricted",
+		"tier":                               "gold",
+	}
+	target.Metadata.Annotations = map[string]string{
+		managedLabelsKey:      "field.cattle.io/projectId,pod-security.kubernetes.io/enforce,tier",
+		managedAnnotationsKey: "kubectl.kubernetes.io/last-applied-configuration",
+		"kubectl.kubernetes.io/last-applied-configuration": "{}",
+	}
+	source := project{ID: "c-1:p-alpha", Name: "Alpha"}
+
+	change := desired(source, target, []string{"cost-center", "tier"}, []string{"owner"}, "", "", "")
+
+	if !slices.Equal(change.removeLabels, []string{"tier"}) {
+		t.Errorf("removeLabels = %v, want [tier]", change.removeLabels)
+	}
+	if want := []string{managedAnnotationsKey, managedLabelsKey}; !slices.Equal(change.removeAnnotations, want) {
+		t.Errorf("removeAnnotations = %v, want %v", change.removeAnnotations, want)
+	}
+}
+
 func TestReconcileLeavesANamespaceThatIsInTheWantedState(t *testing.T) {
 	t.Parallel()
 	rancher, _ := reconcileOnce(t)

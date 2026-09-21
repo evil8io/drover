@@ -3,13 +3,22 @@ package projectsync
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 )
 
-// deniedPrefixes are the key prefixes of Rancher and of Kubernetes. The service
-// never writes a key under one of them.
-var deniedPrefixes = []string{"field.cattle.io/", "cattle.io/", "kubernetes.io/", "k8s.io/"}
+// reservedDomains are the key prefixes of Rancher and of Kubernetes. Each
+// covers its subdomains. The service never writes a key under one of them.
+var reservedDomains = []string{"cattle.io", "kubernetes.io", "k8s.io"}
+
+// qualifiedName is the name part of a Kubernetes label or annotation key.
+var qualifiedName = regexp.MustCompile(`^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$`)
+
+const (
+	maxKeyNameLength   = 63
+	maxKeyPrefixLength = 253
+)
 
 const (
 	// managedLabelsKey and managedAnnotationsKey are the annotations that hold
@@ -43,15 +52,25 @@ func checkKey(key string) error {
 	if key == "" {
 		return errors.New("a metadata key is empty")
 	}
-	if strings.HasSuffix(key, "/") {
-		return fmt.Errorf("the metadata key %q has no name after the prefix", key)
-	}
 	if slices.Contains([]string{managedLabelsKey, managedAnnotationsKey}, key) {
 		return fmt.Errorf("the metadata key %q is reserved, because the service writes it itself", key)
 	}
-	for _, prefix := range deniedPrefixes {
-		if strings.HasPrefix(key, prefix) {
-			return fmt.Errorf("the metadata key %q is under %s, and Rancher or Kubernetes owns that prefix", key, prefix)
+	prefix, name, hasPrefix := strings.Cut(key, "/")
+	if !hasPrefix {
+		prefix, name = "", key
+	}
+	if name == "" {
+		return fmt.Errorf("the metadata key %q has no name after the prefix", key)
+	}
+	if len(name) > maxKeyNameLength || !qualifiedName.MatchString(name) {
+		return fmt.Errorf("the metadata key %q has no valid name: at most %d characters, alphanumeric at both ends, with - _ . inside", key, maxKeyNameLength)
+	}
+	if hasPrefix && (prefix == "" || len(prefix) > maxKeyPrefixLength || strings.ContainsAny(prefix, " /")) {
+		return fmt.Errorf("the metadata key %q has no valid prefix", key)
+	}
+	for _, domain := range reservedDomains {
+		if prefix == domain || strings.HasSuffix(prefix, "."+domain) {
+			return fmt.Errorf("the metadata key %q is under %s, and Rancher or Kubernetes owns that domain", key, domain)
 		}
 	}
 	return nil
