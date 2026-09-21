@@ -116,6 +116,7 @@ func setupTraces(ctx context.Context, target string, secure bool, res *resource.
 		return nil, fmt.Errorf("start the trace exporter: %w", err)
 	}
 	return sdktrace.NewTracerProvider(
+		sdktrace.WithSpanProcessor(urlQueryRedactor{}),
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(res),
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),

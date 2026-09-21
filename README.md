@@ -171,6 +171,8 @@ The service continues an incoming `traceparent` on every request. It starts a sp
 
 A span of the service is named after the method and a path template, for example `GET /k8s/clusters/{cluster}/api/v1/pods`, and the server span carries that template as `http.route`. A collector that rebuilds a span name from the semantic conventions reads that attribute and gives the span the method alone without it, so the two names agree. The cluster id, a namespace name and an object name each become a placeholder, because their value set is unbounded. The api group, the version and the resource name stay, because they say what the request asks for and the api surface of a cluster is bounded. Search a trace on `resource.service.name`, which `--service-name` sets, not on the span name.
 
+A client span records `url.full` without its query, because the query of the privileged list names every allowed namespace of the caller.
+
 | Metric | Kind | Unit | Attributes |
 | --- | --- | --- | --- |
 | `drover.filter.requests` | Counter | `1` | `path`, `outcome`, `cluster`, `watch` |
