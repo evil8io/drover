@@ -91,10 +91,21 @@ func (s *Service) collectionTarget(path string) (collectionTarget, bool) {
 // false. A parse with strconv.ParseBool reads an empty value, or yes, as a
 // list, and the API server then answers a stream that the filter never sees.
 func watchRequested(query url.Values) bool {
-	if !query.Has("watch") {
+	return queryBool(query, "watch")
+}
+
+// watchListRequested reports whether the query asks for the initial events of
+// a watch, that is a watch-list.
+func watchListRequested(query url.Values) bool {
+	return queryBool(query, "sendInitialEvents")
+}
+
+// queryBool reads a boolean parameter as the API server does.
+func queryBool(query url.Values, name string) bool {
+	if !query.Has(name) {
 		return false
 	}
-	value := query.Get("watch")
+	value := query.Get(name)
 	return value != "0" && !strings.EqualFold(value, "false")
 }
 
