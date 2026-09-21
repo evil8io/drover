@@ -6,6 +6,9 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 # A run on main waits for the previous run, so the last push sets the main image tag.
 concurrency:
   group: ci-${{ github.ref }}
@@ -23,6 +26,8 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+
+      - run: go mod verify
 
       - run: test -z "$(gofmt -l .)"
 
