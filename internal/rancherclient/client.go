@@ -26,12 +26,14 @@ func Transport(caFile string) (*http.Transport, error) {
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		DisableCompression:  true,
-		ForceAttemptHTTP2:   false,
-		TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{},
-		TLSHandshakeTimeout: 10 * time.Second,
-		IdleConnTimeout:     90 * time.Second,
-		MaxIdleConnsPerHost: 100,
+		DisableCompression:    true,
+		ForceAttemptHTTP2:     false,
+		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{},
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConnsPerHost:   100,
 	}
 	if caFile == "" {
 		return tr, nil
@@ -44,7 +46,7 @@ func Transport(caFile string) (*http.Transport, error) {
 	if !pool.AppendCertsFromPEM(pem) {
 		return nil, fmt.Errorf("the CA file %s has no certificate", caFile)
 	}
-	tr.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	tr.TLSClientConfig.RootCAs = pool
 	return tr, nil
 }
 

@@ -362,12 +362,12 @@ func listUpstreamFull(steve, projects, identity, privileged http.HandlerFunc) ht
 	}
 }
 
-// projectsHandler answers the caller's project ids, in the local cluster.
+// projectsHandler answers the project ids of the caller, in the test cluster c-1.
 func projectsHandler(ids ...string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		items := make([]string, 0, len(ids))
 		for _, id := range ids {
-			items = append(items, fmt.Sprintf(`{"id":"local:%s"}`, id))
+			items = append(items, fmt.Sprintf(`{"id":"c-1:%s"}`, id))
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, fmt.Sprintf(`{"type":"collection","data":[%s]}`, strings.Join(items, ",")))

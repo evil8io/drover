@@ -176,6 +176,66 @@ func TestFilterMetricsHaveNoCallerName(t *testing.T) {
 	}
 }
 
+// TestRequestMetricClusterAttributeUnknownWhenNeverFetched checks that the
+// cluster attribute of drover.filter.requests is unknown for a cluster whose
+// allowed set was never fetched, and the real cluster id once it was.
+func TestRequestMetricClusterAttributeUnknownWhenNeverFetched(t *testing.T) {
+	t.Parallel()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	const bogusPath = "/k8s/clusters/bogus/api/v1/namespaces"
+	h := newHarnessOpt(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == bogusPath {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		listUpstream(steveHandler("a"), namespaceListHandler)(w, r)
+	}, func(cfg *Config) { cfg.MeterProvider = provider })
+
+	resp, _ := h.do(t, h.request(t, http.MethodGet, bogusPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("bogus cluster status = %d, want 401", resp.StatusCode)
+	}
+
+	resp, _ = h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("c-1 status = %d, want 200", resp.StatusCode)
+	}
+
+	var data metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &data); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	sum := findSum(t, data, "drover.filter.requests")
+
+	if got := clusterAttribute(t, sum, outcomeNative); got != "unknown" {
+		t.Errorf("cluster for the never-fetched cluster = %q, want unknown", got)
+	}
+	if got := clusterAttribute(t, sum, outcomeFiltered); got != "c-1" {
+		t.Errorf("cluster for the fetched cluster = %q, want c-1", got)
+	}
+}
+
+// clusterAttribute returns the cluster attribute of the data point of sum
+// whose outcome attribute is outcome.
+func clusterAttribute(t *testing.T, sum metricdata.Sum[int64], outcome string) string {
+	t.Helper()
+	for _, dp := range sum.DataPoints {
+		value, ok := dp.Attributes.Value(attribute.Key("outcome"))
+		if !ok || value.AsString() != outcome {
+			continue
+		}
+		cluster, ok := dp.Attributes.Value(attribute.Key("cluster"))
+		if !ok {
+			t.Fatalf("the data point with outcome %q has no cluster attribute", outcome)
+		}
+		return cluster.AsString()
+	}
+	t.Fatalf("no data point with outcome %q", outcome)
+	return ""
+}
+
 // findSum returns the metricdata.Sum[int64] of the metric named name, from
 // the first scope that has it.
 func findSum(t *testing.T, data metricdata.ResourceMetrics, name string) metricdata.Sum[int64] {

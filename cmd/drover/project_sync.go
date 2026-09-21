@@ -91,7 +91,7 @@ func runProjectSync(args []string) int {
 	logger.Info("start",
 		"version", version,
 		"listen", cfg.listen,
-		"rancher", cfg.rancherURL.String(),
+		"rancher", cfg.rancherURL.Redacted(),
 		"interval", cfg.interval.String(),
 		"labels", cfg.labels,
 		"annotations", cfg.annotations,

@@ -443,3 +443,36 @@ func TestReviewStaysDeniedOnSteveForbidden(t *testing.T) {
 		t.Errorf("body = %q, want the answer of the upstream", body)
 	}
 }
+
+func TestCollectionList(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		spec reviewSpec
+		want bool
+	}{
+		{
+			name: "wildcard resource",
+			spec: reviewSpec{resource: &resourceAttributes{Verb: "list", Resource: "*"}},
+			want: false,
+		},
+		{
+			name: "wildcard group",
+			spec: reviewSpec{resource: &resourceAttributes{Verb: "list", Resource: "pods", Group: "*"}},
+			want: false,
+		},
+		{
+			name: "plain namespaced resource",
+			spec: reviewSpec{resource: &resourceAttributes{Verb: "list", Resource: "pods"}},
+			want: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := collectionList(test.spec); got != test.want {
+				t.Errorf("collectionList(%+v) = %v, want %v", test.spec, got, test.want)
+			}
+		})
+	}
+}

@@ -61,6 +61,7 @@ func eventAllowed(event watchEvent, allow func(name string, labels map[string]st
 // websocket connection, which needs a close frame before the pipe ends.
 type watchStream struct {
 	upgraded bool
+	ended    bool
 	done     chan struct{}
 }
 
@@ -117,6 +118,12 @@ func (r *watchRegistry) len() int {
 func (r *watchRegistry) end(w *io.PipeWriter) {
 	r.mu.Lock()
 	stream, ok := r.streams[w]
+	if ok && stream.ended {
+		ok = false
+	}
+	if ok {
+		stream.ended = true
+	}
 	r.mu.Unlock()
 	if !ok {
 		return
@@ -131,7 +138,7 @@ func (r *watchRegistry) end(w *io.PipeWriter) {
 
 // closeAll ends every registered stream, and returns the count of streams it
 // ends. Each stream ends in its own goroutine, because the close frame of an
-// upgraded stream waits for the reader.
+// upgraded stream waits for the reader, and closeAll waits for all of them.
 func (r *watchRegistry) closeAll() int {
 	r.mu.Lock()
 	writers := make([]*io.PipeWriter, 0, len(r.streams))
@@ -140,9 +147,15 @@ func (r *watchRegistry) closeAll() int {
 	}
 	r.mu.Unlock()
 
+	var group sync.WaitGroup
 	for _, w := range writers {
-		go r.end(w)
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			r.end(w)
+		}()
 	}
+	group.Wait()
 	return len(writers)
 }
 

@@ -77,6 +77,10 @@ func (s *Service) mergedWatch(req *http.Request, target collectionTarget, set al
 	names := set.names
 	result.count = len(names)
 
+	if s.watches.len() >= s.maxWatches {
+		_ = denied.Body.Close()
+		return s.tooManyWatches(req, start, result)
+	}
 	if len(names) > s.fanoutMaxWatchNamespaces {
 		_ = denied.Body.Close()
 		s.metrics.fanoutCapped(ctx, target.cluster)

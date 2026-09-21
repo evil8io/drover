@@ -178,7 +178,10 @@ func collectionList(spec reviewSpec) bool {
 	if attributes.Namespace != "" && attributes.Namespace != "*" {
 		return false
 	}
-	return attributes.Resource != "" && attributes.Name == "" && attributes.Subresource == ""
+	if attributes.Resource == "" || attributes.Resource == "*" || attributes.Group == "*" {
+		return false
+	}
+	return attributes.Name == "" && attributes.Subresource == ""
 }
 
 func jsonReviewSpec(body []byte) (reviewSpec, error) {

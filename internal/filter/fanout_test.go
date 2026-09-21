@@ -1,6 +1,7 @@
 package filter
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 const (
@@ -971,5 +975,110 @@ func TestCollectionMergeTakesTheKindFromDiscoveryWhenNoAnswerHasOne(t *testing.T
 	}
 	if got := list.names(); !slices.Equal(got, []string{"pod-a"}) {
 		t.Errorf("names = %v, want pod-a", got)
+	}
+}
+
+// TestCollectionSkipsAMismatchedKindOfCollection checks that a Table answer
+// of a later namespace does not merge into a List that an earlier namespace
+// started, and that the merge counts the skip.
+func TestCollectionSkipsAMismatchedKindOfCollection(t *testing.T) {
+	t.Parallel()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	h := newHarnessOpt(t, collectionUpstream(
+		steveHandler("a", "b"),
+		namespaceLists(map[string]string{
+			"a": collectionJSON("PodList", "v1", "a", "pod-a", "5"),
+			"b": tableJSON("pod-b", "8"),
+		}),
+	), withFanout, func(cfg *Config) { cfg.MeterProvider = provider })
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, podsPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, body)
+	}
+
+	list := parseList(t, body)
+	if want := []string{"pod-a"}; !slices.Equal(list.names(), want) {
+		t.Errorf("items = %v, want %v, the Table answer must not merge into the List", list.names(), want)
+	}
+	if strings.Contains(string(body), "columnDefinitions") {
+		t.Errorf("body = %s, want no columnDefinitions, the Table answer must be skipped", body)
+	}
+	if !strings.Contains(h.logs.String(), "not the same kind of collection") {
+		t.Errorf("logs have no mismatched-collection line: %s", h.logs.String())
+	}
+
+	var data metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &data); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	sum := findSum(t, data, "drover.filter.fanout.skipped")
+	if len(sum.DataPoints) != 1 || sum.DataPoints[0].Value != 1 {
+		t.Fatalf("fanout skipped data points = %+v, want one point with value 1", sum.DataPoints)
+	}
+}
+
+// TestOpenCollectionOnStatusReturnsErrNotCollection checks that a Status
+// body, which has neither items nor rows, is not a collection.
+func TestOpenCollectionOnStatusReturnsErrNotCollection(t *testing.T) {
+	t.Parallel()
+	body := io.NopCloser(strings.NewReader(`{"kind":"Status","apiVersion":"v1","metadata":{}}`))
+	if _, err := openCollection(body); err != errNotCollection {
+		t.Errorf("openCollection error = %v, want errNotCollection", err)
+	}
+}
+
+// TestCollectionScannerFinishErrorsOnTruncatedBody checks that finish
+// reports an error when the body ends right after the ] of items, before the
+// trailing fields such as metadata.
+func TestCollectionScannerFinishErrorsOnTruncatedBody(t *testing.T) {
+	t.Parallel()
+	body := io.NopCloser(strings.NewReader(`{"kind":"PodList","apiVersion":"v1","items":[{"a":1}]`))
+	scanner, err := openCollection(body)
+	if err != nil {
+		t.Fatalf("openCollection: %v", err)
+	}
+	for {
+		_, ok, err := scanner.next()
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		if !ok {
+			break
+		}
+	}
+	if err := scanner.finish(); err == nil {
+		t.Error("finish = nil, want an error on a truncated body")
+	}
+}
+
+// TestCollectionTruncatedTailLosesResourceVersion checks that a merge keeps
+// the elements of a namespace whose tail is lost, but that the merged
+// resourceVersion is empty, because the merge cannot vouch for a value below
+// that of the lost tail.
+func TestCollectionTruncatedTailLosesResourceVersion(t *testing.T) {
+	t.Parallel()
+	truncated := `{"apiVersion":"v1","items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"pod-b","namespace":"b"}}]`
+	h := newHarnessOpt(t, collectionUpstream(
+		steveHandler("a", "b"),
+		namespaceLists(map[string]string{
+			"a": unstructuredJSON("PodList", "v1", "a", "pod-a", "5"),
+			"b": truncated,
+		}),
+	), withFanout)
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, podsPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, body)
+	}
+
+	list := parseList(t, body)
+	if want := []string{"pod-a", "pod-b"}; !slices.Equal(list.names(), want) {
+		t.Errorf("names = %v, want %v, a lost tail must not drop the elements", list.names(), want)
+	}
+	if list.Metadata.ResourceVersion != "" {
+		t.Errorf("resourceVersion = %q, want empty, because the truncated answer lost its tail", list.Metadata.ResourceVersion)
 	}
 }

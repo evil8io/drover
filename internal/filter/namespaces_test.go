@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -750,6 +751,36 @@ func TestFilterJSONAccept(t *testing.T) {
 			t.Parallel()
 			if got := filterJSONAccept(test.accept); got != test.want {
 				t.Errorf("filterJSONAccept(%q) = %q, want %q", test.accept, got, test.want)
+			}
+		})
+	}
+}
+
+func TestWatchRequested(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		query string
+		want  bool
+	}{
+		{name: "absent", query: "", want: false},
+		{name: "present empty", query: "watch=", want: true},
+		{name: "yes", query: "watch=yes", want: true},
+		{name: "true", query: "watch=true", want: true},
+		{name: "one", query: "watch=1", want: true},
+		{name: "zero", query: "watch=0", want: false},
+		{name: "false", query: "watch=false", want: false},
+		{name: "false uppercase", query: "watch=FALSE", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			query, err := url.ParseQuery(test.query)
+			if err != nil {
+				t.Fatalf("parse query %q: %v", test.query, err)
+			}
+			if got := watchRequested(query); got != test.want {
+				t.Errorf("watchRequested(%q) = %v, want %v", test.query, got, test.want)
 			}
 		})
 	}

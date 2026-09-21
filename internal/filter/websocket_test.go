@@ -19,6 +19,11 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
+// testLogger discards the log lines of a test that reads no log output.
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
 // wsFrame builds one RFC 6455 frame with no mask, like a frame of a server.
 func wsFrame(fin bool, opcode byte, payload []byte) []byte {
 	first := opcode
@@ -497,11 +502,14 @@ func TestDrainEndsUpgradedWatch(t *testing.T) {
 	if got := h.registry.len(); got != 1 {
 		t.Fatalf("registry length = %d, want 1", got)
 	}
+	// closeAll waits for the close frame, so the read runs next to it.
+	frames := make(chan wsTestFrame, 1)
+	go func() { frames <- h.next(t) }()
 	if got := h.registry.closeAll(); got != 1 {
 		t.Errorf("closeAll = %d, want 1", got)
 	}
 
-	frame := h.next(t)
+	frame := <-frames
 	if frame.opcode != opcodeClose || !bytes.Equal(frame.payload, []byte{0x03, 0xe8}) {
 		t.Errorf("frame = %+v, want the close frame with status 1000", frame)
 	}
@@ -532,5 +540,81 @@ func wantRejected(t *testing.T, reader *sdkmetric.ManualReader, want int64) {
 	}
 	if got := sum.DataPoints[0].Value; got != want {
 		t.Errorf("drover.filter.watches.rejected = %d, want %d", got, want)
+	}
+}
+
+// TestUpgradeEndsOnUndecodableTrailingBytes checks that a message with a
+// valid event followed by bytes that are not JSON ends the stream with an
+// error, instead of leaving it open.
+func TestUpgradeEndsOnUndecodableTrailingBytes(t *testing.T) {
+	t.Parallel()
+	message := append(eventLine("a"), []byte("not json\n")...)
+	h := newUpgradeHarness(t, bytes.NewReader(wsStream("", message)), allowNames("a"), testMetrics(t), "")
+
+	if got := h.nextMessage(t, ""); got != string(eventLine("a")) {
+		t.Fatalf("message = %q, want the ADDED event %q", got, eventLine("a"))
+	}
+
+	_, err := h.reader.ReadByte()
+	if err == nil || !strings.Contains(err.Error(), "decode a websocket watch event") {
+		t.Fatalf("read after the malformed tail = %v, want an error that names the decode failure", err)
+	}
+}
+
+// TestFilterWatchUpgradeRejectsReadOnlyBody checks that a body without a
+// Write method, which httputil.ReverseProxy never gives on a real upgrade,
+// fails instead of leaving the caller's stream unfiltered.
+func TestFilterWatchUpgradeRejectsReadOnlyBody(t *testing.T) {
+	t.Parallel()
+	resp := &http.Response{
+		StatusCode: http.StatusSwitchingProtocols,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader("")),
+	}
+	writer, err := filterWatchUpgrade(context.Background(), resp, allowNames(), testLogger(), newWatchRegistry(), testMetrics(t), "c-1")
+	if err == nil {
+		t.Fatal("err = nil, want an error for a read-only body")
+	}
+	if writer != nil {
+		t.Errorf("writer = %v, want nil", writer)
+	}
+}
+
+// TestWatchRegistryEndIsIdempotentForAnUpgradedStream checks that a second
+// end call on the same upgraded stream writes no second close frame.
+func TestWatchRegistryEndIsIdempotentForAnUpgradedStream(t *testing.T) {
+	t.Parallel()
+	reader, writer := io.Pipe()
+	registry := newWatchRegistry()
+	registry.add(writer, true)
+
+	var frames []wsTestFrame
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		br := bufio.NewReader(reader)
+		for {
+			frame, err := readWSFrame(br)
+			if err != nil {
+				return
+			}
+			frames = append(frames, frame)
+		}
+	}()
+
+	registry.end(writer)
+	registry.end(writer)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the reader did not end after end closed the writer")
+	}
+
+	if len(frames) != 1 {
+		t.Fatalf("frames = %d, want 1 close frame", len(frames))
+	}
+	if frames[0].opcode != opcodeClose {
+		t.Errorf("opcode = %#x, want the close opcode %#x", frames[0].opcode, opcodeClose)
 	}
 }

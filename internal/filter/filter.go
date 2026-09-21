@@ -26,8 +26,10 @@ import (
 )
 
 const (
-	defaultCacheTTL = 15 * time.Second
-	serviceName     = "drover"
+	defaultCacheTTL   = 15 * time.Second
+	defaultMaxWatches = 1000
+	bodyReadTimeout   = 10 * time.Second
+	serviceName       = "drover"
 )
 
 // Config configures the handler that New returns.
@@ -62,6 +64,9 @@ type Config struct {
 	// one upstream connection per namespace for its whole life, so its bound
 	// is below the bound of a list.
 	FanoutMaxWatchNamespaces int
+	// MaxWatches is the count of open watch streams of the service above
+	// which a new watch answers 503. Zero selects 1000.
+	MaxWatches int
 	// Logger gets one line for each intercepted request. Nil selects slog.Default.
 	Logger *slog.Logger
 	// MeterProvider creates the meter of the filter metrics. Nil selects
@@ -91,9 +96,11 @@ type Service struct {
 	fanoutMaxNamespaces      int
 	fanoutConcurrency        int
 	fanoutMaxWatchNamespaces int
+	maxWatches               int
 
 	draining atomic.Bool
 	watches  *watchRegistry
+	clusters *clusterSet
 }
 
 // New returns a Service that proxies every request to the upstream. It answers
@@ -135,16 +142,20 @@ func New(cfg Config) (*Service, error) {
 		now = time.Now
 	}
 	ttl := cfg.CacheTTL
-	if ttl == 0 {
+	if ttl <= 0 {
 		ttl = defaultCacheTTL
 	}
 	maxCacheEntries := cfg.MaxCacheEntries
-	if maxCacheEntries == 0 {
+	if maxCacheEntries <= 0 {
 		maxCacheEntries = defaultMaxCacheEntries
 	}
 	fetchRate := cfg.FetchRate
-	if fetchRate == 0 {
+	if fetchRate <= 0 {
 		fetchRate = defaultFetchRate
+	}
+	maxWatches := cfg.MaxWatches
+	if maxWatches <= 0 {
+		maxWatches = defaultMaxWatches
 	}
 	fetchBurst := max(2*fetchRate, 1)
 	fanoutMaxNamespaces := cfg.FanoutMaxNamespaces
@@ -182,15 +193,17 @@ func New(cfg Config) (*Service, error) {
 			otelhttp.WithTracerProvider(tracerProvider),
 			otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string { return spanName(r) }),
 		),
-		cache:   newCache(ttl, maxCacheEntries, now),
-		limiter: newLimiter(fetchRate, fetchBurst, now),
-		metrics: m,
-		watches: newWatchRegistry(),
+		cache:    newCache(ttl, maxCacheEntries, now),
+		limiter:  newLimiter(fetchRate, fetchBurst, now),
+		metrics:  m,
+		watches:  newWatchRegistry(),
+		clusters: newClusterSet(),
 
 		fanoutEnabled:            cfg.Fanout,
 		fanoutMaxNamespaces:      fanoutMaxNamespaces,
 		fanoutConcurrency:        fanoutConcurrency,
 		fanoutMaxWatchNamespaces: fanoutMaxWatchNamespaces,
+		maxWatches:               maxWatches,
 	}
 	svc.proxy = &httputil.ReverseProxy{
 		Rewrite:       svc.rewrite,
@@ -236,6 +249,13 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if r.Method == http.MethodPost {
+		// A review body is small, and a caller that sends it slowly holds a
+		// goroutine. The server resets the deadline before the next request.
+		controller := http.NewResponseController(w)
+		_ = controller.SetReadDeadline(time.Now().Add(bodyReadTimeout))
+		defer func() { _ = controller.SetReadDeadline(time.Time{}) }()
+	}
 	s.proxy.ServeHTTP(w, r)
 }
 
@@ -260,8 +280,9 @@ func writePlain(w http.ResponseWriter, code int, body string) {
 
 // StartDrain marks the service as draining, so /readyz answers 503 from this
 // point on, and it ends every open watch stream with a plain EOF. It returns
-// the count of streams it ends. A caller runs this once, before
-// http.Server.Shutdown.
+// the count of streams it ends, once each of them has its close frame. A
+// caller runs this once, before http.Server.Shutdown, because Shutdown does
+// not wait for an upgraded connection.
 func (s *Service) StartDrain() int {
 	s.draining.Store(true)
 	return s.watches.closeAll()
@@ -293,5 +314,5 @@ func (s *Service) handleError(w http.ResponseWriter, r *http.Request, err error)
 		level = slog.LevelDebug
 	}
 	s.logger.Log(r.Context(), level, "proxy error", "method", r.Method, "path", r.URL.Path, "error", err.Error())
-	writeStatus(w, http.StatusBadGateway, reasonInternalError, serviceName+": "+err.Error())
+	writeStatus(w, http.StatusBadGateway, reasonInternalError, serviceName+": "+publicMessage(err))
 }

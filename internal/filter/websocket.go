@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -77,16 +78,15 @@ func (u *upgradedWatch) Close() error {
 // project change can end the stream. It raises drover.filter.watches.open
 // while the stream is open.
 //
-// The body stays unchanged, and the return is nil, when the body is not an
-// io.ReadWriteCloser, because httputil.ReverseProxy needs that interface for
-// an upgraded connection. The stream ends at once, with a close frame and no
-// event, when the answer names a websocket extension.
-func filterWatchUpgrade(ctx context.Context, resp *http.Response, allow func(name string, labels map[string]string) bool, logger *slog.Logger, registry *watchRegistry, metrics *metrics, cluster string) *io.PipeWriter {
+// It returns an error when the body is not an io.ReadWriteCloser, because
+// httputil.ReverseProxy needs that interface for an upgraded connection, and
+// the stream is privileged, so it must not pass without the filter. The
+// stream ends at once, with a close frame and no event, when the answer names
+// a websocket extension.
+func filterWatchUpgrade(ctx context.Context, resp *http.Response, allow func(name string, labels map[string]string) bool, logger *slog.Logger, registry *watchRegistry, metrics *metrics, cluster string) (*io.PipeWriter, error) {
 	upstream, ok := resp.Body.(io.ReadWriteCloser)
 	if !ok {
-		logger.ErrorContext(ctx, "the upgraded watch gets no filter, because its body is read-only",
-			"cluster", cluster, "body_type", fmt.Sprintf("%T", resp.Body))
-		return nil
+		return nil, fmt.Errorf("the upgraded watch has a read-only body of type %T", resp.Body)
 	}
 
 	subprotocol := resp.Header.Get("Sec-WebSocket-Protocol")
@@ -113,7 +113,7 @@ func filterWatchUpgrade(ctx context.Context, resp *http.Response, allow func(nam
 			defer end()
 			registry.end(writer)
 		}()
-		return nil
+		return nil, nil
 	}
 
 	filter := &frameFilter{
@@ -132,7 +132,7 @@ func filterWatchUpgrade(ctx context.Context, resp *http.Response, allow func(nam
 		_ = writer.CloseWithError(filter.run())
 	}()
 
-	return writer
+	return writer, nil
 }
 
 // frameFilter reads the RFC 6455 frames of a namespace watch, and writes the
@@ -235,14 +235,18 @@ func (f *frameFilter) consume(message []byte) error {
 
 // drain takes every complete JSON value from the stream buffer, and keeps the
 // bytes that the decoder does not consume. Those bytes are the head of the
-// next event, and the next message completes them.
+// next event, and the next message completes them. A value that is not JSON
+// ends the stream, as it does on the chunked path.
 func (f *frameFilter) drain() error {
 	decoder := json.NewDecoder(bytes.NewReader(f.buffer))
 	var consumed int64
 	for {
 		var raw json.RawMessage
 		if err := decoder.Decode(&raw); err != nil {
-			break
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				break
+			}
+			return fmt.Errorf("decode a websocket watch event: %w", err)
 		}
 		consumed = decoder.InputOffset()
 		if err := f.emit(raw); err != nil {
