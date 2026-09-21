@@ -158,6 +158,42 @@ func TestRunPrunesOldTokens(t *testing.T) {
 	h.assertNoSecret(t)
 }
 
+func TestRunPruneKeepsTheNewTokenOnATie(t *testing.T) {
+	t.Parallel()
+	rancher := newFakeRancher(t)
+	// Two tokens with the same creation second as the new token, and names
+	// that sort before it. The new token stays, and only one of them stays.
+	rancher.addToken("token-aaa", testDescription, 0, 48*time.Hour, true)
+	rancher.addToken("token-bbb", testDescription, 0, 48*time.Hour, true)
+	rancher.addToken("token-old", testDescription, 40*time.Hour, 48*time.Hour, true)
+
+	kube := newFakeKube(t, nil)
+	h := newHarness(t, kube, rancher)
+	h.cfg.Keep = 2
+
+	if err := h.run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	created, _, _ := strings.Cut(kube.value(testKey), ":")
+	want := []string{created, "token-aaa"}
+	slices.Sort(want)
+	assertRoutes(t, rancher.names(), want)
+	h.assertLog(t, `"step":"token_prune"`, `"kept":2`, `"deleted":2`)
+}
+
+func TestNewRejectsAKeepCountBelowTwo(t *testing.T) {
+	t.Parallel()
+	rancher := newFakeRancher(t)
+	kube := newFakeKube(t, nil)
+	h := newHarness(t, kube, rancher)
+	h.cfg.Keep = 1
+
+	if err := h.run(); err == nil || !strings.Contains(err.Error(), "keep count") {
+		t.Fatalf("Run with keep 1 = %v, want a keep count error", err)
+	}
+}
+
 func TestRunLoginFailure(t *testing.T) {
 	t.Parallel()
 	rancher := newFakeRancher(t)
