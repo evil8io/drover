@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.12.1](https://github.com/evil8io/drover/compare/v0.12.0...v0.12.1) (2026-09-21)
+
+
+### Bug Fixes
+
+* **api-filter:** close the findings of a security and reliability review ([#57](https://github.com/evil8io/drover/issues/57)) ([06834f9](https://github.com/evil8io/drover/commit/06834f98d2eed274ba0193e9df67acfdd50e2483))
+* **project-sync:** remove only a key of the allow list ([#53](https://github.com/evil8io/drover/issues/53)) ([8d9b3fa](https://github.com/evil8io/drover/commit/8d9b3fa0c8ee07c88b564654c3e9261d5da00cd1))
+* **rotate-token:** keep the new token whatever its position in the list ([#54](https://github.com/evil8io/drover/issues/54)) ([4bc64e9](https://github.com/evil8io/drover/commit/4bc64e90328d0f63f01ea48c8d96f0a2f61b47bf))
+
 ## [0.12.0](https://github.com/evil8io/drover/compare/v0.11.1...v0.12.0) (2026-09-20)
 
 
