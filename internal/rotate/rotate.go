@@ -26,13 +26,14 @@ import (
 const (
 	maxBody = 1 << 20
 
-	stepSecretGet   = "secret_get"
-	stepTokenCheck  = "token_check"
-	stepLogin       = "login"
-	stepTokenCreate = "token_create"
-	stepSecretPatch = "secret_patch"
-	stepTokenPrune  = "token_prune"
-	stepLogout      = "logout"
+	stepPasswordSync = "password_sync"
+	stepSecretGet    = "secret_get"
+	stepTokenCheck   = "token_check"
+	stepLogin        = "login"
+	stepTokenCreate  = "token_create"
+	stepSecretPatch  = "secret_patch"
+	stepTokenPrune   = "token_prune"
+	stepLogout       = "logout"
 
 	outcomeOK      = "ok"
 	outcomeValid   = "valid"
@@ -62,6 +63,12 @@ type Config struct {
 	// Username and Password are the credentials of the Rancher service user.
 	Username string
 	Password string
+	// PasswordNamespace and PasswordSecret name the Secret that Rancher reads
+	// for the password of the service user. Both empty turn the password step
+	// off. With both set, a run writes the hash of Password into that Secret,
+	// before it reads the token Secret.
+	PasswordNamespace string
+	PasswordSecret    string
 	// TTL is the lifetime of a new token. Rancher reduces a TTL above its own maximum.
 	TTL time.Duration
 	// RenewBefore is the remaining lifetime that starts a rotation.
@@ -123,6 +130,11 @@ func (r *rotator) run(ctx context.Context) error {
 // check reads the token in the Secret, and renews it when the token is not
 // valid. It returns nil when the token in the Secret is still valid.
 func (r *rotator) check(ctx context.Context) error {
+	if r.cfg.PasswordSecret != "" {
+		if err := r.syncPassword(ctx); err != nil {
+			return err
+		}
+	}
 	current, err := r.secretToken(ctx)
 	if err != nil {
 		return err
@@ -178,6 +190,9 @@ func newRotator(cfg Config) (*rotator, error) {
 	}
 	if cfg.Keep < 2 {
 		return nil, errors.New("the keep count must be 2 or more, because a mounted Secret updates after a delay")
+	}
+	if (cfg.PasswordNamespace == "") != (cfg.PasswordSecret == "") {
+		return nil, errors.New("the password Secret needs both a namespace and a name")
 	}
 
 	r := &rotator{cfg: cfg, logger: cfg.Logger, now: cfg.Now}

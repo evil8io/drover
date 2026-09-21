@@ -218,7 +218,7 @@ func TestRunLoginFailure(t *testing.T) {
 func TestRunMissingSecret(t *testing.T) {
 	t.Parallel()
 	kube := newFakeKube(t, nil)
-	kube.missing = true
+	kube.token.missing = true
 	rancher := newFakeRancher(t)
 	h := newHarness(t, kube, rancher)
 
