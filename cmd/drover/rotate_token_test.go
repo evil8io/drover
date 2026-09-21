@@ -174,6 +174,33 @@ func TestParseRotateConfigInCluster(t *testing.T) {
 	}
 }
 
+func TestParseRotateConfigInsecureSkipVerify(t *testing.T) {
+	t.Parallel()
+	credentials := credentialsDir(t, map[string]string{"username": "drover\n", "password": "secret\n"})
+	base := []string{
+		"--rancher-url", "https://rancher.example.com",
+		"--credentials-dir", credentials,
+		"--token-secret", "cattle-system/drover-token",
+		"--kube-url", "https://kubernetes.default.svc",
+	}
+
+	cfg, err := parseRotateConfig(base, io.Discard, noEnvironment)
+	if err != nil {
+		t.Fatalf("parseRotateConfig: %v", err)
+	}
+	if cfg.rancherInsecureSkipVerify {
+		t.Error("insecure skip verify = true, want false")
+	}
+
+	cfg, err = parseRotateConfig(append(append([]string{}, base...), "--rancher-insecure-skip-verify"), io.Discard, noEnvironment)
+	if err != nil {
+		t.Fatalf("parseRotateConfig: %v", err)
+	}
+	if !cfg.rancherInsecureSkipVerify {
+		t.Error("insecure skip verify = false, want true")
+	}
+}
+
 func TestParseRotateConfigTelemetryDefaults(t *testing.T) {
 	t.Parallel()
 	credentials := credentialsDir(t, map[string]string{"username": "drover\n", "password": "secret\n"})

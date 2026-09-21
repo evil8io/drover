@@ -99,7 +99,7 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 		return nil, s.listError(req, start, result, err)
 	}
 	if filtered.StatusCode == http.StatusForbidden {
-		s.logger.WarnContext(req.Context(), "the service token has no cluster-owner binding", "cluster", cluster)
+		s.logger.WarnContext(req.Context(), "the service token may not list namespaces", "cluster", cluster)
 	}
 	// A watch answer has the events in a chunked body, or in the websocket
 	// frames of an upgraded connection. An error status has no events.

@@ -83,7 +83,7 @@ With `--fanout` on, the service also answers a cluster-wide watch, for example `
 
 ### Requirements
 
-1. A Rancher service user with a `cluster-owner` binding on every cluster whose tenants use the filter.
+1. A Rancher service user with `list` and `watch` on `namespaces` in every cluster whose tenants use the filter. A `cluster-owner` binding also covers that.
 2. An API token of that service user. The token has no scope.
 3. The token in a Secret, mounted into the service.
 4. Route rules on the Rancher hostname for these requests:
@@ -107,6 +107,7 @@ With these routes, the service becomes the data path for most reads of a tenant.
 | `--listen` | `:8080` | Address the service listens on. |
 | `--upstream` | (required) | URL of Rancher. Use `http://` or `https://`. The path must be empty or `/`. |
 | `--upstream-ca-file` | | PEM bundle that verifies an `https` upstream. |
+| `--upstream-insecure-skip-verify` | `false` | Skip the certificate verification of an `https` upstream. |
 | `--token-file` | (required) | File with the API token of the Rancher service user. |
 | `--cache-ttl` | `15s` | Lifetime of a cached allowed set. |
 | `--max-cache-entries` | `1000` | Hard bound on the cached allowed sets. |
@@ -122,6 +123,8 @@ With these routes, the service becomes the data path for most reads of a tenant.
 | `--otlp-traces` | `true` | Send traces to the OTLP endpoint. |
 | `--otlp-metrics` | `true` | Send metrics to the OTLP endpoint. |
 | `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | `service.name` resource attribute. |
+
+`--upstream-insecure-skip-verify` is for an upstream inside the cluster whose certificate comes from a private CA that the deployment does not copy. A network policy must then limit the path to Rancher.
 
 The upstream is the Rancher Service inside the cluster, for example `http://rancher.cattle-system.svc`. The public hostname is not a valid upstream, because the route sends the filtered paths back to the service.
 
@@ -146,7 +149,7 @@ A Helm chart for drover is published separately.
 | Empty answer | A cluster-wide list of a namespaced kind gets an empty collection, not Forbidden, when the caller may see no object of that kind. |
 | Self-check | `kubectl auth can-i list namespaces` returns yes when the caller has at least one allowed namespace, while RBAC returns no. With `--fanout` on, the same applies to `list` and `watch` on any named resource, cluster-wide, also a cluster-scoped one, whose list then keeps its 403 error. |
 | Fetch rate | A fetch of an allowed set past `--fetch-rate` waits up to 5 s for a free token, then gets a 429 Status. |
-| Trust level | The service is a privileged component. It uses the cluster-owner token for the filtered namespace list and for the watch stream. |
+| Trust level | The service is a privileged component. It uses the service token for the filtered namespace list and for the watch stream. |
 | Project scope | A project selector has the projects of the requested cluster only. The project part of a Rancher project id is unique inside one cluster, and the namespace label has that part alone. |
 
 ### Logging
@@ -161,7 +164,7 @@ Both log lines have the field `user`, the caller's Rancher user id from a SelfSu
 
 The service never logs a token, a cookie, a header value, or a request body. It logs a namespace name at the `debug` level only.
 
-The service writes a `warn` line when the privileged list request gets a 403 error. The cause is a `cluster-owner` binding that the service user does not have.
+The service writes a `warn` line when the privileged list request gets a 403 error. The cause is a namespace list permission that the service user does not have.
 
 A log line has `trace_id` and `span_id` when the request has a span.
 
@@ -211,6 +214,7 @@ A CronJob is the normal caller, because most runs find a valid token and exit 0.
 | --- | --- | --- |
 | `--rancher-url` | (required) | URL of Rancher. Use `http://` or `https://`. The path must be empty or `/`. |
 | `--rancher-ca-file` | | PEM bundle that verifies an `https` Rancher URL. |
+| `--rancher-insecure-skip-verify` | `false` | Skip the certificate verification of an `https` Rancher URL. |
 | `--credentials-dir` | (required) | Directory with the files `username` and `password` of the service user. |
 | `--token-secret` | (required) | `namespace/name` of the Secret with the API token. |
 | `--token-key` | `token` | Key of the token inside the Secret. |
@@ -259,13 +263,13 @@ With `--otlp-endpoint` set, one run produces a span named `rotate`, with a child
 
 ## project-sync
 
-This service copies labels and annotations of a Rancher project to every namespace of that project, because Rancher does not copy them. The `--labels` and `--annotations` flags are the allow list of keys. The value of the project wins, and the service overwrites a different value on the namespace. The service polls Rancher at every `--interval`, and it also keeps one namespace watch per cluster open, so that a new namespace gets its keys within a few seconds. One replica is enough, because every run is a full reconcile. A namespace list that returns status 403 means that the service user has no `cluster-owner` binding on that cluster.
+This service copies labels and annotations of a Rancher project to every namespace of that project, because Rancher does not copy them. The `--labels` and `--annotations` flags are the allow list of keys. The value of the project wins, and the service overwrites a different value on the namespace. The service polls Rancher at every `--interval`, and it also keeps one namespace watch per cluster open, so that a new namespace gets its keys within a few seconds. One replica is enough, because every run is a full reconcile. A namespace list that returns status 403 means that the service user may not list namespaces on that cluster.
 
 The service writes a warning with the cluster id and continues with the next cluster.
 
 ### Requirements
 
-1. A Rancher service user with a `cluster-owner` binding on every cluster whose namespaces the service syncs.
+1. A Rancher service user with `get`, `list`, `watch`, and `patch` on `namespaces`, and with `get`, `list`, and `watch` on `projects` of `management.cattle.io`, in every cluster whose namespaces the service syncs. A `cluster-owner` binding also covers that.
 2. An API token of that service user, in a Secret that the service mounts.
 
 ### Configuration
@@ -274,6 +278,7 @@ The service writes a warning with the cluster id and continues with the next clu
 | --- | --- | --- |
 | `--rancher-url` | (required) | URL of Rancher. Use `http://` or `https://`. The path must be empty or `/`. |
 | `--rancher-ca-file` | | PEM bundle that verifies an `https` URL. |
+| `--rancher-insecure-skip-verify` | `false` | Skip the certificate verification of an `https` Rancher URL. |
 | `--token-file` | (required) | File with the API token of the Rancher service user. |
 | `--labels` | | Comma-separated label keys of a project to copy. |
 | `--annotations` | | Comma-separated annotation keys of a project to copy. |

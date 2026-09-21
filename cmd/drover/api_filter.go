@@ -24,21 +24,22 @@ import (
 const telemetryShutdownGrace = 5 * time.Second
 
 type config struct {
-	listen           string
-	upstream         *url.URL
-	caFile           string
-	tokenFile        string
-	cacheTTL         time.Duration
-	maxCacheEntries  int
-	fetchRate        float64
-	fanout           bool
-	fanoutMaxNS      int
-	fanoutWorkers    int
-	fanoutWatchMaxNS int
-	maxWatches       int
-	logLevel         slog.Level
-	shutdownGrace    time.Duration
-	telemetry        telemetry.Config
+	listen             string
+	upstream           *url.URL
+	caFile             string
+	insecureSkipVerify bool
+	tokenFile          string
+	cacheTTL           time.Duration
+	maxCacheEntries    int
+	fetchRate          float64
+	fanout             bool
+	fanoutMaxNS        int
+	fanoutWorkers      int
+	fanoutWatchMaxNS   int
+	maxWatches         int
+	logLevel           slog.Level
+	shutdownGrace      time.Duration
+	telemetry          telemetry.Config
 }
 
 func runAPIFilter(args []string) int {
@@ -53,6 +54,9 @@ func runAPIFilter(args []string) int {
 	logger := slog.New(telemetry.NewLogHandler(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.logLevel})))
 	if !tokenFileReady(cfg.tokenFile) {
 		logger.Warn("the token file is not available yet", "path", cfg.tokenFile)
+	}
+	if cfg.insecureSkipVerify {
+		logger.Warn("the certificate of Rancher is not verified")
 	}
 
 	tel, err := telemetry.Setup(context.Background(), cfg.telemetry)
@@ -69,12 +73,13 @@ func runAPIFilter(args []string) int {
 	}()
 
 	svc, err := filter.New(filter.Config{
-		Upstream:        cfg.upstream,
-		CAFile:          cfg.caFile,
-		TokenFile:       cfg.tokenFile,
-		CacheTTL:        cfg.cacheTTL,
-		MaxCacheEntries: cfg.maxCacheEntries,
-		FetchRate:       cfg.fetchRate,
+		Upstream:           cfg.upstream,
+		CAFile:             cfg.caFile,
+		InsecureSkipVerify: cfg.insecureSkipVerify,
+		TokenFile:          cfg.tokenFile,
+		CacheTTL:           cfg.cacheTTL,
+		MaxCacheEntries:    cfg.maxCacheEntries,
+		FetchRate:          cfg.fetchRate,
 
 		Fanout:                   cfg.fanout,
 		FanoutMaxNamespaces:      cfg.fanoutMaxNS,
@@ -111,6 +116,7 @@ func runAPIFilter(args []string) int {
 		"version", version,
 		"listen", cfg.listen,
 		"upstream", cfg.upstream.Redacted(),
+		"insecure_skip_verify", cfg.insecureSkipVerify,
 		"cache_ttl", cfg.cacheTTL.String(),
 		"max_cache_entries", cfg.maxCacheEntries,
 		"fetch_rate", cfg.fetchRate,
@@ -156,6 +162,7 @@ func parseConfig(args []string, output io.Writer, getenv func(string) string) (c
 	flags.StringVar(&cfg.listen, "listen", ":8080", "listen address")
 	flags.StringVar(&upstream, "upstream", "", "Rancher URL, http:// or https://")
 	flags.StringVar(&cfg.caFile, "upstream-ca-file", "", "PEM bundle that verifies an https upstream")
+	flags.BoolVar(&cfg.insecureSkipVerify, "upstream-insecure-skip-verify", false, "skip the certificate verification of an https upstream")
 	flags.StringVar(&cfg.tokenFile, "token-file", "", "file with the API token of the service user")
 	flags.DurationVar(&cfg.cacheTTL, "cache-ttl", 15*time.Second, "lifetime of a cached allowed set")
 	flags.IntVar(&cfg.maxCacheEntries, "max-cache-entries", 1000, "hard bound on the cached allowed sets")
