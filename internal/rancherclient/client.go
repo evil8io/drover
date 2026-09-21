@@ -19,8 +19,9 @@ import (
 )
 
 // Transport returns the transport of a Rancher client. An empty caFile selects
-// the system certificate pool.
-func Transport(caFile string) (*http.Transport, error) {
+// the system certificate pool. insecureSkipVerify skips the certificate
+// verification of an https upstream.
+func Transport(caFile string, insecureSkipVerify bool) (*http.Transport, error) {
 	tr := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
@@ -34,6 +35,9 @@ func Transport(caFile string) (*http.Transport, error) {
 		ResponseHeaderTimeout: 30 * time.Second,
 		IdleConnTimeout:       90 * time.Second,
 		MaxIdleConnsPerHost:   100,
+	}
+	if insecureSkipVerify {
+		tr.TLSClientConfig.InsecureSkipVerify = true
 	}
 	if caFile == "" {
 		return tr, nil

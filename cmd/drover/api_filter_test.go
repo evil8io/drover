@@ -138,6 +138,34 @@ func TestParseConfigValid(t *testing.T) {
 	}
 }
 
+func TestParseConfigInsecureSkipVerify(t *testing.T) {
+	t.Parallel()
+	token := tokenFile(t, "token\n")
+
+	cfg, err := parseConfig([]string{
+		"--upstream", "https://rancher.example.com",
+		"--token-file", token,
+	}, io.Discard, noEnvironment)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if cfg.insecureSkipVerify {
+		t.Error("insecure skip verify = true, want false")
+	}
+
+	cfg, err = parseConfig([]string{
+		"--upstream", "https://rancher.example.com",
+		"--token-file", token,
+		"--upstream-insecure-skip-verify",
+	}, io.Discard, noEnvironment)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if !cfg.insecureSkipVerify {
+		t.Error("insecure skip verify = false, want true")
+	}
+}
+
 func TestParseConfigShutdownGraceDefault(t *testing.T) {
 	t.Parallel()
 	token := tokenFile(t, "token\n")

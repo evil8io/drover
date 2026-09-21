@@ -26,22 +26,23 @@ const (
 )
 
 type rotateConfig struct {
-	rancher       *url.URL
-	rancherCAFile string
-	kube          *url.URL
-	kubeTokenFile string
-	kubeCAFile    string
-	namespace     string
-	secret        string
-	key           string
-	username      string
-	password      string
-	ttl           time.Duration
-	renewBefore   time.Duration
-	keep          int
-	description   string
-	logLevel      slog.Level
-	telemetry     telemetry.Config
+	rancher                   *url.URL
+	rancherCAFile             string
+	rancherInsecureSkipVerify bool
+	kube                      *url.URL
+	kubeTokenFile             string
+	kubeCAFile                string
+	namespace                 string
+	secret                    string
+	key                       string
+	username                  string
+	password                  string
+	ttl                       time.Duration
+	renewBefore               time.Duration
+	keep                      int
+	description               string
+	logLevel                  slog.Level
+	telemetry                 telemetry.Config
 }
 
 func runRotateToken(args []string) int {
@@ -54,6 +55,9 @@ func runRotateToken(args []string) int {
 	}
 
 	logger := slog.New(telemetry.NewLogHandler(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.logLevel})))
+	if cfg.rancherInsecureSkipVerify {
+		logger.Warn("the certificate of Rancher is not verified")
+	}
 
 	tel, err := telemetry.Setup(context.Background(), cfg.telemetry)
 	if err != nil {
@@ -68,12 +72,12 @@ func runRotateToken(args []string) int {
 		}
 	}()
 
-	rancherClient, err := rotate.NewClient(cfg.rancherCAFile)
+	rancherClient, err := rotate.NewClient(cfg.rancherCAFile, cfg.rancherInsecureSkipVerify)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
-	kubeClient, err := rotate.NewClient(cfg.kubeCAFile)
+	kubeClient, err := rotate.NewClient(cfg.kubeCAFile, false)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
@@ -124,6 +128,7 @@ func parseRotateConfig(args []string, output io.Writer, getenv func(string) stri
 	)
 	flags.StringVar(&rancherURL, "rancher-url", "", "Rancher URL, http:// or https://")
 	flags.StringVar(&cfg.rancherCAFile, "rancher-ca-file", "", "PEM bundle that verifies an https Rancher URL")
+	flags.BoolVar(&cfg.rancherInsecureSkipVerify, "rancher-insecure-skip-verify", false, "skip the certificate verification of an https Rancher URL")
 	flags.StringVar(&credentialsDir, "credentials-dir", "", "directory with the files username and password")
 	flags.StringVar(&tokenSecret, "token-secret", "", "namespace/name of the Secret with the API token")
 	flags.StringVar(&cfg.key, "token-key", "token", "key of the token inside the Secret")
