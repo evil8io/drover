@@ -39,21 +39,19 @@ A Gateway serves the Rancher hostname. A Kyverno `GeneratingPolicy` from the cha
 
 ## Requirements
 
-The chart installs into the cluster that runs Rancher. The table names what drover needs, and whether the chart installs it.
+The chart installs into the cluster that runs Rancher. The table names what drover depends on, why, and whether the chart installs it.
 
-| Requirement | Installed by the chart | Note |
+| Dependency | Reason | Installed by the chart |
 | --- | --- | --- |
-| Kubernetes 1.27 or later | No | The `kubeVersion` of the chart. |
-| Rancher | No | The `rancher.url` value names the Rancher Service in the cluster. |
-| Gateway API, with a `Gateway` that serves the Rancher hostname | No | The `httpRoute.parentRefs` value names the Gateway. |
-| Kyverno, with the `GeneratingPolicy` kind of `policies.kyverno.io/v1` | No | Kyverno generates the routes. |
-| external-secrets, with the `Password` generator | No | The generator makes the password of the service user. |
-| A `ReferenceGrant` in the Rancher namespace | No | Only with the fan-out on, when the Rancher Service is in another namespace than the release. |
-| An OTLP gRPC endpoint for traces and metrics | No | Optional. An empty `otlp.endpoint` value turns telemetry off. |
-| The Rancher service user, its `RoleTemplate`, its `GlobalRole`, and its bindings | Yes | Two Helm hook Jobs write and delete the Rancher roles and bindings. |
-| The credentials Secret and the token Secret of the service user | Yes | The chart ships the `ExternalSecret` for the password and the token Secret without data. |
-| The `GeneratingPolicy`, and one `HTTPRoute` per Rancher cluster | Yes | The chart ships the policy, and Kyverno generates the routes. |
-| The Deployments, the CronJob, the ServiceAccounts, the RBAC objects, and the PodDisruptionBudget | Yes | |
+| Kubernetes 1.27 or later | The `kubeVersion` of the chart. | No |
+| Rancher | The API that drover extends. The `rancher.url` value names the Rancher Service in the cluster. | No |
+| Gateway API, with a `Gateway` on the Rancher hostname | The generated routes attach to that Gateway, which `httpRoute.parentRefs` names, and they send the filtered paths to the API filter. | No |
+| Kyverno, with `policies.kyverno.io/v1` | Generates one `HTTPRoute` per Rancher cluster from the `GeneratingPolicy` of the chart. | No |
+| external-secrets, with the `Password` generator | Generates the password of the service user, and renews it at `serviceUser.password.refreshInterval`. | No |
+| A `ReferenceGrant` in the Rancher namespace | Lets the fan-out route send the namespaced reads to the Rancher Service in another namespace. Needed with the fan-out on only. | No |
+| An OTLP gRPC endpoint | Receives the traces and the metrics. Optional. | No |
+| The Rancher service user, with its `RoleTemplate`, its `GlobalRole`, and its bindings | Every component authenticates as that user. | Yes, through two Helm hook Jobs |
+| The credentials Secret and the token Secret of the service user | The password and the API token of that user. The token rotation writes the token. | Yes |
 
 The current release is tested against Rancher 2.14, Gateway API 1.6, Kyverno 1.19, and external-secrets 2.10.
 
