@@ -6,6 +6,7 @@ Human doc: `docs/api-filter.md`. Update it with a behaviour change.
 
 - The retry logic is an `http.RoundTripper` under `httputil.ReverseProxy`, with `FlushInterval` -1 and HTTP/1.1 only to the upstream, because a websocket upgrade needs HTTP/1.1. Keep `ForceAttemptHTTP2` off and `TLSNextProto` empty in `internal/rancherclient`.
 - The upstream is the in-cluster Rancher Service, never the public hostname, because the route sends the filtered paths back to the filter.
+- Strip `Accept-Encoding` from a request whose answer the filter parses, because the filter reads the upstream body as plain JSON.
 - `steveTimeout` in `steve.go` is 30 s. A tenant read that hangs 30 s and returns 502 with `allowed set request failed: context deadline exceeded` means that Rancher is down or cold, for example after an OOMKill while its Steve cache fills. It does not mean that the fan-out is slow. Check the Rancher pods first, then `duration_ms` per outcome.
 
 ## Allowed set
@@ -13,6 +14,7 @@ Human doc: `docs/api-filter.md`. Update it with a behaviour change.
 - Steve (`/k8s/clusters/<id>/v1/namespaces`) returns the RBAC-filtered list in its own shape, without `labelSelector` and without watch. It is the source of the allowed set only.
 - The cache key is the cluster plus the credential that Rancher reads: the `Authorization` header, else the `R_SESS` cookie. Another cookie must not enter the key.
 - The caller name comes from `POST .../selfsubjectreviews` with the caller credentials, cached in `allowedSet.user`, and it fails open. Put it in a log line and a span only, never in a metric attribute, because the value set is unbounded.
+- Rancher accepts a ServiceAccount JWT on `/k8s/clusters/<id>/` only, per cluster, behind a `ClusterProxyConfig` with `enabled: true` (Rancher 2.9.0 and later).
 - A ServiceAccount JWT caller gets 401 from Steve, because the Steve cluster proxy runs before the ServiceAccount authenticator in the Rancher handler chain, and the filter returns that 401. An RBAC leg through a `SelfSubjectRulesReview` is the open design for that caller. Do not derive its project from a label on the ServiceAccount namespace, because a project owner can set that label.
 
 ## Watch

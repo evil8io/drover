@@ -35,6 +35,7 @@ drover is a set of tenancy extensions for Rancher: one Go binary, one subcommand
 Verified against Rancher 2.14.5. Each component file has the facts of its own API surface.
 
 - Rancher answers `400 Use HTTPS` to a login over plain HTTP. In the Rancher cluster, `rancher.<namespace>` is in the serving certificate, and `rancher.<namespace>.svc` is not.
+- The CA of that serving certificate is the Secret `tls-rancher`, key `tls.crt`, in the Rancher namespace. `tls-rancher-internal-ca` is a different CA and does not verify it.
 - Rancher grants a project member `get` on the namespaces of its projects and no `list`. The api-filter exists for that gap.
 - A binding that grants `list` on `namespaces` to `system:cattle:authenticated` makes the native list succeed, and the filter then never filters, because the filter acts on a 403 only. Look for such a binding first when a tenant sees every namespace.
 
