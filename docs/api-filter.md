@@ -14,13 +14,13 @@ The service handles two request patterns from a Rancher kubeconfig. It passes ev
 2. A status other than 403 goes back to the client unchanged.
 3. On a 403 error, the service requests the caller's allowed namespaces from Steve, the Rancher API server in the cluster agent.
 4. A plain list gets a new request with a service token, no cookie, and a label selector. The selector matches `field.cattle.io/projectId` on the caller's projects, when every allowed namespace has that label. It matches the allowed namespace names in every other case. That case includes the selector that matches no namespace, when the caller may see none.
-6. A watch (`?watch=true`) gets a new request with a service token, no cookie, and the caller's own query. The selector of a watch does not change while the stream runs. A name selector on a watch hides a namespace that Rancher puts in a project of the caller later. The watch therefore gets a project selector, or no selector at all. The selector of the caller merges into it, as it does on a list. Three cases apply:
+5. A watch (`?watch=true`) gets a new request with a service token, no cookie, and the caller's own query. The selector of a watch does not change while the stream runs. A name selector on a watch hides a namespace that Rancher puts in a project of the caller later. The watch therefore gets a project selector, or no selector at all. The selector of the caller merges into it, as it does on a list. Three cases apply:
    - A caller with no namespace and no project gets the selector that matches no namespace.
    - A caller whose namespaces are all in its own projects gets a `field.cattle.io/projectId` selector on those projects. A new namespace of such a project matches that selector by itself.
    - A caller with a namespace outside its own projects gets no selector, because no selector holds that namespace and the projects of the caller at the same time.
 
    The request keeps every Accept entry of the caller whose media type is `application/json`, for example a table request from kubectl, and drops every other entry, for example protobuf or CBOR. It sets `application/json` when no entry remains.
-7. The service sends the new request to Rancher, and it streams the response to the client. The event filter runs on every watch, also on a watch with a selector. An event passes only when every namespace in it is in the allowed set, or its `field.cattle.io/projectId` label matches a project of the caller. A server-side table event has one row per namespace, and the filter checks the name and the labels of each row. The filter is the only gate for a watch with no selector. It is the second gate for a watch with a selector.
+6. The service sends the new request to Rancher, and it streams the response to the client. The event filter runs on every watch, also on a watch with a selector. An event passes only when every namespace in it is in the allowed set, or its `field.cattle.io/projectId` label matches a project of the caller. A server-side table event has one row per namespace, and the filter checks the name and the labels of each row. The filter is the only gate for a watch with no selector. It is the second gate for a watch with a selector.
 
 A request is a watch when its `watch` parameter is present with a value other than `0` or `false`, as the API server reads it. A watch request streams over chunked HTTP, or over a websocket connection after a protocol switch. A namespace that Rancher grants after the start of the watch becomes visible in one of three ways. A project selector matches a new namespace of a project of the caller at once. A watch with no selector gets the event too, because the event filter reads the allowed set through the same cache as a plain list. In every other case the service ends the watch, and the client sees the namespace on its next watch.
 
@@ -51,6 +51,7 @@ With `--fanout` on, the service answers a cluster-wide list of a namespaced kind
 7. The merged answer puts the `kind`, the `apiVersion` and the `metadata` fields after the elements. The `resourceVersion` of the merge is the lowest value of the answers, so the service knows it only after the last answer. The `kind` of a custom resource list also stands after its elements upstream, because an unstructured object serializes its keys in alphabetical order. A JSON object has no fixed field order, so this position is valid. The service asks discovery for the kind when no answer names one.
 8. The merge names no `continue` token. It also drops the `limit` and `continue` parameters of the caller. A `continue` token belongs to one namespace only. A client that reads a merged answer reads one page, and it stops there.
 9. The service merges a `List` and a `Table` alike. A merged `Table` keeps the `columnDefinitions` field of the first answer. A table view in kubectl then keeps its columns.
+
 A caller may see more allowed namespaces than `--fanout-max-namespaces` allows. That cluster-wide list then gets a 403 error, and the service runs no fan-out.
 
 The `selfsubjectaccessreviews` path grants a cluster-wide `list` and a cluster-wide `watch` of any named resource when `--fanout` is on and the caller has at least one allowed namespace. A review of the resource `*` or the group `*` keeps its native answer. The list and the watch apply the real permission on their own. A grant that the permission does not cover then gives an empty answer, not an error.
@@ -89,6 +90,8 @@ With `--fanout` on, the service also answers a cluster-wide watch, for example `
 With these routes, the service becomes the data path for most reads of a tenant. The tenant then depends on the availability and the latency of the service for those reads.
 
 ## Configuration
+
+`drover api-filter [flags]` starts the service.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -156,11 +159,13 @@ A log line has `trace_id` and `span_id` when the request has a span.
 
 ## Telemetry
 
-The service continues an incoming `traceparent` on every request. It starts a span when the header is absent. A request span has a child span for the Steve call, the project list, the privileged list, and the privileged watch. With `--otlp-endpoint` set, the service also exports these metrics:
+The service continues an incoming `traceparent` on every request. It starts a span when the header is absent. A request span has a child span for the Steve call, the project list, the privileged list, and the privileged watch.
 
 A span of the service is named after the method and a path template, for example `GET /k8s/clusters/{cluster}/api/v1/pods`, and the server span carries that template as `http.route`. A collector that rebuilds a span name from the semantic conventions reads that attribute and gives the span the method alone without it, so the two names agree. The cluster id, a namespace name and an object name each become a placeholder, because their value set is unbounded. The api group, the version and the resource name stay, because they say what the request asks for and the api surface of a cluster is bounded. Search a trace on `resource.service.name`, which `--service-name` sets, not on the span name.
 
 A client span records `url.full` without its query, because the query of the privileged list names every allowed namespace of the caller.
+
+With `--otlp-endpoint` set, the service also exports these metrics:
 
 | Metric | Kind | Unit | Attributes |
 | --- | --- | --- | --- |

@@ -32,6 +32,10 @@ Build the image with `podman build` or `docker build`. Pass the version with the
 podman build --build-arg VERSION=0.14.0 -t drover:0.14.0 .
 ```
 
+## Docs
+
+Each subcommand has a document in `docs/`, with its behaviour, its flags, its permissions, its log fields, and its metrics. A change to one of those updates the document in the same pull request.
+
 ## Pull requests
 
 A pull request title follows [Conventional Commits](https://www.conventionalcommits.org/), and a check on the title blocks the merge otherwise. Every pull request is squash-merged, and the title becomes the commit subject on `main`. Add a `!` after the type for a breaking change.

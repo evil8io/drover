@@ -10,6 +10,8 @@ A CronJob is the normal caller, because most runs find a valid token and exit 0.
 
 ## Configuration
 
+`drover rotate-token [flags]` runs the command once.
+
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--rancher-url` | (required) | URL of Rancher. Use `http://` or `https://`. The path must be empty or `/`. |

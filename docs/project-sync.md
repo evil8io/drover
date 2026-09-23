@@ -1,8 +1,6 @@
 # project-sync
 
-This service copies labels and annotations of a Rancher project to every namespace of that project, because Rancher does not copy them. The `--labels` and `--annotations` flags are the allow list of keys. The value of the project wins, and the service overwrites a different value on the namespace. The service polls Rancher at every `--interval`, and it also keeps one namespace watch per cluster open, so that a new namespace gets its keys within a few seconds. One replica is enough, because every run is a full reconcile. A namespace list that returns status 403 means that the service user may not list namespaces on that cluster.
-
-The service writes a warning with the cluster id and continues with the next cluster.
+This service copies labels and annotations of a Rancher project to every namespace of that project, because Rancher does not copy them. The `--labels` and `--annotations` flags are the allow list of keys. The value of the project wins, and the service overwrites a different value on the namespace. The service polls Rancher at every `--interval`, and it also keeps one namespace watch per cluster open, so that a new namespace gets its keys within a few seconds. One replica is enough, because every run is a full reconcile. A namespace list that returns status 403 means that the service user may not list namespaces on that cluster. The service writes a warning with the cluster id and continues with the next cluster.
 
 ## Requirements
 
@@ -10,6 +8,8 @@ The service writes a warning with the cluster id and continues with the next clu
 2. An API token of that service user, in a Secret that the service mounts.
 
 ## Configuration
+
+`drover project-sync [flags]` starts the service.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -55,8 +55,6 @@ The service also keeps one namespace watch per cluster open, on `GET /k8s/cluste
 The watch puts the namespace of an event into the queue of its cluster, by namespace name. One worker per cluster patches the namespaces of that queue, one at a time. A second event of a namespace replaces the first one in the queue, so a storm of events on one namespace gives one patch. The `--patch-rate` flag bounds the patches per second of one cluster, and the burst equals the rate.
 
 A patch of a namespace that no longer exists, or of a namespace in `Terminating`, is not an error. The service skips it, and the next reconcile run repeats the work.
-
-The standard library is enough for the work: the service needs an HTTP client, a JSON decoder, and a ticker.
 
 ## Telemetry
 
