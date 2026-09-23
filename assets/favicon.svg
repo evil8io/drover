@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-labelledby="t">
+  <title id="t">drover</title>
+  <rect width="64" height="64" rx="14" fill="#326ce5"/>
+  <g transform="translate(11.21 59.25) scale(0.75)">
+    <polygon points="27.85,-5.7 9.36,-16.38 9.36,-37.73 27.85,-48.4 46.34,-37.73 46.34,-16.38" fill="none" stroke="#ffffff" stroke-width="13.4" stroke-linejoin="round"/>
+    <line stroke="#ffffff" x1="46.34" y1="-74" x2="46.34" y2="0" stroke-width="13.4"/>
+  </g>
+</svg>

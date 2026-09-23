@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="300" height="300" role="img" aria-labelledby="t">
+  <title id="t">drover</title>
+  <style>
+    .ws { stroke: #1f2937; }
+    @media (prefers-color-scheme: dark) { .ws { stroke: #e5e7eb; } }
+  </style>
+  <g transform="translate(18.07 91.85) scale(1.15)">
+    <polygon points="27.85,-5.7 9.36,-16.38 9.36,-37.73 27.85,-48.4 46.34,-37.73 46.34,-16.38" fill="none" stroke="#326ce5" stroke-width="13.4" stroke-linejoin="round"/>
+    <line class="ws" x1="46.34" y1="-74" x2="46.34" y2="0" stroke-width="13.4"/>
+  </g>
+</svg>
