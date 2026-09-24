@@ -4,7 +4,7 @@ Human doc: `docs/rotate-token.md`. Update it with a behaviour change.
 
 Rancher token facts, verified against 2.14.5:
 
-- `POST /v3-public/localProviders/local?action=login` ignores `ttl`. The session length is `auth-user-session-ttl-minutes`. A chosen lifetime needs `POST /v3/tokens` with `ttl` in milliseconds, and Rancher reduces a value above `auth-token-max-ttl-minutes` without an error, so compare the returned TTL and warn.
+- `POST /v3-public/localProviders/local?action=login` ignores `ttl`. The session length is `auth-user-session-ttl-minutes`. A chosen lifetime needs `POST /v3/tokens` with `ttl` in milliseconds, and Rancher reduces a value above `auth-token-max-ttl-minutes` without an error. Warn when the returned TTL differs from the request. Fail the run after the rotation when the granted TTL is not longer than `--renew-before`, because the new token is inside the renew window at once.
 - `responseType: cookie` on the login returns an empty body. Use the token response.
 - `expiresAt` is empty right after a create. Derive the expiry from `ttl` and the creation time.
 - A delete of the current session token answers 400. End the session with `?action=logout`.

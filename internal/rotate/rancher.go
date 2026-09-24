@@ -77,6 +77,7 @@ type session struct {
 type createdToken struct {
 	value string
 	name  string
+	ttl   time.Duration
 }
 
 // tokenName returns the name part of a token value. It returns an empty string
@@ -199,7 +200,8 @@ func (r *rotator) login(ctx context.Context) (_ session, err error) {
 // above auth-token-max-ttl-minutes without an error.
 func (r *rotator) createToken(ctx context.Context, s session) (_ createdToken, err error) {
 	ctx, end := r.step(ctx, stepTokenCreate)
-	defer func() { end(outcomeOK, err) }()
+	outcome := outcomeOK
+	defer func() { end(outcome, err) }()
 
 	want := r.cfg.TTL.Milliseconds()
 	body := map[string]any{"type": "token", "ttl": want, "description": r.cfg.Description}
@@ -223,12 +225,13 @@ func (r *rotator) createToken(ctx context.Context, s session) (_ createdToken, e
 		return createdToken{}, errors.New("the answer of the token create has no token")
 	}
 	if item.TTL != want {
+		outcome = outcomeClamped
 		r.logger.WarnContext(ctx, "rancher clamped the ttl", "step", stepTokenCreate, "outcome", outcomeClamped,
 			"token_name", name, "requested_ttl_ms", want, "granted_ttl_ms", item.TTL)
 	}
-	r.logger.InfoContext(ctx, "created a token", "step", stepTokenCreate, "outcome", outcomeOK,
+	r.logger.InfoContext(ctx, "created a token", "step", stepTokenCreate, "outcome", outcome,
 		"token_name", name, "ttl_ms", item.TTL)
-	return createdToken{value: item.Token, name: name}, nil
+	return createdToken{value: item.Token, name: name, ttl: time.Duration(item.TTL) * time.Millisecond}, nil
 }
 
 // prune deletes the tokens of the service user that this command created before.

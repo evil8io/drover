@@ -2,7 +2,9 @@
 
 A command that renews the API token of the Rancher service user in a Kubernetes Secret.
 
-The command runs once: it reads the token from the Secret, and it asks Rancher for the expiry. A token that lasts longer than `--renew-before` is valid, and the run ends with no change. For a new token the command logs in as the service user, and it derives a token from that session. The login is a first step only, because Rancher ignores the TTL of a login token. Rancher also reduces a TTL above its own maximum without an error, so a different TTL in the answer gives a warning. Last, the command patches the Secret, deletes the old tokens, and ends the session with a logout.
+The command runs once: it reads the token from the Secret, and it asks Rancher for the expiry. A token that lasts longer than `--renew-before` is valid, and the run ends with no change. For a new token the command logs in as the service user, and it derives a token from that session. The login is a first step only, because Rancher ignores the TTL of a login token. Last, the command patches the Secret, deletes the old tokens, and ends the session with a logout.
+
+Rancher reduces a TTL above its own maximum without an error, so a different TTL in the answer gives a warning. When the granted TTL is not longer than `--renew-before`, the run completes the rotation and then exits 1, because every later run rotates again.
 
 The run keeps the new token and the token that it read from the Secret. It deletes the other tokens with the same description, except the newest ones up to `--keep`.
 
@@ -23,7 +25,7 @@ A CronJob is the normal caller, because most runs find a valid token and exit 0.
 | `--token-secret` | (required) | `namespace/name` of the Secret with the API token. |
 | `--token-key` | `token` | Key of the token inside the Secret. |
 | `--password-secret` | | `namespace/name` of the Secret that Rancher reads for the password of the service user. When set, a run first writes the PBKDF2-SHA3-512 hash of the password into it. |
-| `--ttl` | `48h` | Lifetime of a new token. Rancher reduces a value above `auth-token-max-ttl-minutes`. |
+| `--ttl` | `48h` | Lifetime of a new token. Rancher reduces a value above `auth-token-max-ttl-minutes`, and a reduced value that is not longer than `--renew-before` makes the run exit 1 after the rotation. |
 | `--renew-before` | `24h` | Remaining lifetime that starts a rotation. The value must be shorter than `--ttl`. |
 | `--keep` | `2` | Number of tokens with the description to keep. The new token and the token that the run read from the Secret count, and the run never deletes them. The value must be 2 or more, because a pod reads a mounted Secret with a delay after the patch. |
 | `--description` | `drover rotate-token` | Description of the tokens of this command. It also selects the tokens to delete. |

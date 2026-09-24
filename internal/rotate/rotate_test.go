@@ -263,7 +263,7 @@ func TestRunMissingSecret(t *testing.T) {
 func TestRunClampedTTL(t *testing.T) {
 	t.Parallel()
 	rancher := newFakeRancher(t)
-	rancher.grantedTTL = (24 * time.Hour).Milliseconds()
+	rancher.grantedTTL = (30 * time.Hour).Milliseconds()
 	kube := newFakeKube(t, nil)
 	h := newHarness(t, kube, rancher)
 
@@ -271,7 +271,34 @@ func TestRunClampedTTL(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	h.assertLog(t, "rancher clamped the ttl", `"requested_ttl_ms":172800000`, `"granted_ttl_ms":86400000`)
+	h.assertLog(t, "rancher clamped the ttl", `"requested_ttl_ms":172800000`, `"granted_ttl_ms":108000000`)
+	h.assertNoSecret(t)
+}
+
+func TestRunClampedTTLInsideTheRenewWindowFailsTheRun(t *testing.T) {
+	t.Parallel()
+	rancher := newFakeRancher(t)
+	rancher.grantedTTL = (24 * time.Hour).Milliseconds()
+	kube := newFakeKube(t, nil)
+	h := newHarness(t, kube, rancher)
+
+	err := h.run()
+	if err == nil {
+		t.Fatal("Run returned no error")
+	}
+	if !strings.Contains(err.Error(), "not longer than the renew window") {
+		t.Errorf("the error is %q, and the test expects the renew window", err)
+	}
+
+	assertRoutes(t, rancher.routes(), rotationRoutes)
+	names := rancher.names()
+	if len(names) != 1 {
+		t.Fatalf("the tokens after the run are %v, and the test expects one", names)
+	}
+	if got, want := kube.value(testKey), names[0]+":"+names[0]+"key"; got != want {
+		t.Errorf("the Secret has the token %q, and the test expects %q", got, want)
+	}
+	h.assertLog(t, `"reason":"window"`, `"outcome":"clamped"`)
 	h.assertNoSecret(t)
 }
 

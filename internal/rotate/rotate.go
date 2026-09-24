@@ -260,7 +260,21 @@ func (r *rotator) rotate(ctx context.Context, secretName string) error {
 	if err := r.patchSecret(ctx, created.value); err != nil {
 		return err
 	}
-	return r.prune(ctx, created, secretName, session)
+	pruneErr := r.prune(ctx, created, secretName, session)
+	return errors.Join(pruneErr, r.checkGrantedTTL(ctx, created.ttl))
+}
+
+// checkGrantedTTL returns an error when a token with the granted TTL expires
+// inside the renew window at once. The TTL zero never expires.
+func (r *rotator) checkGrantedTTL(ctx context.Context, granted time.Duration) error {
+	if granted <= 0 || granted > r.cfg.RenewBefore {
+		return nil
+	}
+	r.logger.ErrorContext(ctx, "the granted ttl is inside the renew window",
+		"step", stepTokenCreate, "outcome", outcomeClamped, "reason", "window",
+		"granted_ttl_ms", granted.Milliseconds(), "renew_before_ms", r.cfg.RenewBefore.Milliseconds())
+	return fmt.Errorf("rancher granted a ttl of %s, which is not longer than the renew window of %s, "+
+		"so every run rotates: raise auth-token-max-ttl-minutes or lower -renew-before", granted, r.cfg.RenewBefore)
 }
 
 // step starts a child span named name, and returns the traced context and a
