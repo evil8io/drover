@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1080,5 +1081,202 @@ func TestCollectionTruncatedTailLosesResourceVersion(t *testing.T) {
 	}
 	if list.Metadata.ResourceVersion != "" {
 		t.Errorf("resourceVersion = %q, want empty, because the truncated answer lost its tail", list.Metadata.ResourceVersion)
+	}
+}
+
+// blockGate blocks a namespaced request until the test opens it, or its
+// context ends. It opens itself once n requests wait at the same time, so a
+// test does not need a sleep to reach that count. n of 0 disables the
+// automatic open, for a test that opens the gate itself. It tracks the
+// highest count of requests that wait at the same time.
+type blockGate struct {
+	n       int32
+	current atomic.Int32
+	highest atomic.Int32
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockGate(n int) *blockGate {
+	return &blockGate{n: int32(n), release: make(chan struct{})}
+}
+
+func (g *blockGate) wait(ctx context.Context) {
+	current := g.current.Add(1)
+	defer g.current.Add(-1)
+	for {
+		highest := g.highest.Load()
+		if current <= highest || g.highest.CompareAndSwap(highest, current) {
+			break
+		}
+	}
+	if g.n > 0 && current == g.n {
+		g.open()
+	}
+	select {
+	case <-g.release:
+	case <-ctx.Done():
+	}
+}
+
+func (g *blockGate) open() {
+	g.once.Do(func() { close(g.release) })
+}
+
+// pendingResponse is the outcome of one fan-out request. The main test
+// goroutine reads it back, so a failure calls t.Fatal there and never on a
+// spawned goroutine.
+type pendingResponse struct {
+	status int
+	body   []byte
+	err    error
+}
+
+// doAsync starts req and sends its outcome on the returned channel. It makes
+// no call on t, so the caller may read the result from any goroutine.
+func doAsync(client *http.Client, req *http.Request) <-chan pendingResponse {
+	out := make(chan pendingResponse, 1)
+	go func() {
+		resp, err := client.Do(req)
+		if err != nil {
+			out <- pendingResponse{err: err}
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		out <- pendingResponse{status: resp.StatusCode, body: body, err: err}
+	}()
+	return out
+}
+
+// TestFanoutMaxInflightBoundsAllFanoutsTogether checks that
+// FanoutMaxInflight bounds the namespaced requests of every fan-out
+// together, and that it releases its slots for a following batch of the
+// same shape.
+func TestFanoutMaxInflightBoundsAllFanoutsTogether(t *testing.T) {
+	t.Parallel()
+	const namespaceCount = 10
+	const fanouts = 2
+
+	names := make([]string, 0, namespaceCount)
+	bodies := make(map[string]string, namespaceCount)
+	for i := 1; i <= namespaceCount; i++ {
+		namespace := fmt.Sprintf("ns-%02d", i)
+		names = append(names, namespace)
+		bodies[namespace] = collectionJSON("PodList", "v1", namespace, "pod-"+namespace, "1")
+	}
+	lists := namespaceLists(bodies)
+
+	var gate atomic.Pointer[blockGate]
+	h := newHarnessOpt(t, collectionUpstream(
+		steveHandler(names...),
+		func(w http.ResponseWriter, r *http.Request) {
+			gate.Load().wait(r.Context())
+			lists(w, r)
+		},
+	), withFanout,
+		func(cfg *Config) { cfg.FanoutConcurrency = 16 },
+		func(cfg *Config) { cfg.FanoutMaxInflight = 2 })
+
+	runBatch := func() {
+		batch := newBlockGate(2)
+		t.Cleanup(batch.open)
+		gate.Store(batch)
+
+		results := make([]<-chan pendingResponse, fanouts)
+		for i := range fanouts {
+			req := h.request(t, http.MethodGet, podsPath, nil, callerHeader())
+			results[i] = doAsync(h.proxy.Client(), req)
+		}
+
+		for _, result := range results {
+			select {
+			case res := <-result:
+				if res.err != nil {
+					t.Fatal(res.err)
+				}
+				if res.status != http.StatusOK {
+					t.Fatalf("status = %d, want 200: %s", res.status, res.body)
+				}
+				list := parseList(t, res.body)
+				if len(list.Items) != namespaceCount {
+					t.Errorf("items = %d, want %d", len(list.Items), namespaceCount)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("a fan-out did not complete")
+			}
+		}
+		if got := batch.highest.Load(); got != 2 {
+			t.Errorf("namespaced requests in flight at once = %d, want 2", got)
+		}
+	}
+
+	runBatch()
+	runBatch()
+}
+
+// TestFanoutReleasesSlotsOnClientCancel checks that a fan-out whose client
+// cancels mid-stream releases its local and global slots, so a following
+// fan-out completes.
+func TestFanoutReleasesSlotsOnClientCancel(t *testing.T) {
+	t.Parallel()
+	const first, blocked = "ns-a", "ns-b"
+
+	bodies := map[string]string{
+		first:   collectionJSON("PodList", "v1", first, "pod-"+first, "1"),
+		blocked: collectionJSON("PodList", "v1", blocked, "pod-"+blocked, "2"),
+	}
+	lists := namespaceLists(bodies)
+	gate := newBlockGate(0)
+	t.Cleanup(gate.open)
+
+	h := newHarnessOpt(t, collectionUpstream(
+		steveHandler(first, blocked),
+		func(w http.ResponseWriter, r *http.Request) {
+			if namespace, _, _ := splitNamespaced(r.URL.Path); namespace == blocked {
+				gate.wait(r.Context())
+			}
+			lists(w, r)
+		},
+	), withFanout, func(cfg *Config) { cfg.FanoutMaxInflight = 1 })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := h.request(t, http.MethodGet, podsPath, nil, callerHeader()).WithContext(ctx)
+	resp, err := h.proxy.Client().Do(req)
+	if err != nil {
+		t.Fatalf("do the first request: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	// A read of the first bytes proves that streamFanout opened the merge on
+	// the first namespace, while the blocked namespace still holds a slot.
+	buf := make([]byte, 64)
+	read := make(chan struct{})
+	go func() {
+		_, _ = resp.Body.Read(buf)
+		close(read)
+	}()
+	select {
+	case <-read:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the first fan-out sent no data before the cancel")
+	}
+
+	cancel()
+	_ = resp.Body.Close()
+	gate.open()
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	req2 := h.request(t, http.MethodGet, podsPath, nil, callerHeader()).WithContext(ctx2)
+	resp2, body2 := h.do(t, req2)
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", resp2.StatusCode, body2)
+	}
+	list := parseList(t, body2)
+	if want := []string{"pod-" + first, "pod-" + blocked}; !slices.Equal(list.names(), want) {
+		t.Errorf("items = %v, want %v, a following fan-out did not complete", list.names(), want)
 	}
 }

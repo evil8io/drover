@@ -15,6 +15,7 @@ import (
 const (
 	defaultFanoutMaxNamespaces = 200
 	defaultFanoutConcurrency   = 16
+	defaultFanoutMaxInflight   = 64
 )
 
 // collectionTarget names one cluster-wide collection of a namespaced kind.
@@ -98,6 +99,40 @@ func (s *Service) roundTripCollection(req *http.Request, target collectionTarget
 	return s.fanout(req, target, set.names, denied, start, result), nil
 }
 
+// fanoutSlots has the local slots of one fan-out, and the global slots of
+// every fan-out on the Service.
+type fanoutSlots struct {
+	local  chan struct{}
+	global chan struct{}
+}
+
+func newFanoutSlots(concurrency int, global chan struct{}) *fanoutSlots {
+	return &fanoutSlots{local: make(chan struct{}, concurrency), global: global}
+}
+
+// acquire takes the local slot, then the global slot, both against
+// ctx.Done(). It reports whether it got both slots.
+func (f *fanoutSlots) acquire(ctx context.Context) bool {
+	select {
+	case f.local <- struct{}{}:
+	case <-ctx.Done():
+		return false
+	}
+	select {
+	case f.global <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		<-f.local
+		return false
+	}
+}
+
+// release returns the global slot, then the local slot.
+func (f *fanoutSlots) release() {
+	<-f.global
+	<-f.local
+}
+
 // fanout requests the collection in each allowed namespace, and returns the
 // merged answer. The answers stream out in the order of names, so the filter
 // holds at most fanoutConcurrency answers at a time. A namespace that answers
@@ -106,16 +141,18 @@ func (s *Service) roundTripCollection(req *http.Request, target collectionTarget
 // no namespace answers 200.
 func (s *Service) fanout(req *http.Request, target collectionTarget, names []string, denied *http.Response, start time.Time, result listResult) *http.Response {
 	ctx := req.Context()
-	slots := make(chan struct{}, s.fanoutConcurrency)
+	slots := newFanoutSlots(s.fanoutConcurrency, s.fanoutGlobal)
 	stopped := &atomic.Bool{}
 	answers := make([]chan *http.Response, len(names))
 	for i := range answers {
 		answers[i] = make(chan *http.Response, 1)
 	}
 
-	// The dispatcher takes a slot before it starts a request, and it starts
-	// the requests in the order of names. The reader needs the answers in
-	// that same order, so a request it waits for always runs already.
+	// The dispatcher takes the local slot before the global slot, and it
+	// starts the requests in the order of names. The reader needs the
+	// answers in that same order, so a request it waits for always runs
+	// already. The global wait blocks the dispatcher only. It never blocks
+	// the reader, so no deadlock exists.
 	go func() {
 		for i, name := range names {
 			if stopped.Load() {
@@ -124,9 +161,7 @@ func (s *Service) fanout(req *http.Request, target collectionTarget, names []str
 				}
 				return
 			}
-			select {
-			case slots <- struct{}{}:
-			case <-ctx.Done():
+			if !slots.acquire(ctx) {
 				for _, answer := range answers[i:] {
 					answer <- nil
 				}
@@ -268,14 +303,14 @@ func (s *Service) discoverResource(req *http.Request, target collectionTarget) (
 // slot, so an unread answer keeps holding one. A 404 sets stopped, because a
 // namespaced path of a kind that has no namespace scope, for example nodes,
 // answers 404 in every namespace.
-func (s *Service) fetchNamespaced(req *http.Request, target collectionTarget, name string, slots chan struct{}, answer chan<- *http.Response, stopped *atomic.Bool) {
+func (s *Service) fetchNamespaced(req *http.Request, target collectionTarget, name string, slots *fanoutSlots, answer chan<- *http.Response, stopped *atomic.Bool) {
 	ctx := req.Context()
 	resp, err := s.base.RoundTrip(namespacedRequest(req, target, name))
 	if err != nil {
 		s.metrics.fanoutSkipped(ctx, target.cluster)
 		s.logger.DebugContext(ctx, "the namespaced request failed",
 			"cluster", target.cluster, "resource", target.resource, "namespace", name, "error", err.Error())
-		<-slots
+		slots.release()
 		answer <- nil
 		return
 	}
@@ -288,7 +323,7 @@ func (s *Service) fetchNamespaced(req *http.Request, target collectionTarget, na
 		s.metrics.fanoutSkipped(ctx, target.cluster)
 		s.logger.DebugContext(ctx, "the namespaced request returned no collection",
 			"cluster", target.cluster, "resource", target.resource, "namespace", name, "status", resp.StatusCode)
-		<-slots
+		slots.release()
 		answer <- nil
 		return
 	}
@@ -323,7 +358,7 @@ func namespacedRequest(req *http.Request, target collectionTarget, name string) 
 // the elements of every answer, and the metadata last. A read error of an
 // answer ends the body with that error, because a half-written collection is
 // not valid JSON.
-func (s *Service) streamFanout(req *http.Request, writer *io.PipeWriter, first *collectionScanner, rest []chan *http.Response, slots chan struct{}, target collectionTarget) {
+func (s *Service) streamFanout(req *http.Request, writer *io.PipeWriter, first *collectionScanner, rest []chan *http.Response, slots *fanoutSlots, target collectionTarget) {
 	ctx := req.Context()
 	defer func() { _ = writer.Close() }()
 
@@ -341,7 +376,7 @@ func (s *Service) streamFanout(req *http.Request, writer *io.PipeWriter, first *
 			}
 			mergeHeader(&merged, scanner.header)
 			scanner.close()
-			<-slots
+			slots.release()
 		}()
 		count, err := copyElements(writer, scanner, written)
 		written = count
@@ -350,7 +385,7 @@ func (s *Service) streamFanout(req *http.Request, writer *io.PipeWriter, first *
 
 	if err := writeCollectionHeader(writer, first.header.arrayKey); err != nil {
 		first.close()
-		<-slots
+		slots.release()
 		drainAnswers(rest, slots)
 		return
 	}
@@ -416,9 +451,9 @@ func mergeHeader(merged *collectionHeader, answer collectionHeader) {
 }
 
 // skipNamespace drops one answer that the merge cannot read.
-func (s *Service) skipNamespace(ctx context.Context, target collectionTarget, resp *http.Response, slots chan struct{}, err error) {
+func (s *Service) skipNamespace(ctx context.Context, target collectionTarget, resp *http.Response, slots *fanoutSlots, err error) {
 	_ = resp.Body.Close()
-	<-slots
+	slots.release()
 	s.metrics.fanoutSkipped(ctx, target.cluster)
 	s.logger.WarnContext(ctx, "the namespaced answer is not a collection",
 		"cluster", target.cluster, "resource", target.resource, "error", err.Error())
@@ -447,14 +482,14 @@ func copyElements(w io.Writer, scanner *collectionScanner, written int) (int, er
 
 // drainAnswers reads the answers that the merge no longer needs, and returns
 // their slots, so every dispatched request ends.
-func drainAnswers(answers []chan *http.Response, slots chan struct{}) {
+func drainAnswers(answers []chan *http.Response, slots *fanoutSlots) {
 	for _, answer := range answers {
 		resp := <-answer
 		if resp == nil {
 			continue
 		}
 		_ = resp.Body.Close()
-		<-slots
+		slots.release()
 	}
 }
 
