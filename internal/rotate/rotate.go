@@ -44,7 +44,7 @@ const (
 
 // Config configures one run.
 type Config struct {
-	// Rancher is the Rancher URL. The scheme is http or https, and the path is empty.
+	// Rancher is the Rancher URL. The scheme is https, and the path is empty.
 	Rancher *url.URL
 	// RancherClient sends every Rancher request. Nil selects a client with a 30 s timeout.
 	RancherClient *http.Client
@@ -163,11 +163,18 @@ func (r *rotator) checkToken(ctx context.Context) error {
 
 func newRotator(cfg Config) (*rotator, error) {
 	for _, field := range []struct {
-		name  string
-		value *url.URL
-	}{{"the Rancher URL", cfg.Rancher}, {"the Kubernetes URL", cfg.Kube}} {
+		name      string
+		value     *url.URL
+		httpsOnly bool
+	}{
+		{"the Rancher URL", cfg.Rancher, true},
+		{"the Kubernetes URL", cfg.Kube, false},
+	} {
 		if field.value == nil {
 			return nil, fmt.Errorf("%s is required", field.name)
+		}
+		if field.httpsOnly && field.value.Scheme != "https" {
+			return nil, fmt.Errorf("%s scheme %q is not https", field.name, field.value.Scheme)
 		}
 		if field.value.Scheme != "http" && field.value.Scheme != "https" {
 			return nil, fmt.Errorf("%s scheme %q is not http or https", field.name, field.value.Scheme)
@@ -220,6 +227,12 @@ func newRotator(cfg Config) (*rotator, error) {
 	if r.cfg.KubeClient == nil {
 		r.cfg.KubeClient = &http.Client{Timeout: 30 * time.Second}
 	}
+	r.cfg.KubeClient = &http.Client{
+		Transport:     r.cfg.KubeClient.Transport,
+		CheckRedirect: noRedirect,
+		Jar:           r.cfg.KubeClient.Jar,
+		Timeout:       r.cfg.KubeClient.Timeout,
+	}
 
 	meterProvider := cfg.MeterProvider
 	if meterProvider == nil {
@@ -232,7 +245,7 @@ func newRotator(cfg Config) (*rotator, error) {
 	r.metrics = m
 	r.cfg.RancherClient = &http.Client{
 		Transport:     rancherclient.WrapTransport(r.cfg.RancherClient.Transport, meterProvider),
-		CheckRedirect: r.cfg.RancherClient.CheckRedirect,
+		CheckRedirect: noRedirect,
 		Jar:           r.cfg.RancherClient.Jar,
 		Timeout:       r.cfg.RancherClient.Timeout,
 	}

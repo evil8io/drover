@@ -4,6 +4,8 @@ A command that renews the API token of the Rancher service user in a Kubernetes 
 
 The command runs once: it reads the token from the Secret, and it asks Rancher for the expiry. A token that lasts longer than `--renew-before` is valid, and the run ends with no change. For a new token the command logs in as the service user, and it derives a token from that session. The login is a first step only, because Rancher ignores the TTL of a login token. Last, the command patches the Secret, deletes the old tokens, and ends the session with a logout.
 
+The command accepts an https URL for `--rancher-url` only, because the login sends the password in the request body. The command never follows a redirect, so a redirect answer fails the run and never resends the password.
+
 Rancher reduces a TTL above its own maximum without an error, so a different TTL in the answer gives a warning. When the granted TTL is not longer than `--renew-before`, the run completes the rotation and then exits 1, because every later run rotates again.
 
 The run keeps the new token and the token that it read from the Secret. It deletes the other tokens with the same description, except the newest ones up to `--keep`.
@@ -18,7 +20,7 @@ A CronJob is the normal caller, because most runs find a valid token and exit 0.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--rancher-url` | (required) | URL of Rancher. Use `http://` or `https://`. The path must be empty or `/`. |
+| `--rancher-url` | (required) | URL of Rancher. Use `https://` only. The path must be empty or `/`. |
 | `--rancher-ca-file` | | PEM bundle that verifies an `https` Rancher URL. |
 | `--rancher-insecure-skip-verify` | `false` | Skip the certificate verification of an `https` Rancher URL. |
 | `--credentials-dir` | (required) | Directory with the files `username` and `password` of the service user. |

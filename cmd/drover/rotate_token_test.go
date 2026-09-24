@@ -49,6 +49,10 @@ func TestParseRotateConfigErrors(t *testing.T) {
 			"--rancher-url", "ftp://rancher.example.com",
 			"--credentials-dir", credentials, "--token-secret", "a/b", "--kube-url", "https://k",
 		}},
+		{"rancher url over http", []string{
+			"--rancher-url", "http://rancher.example.com",
+			"--credentials-dir", credentials, "--token-secret", "a/b", "--kube-url", "https://k",
+		}},
 		{"rancher url without a host", []string{
 			"--rancher-url", "https://",
 			"--credentials-dir", credentials, "--token-secret", "a/b", "--kube-url", "https://k",
@@ -97,7 +101,7 @@ func TestParseRotateConfigValid(t *testing.T) {
 	serviceAccount := credentialsDir(t, map[string]string{"token": "kube\n", "ca.crt": "pem\n"})
 
 	cfg, err := parseRotateConfig([]string{
-		"--rancher-url", "http://rancher.cattle-system.svc/",
+		"--rancher-url", "https://rancher.cattle-system.svc/",
 		"--credentials-dir", credentials,
 		"--token-secret", "cattle-system/drover-token",
 		"--token-key", "api-token",
@@ -113,7 +117,7 @@ func TestParseRotateConfigValid(t *testing.T) {
 		t.Fatalf("parseRotateConfig: %v", err)
 	}
 
-	if got := cfg.rancher.String(); got != "http://rancher.cattle-system.svc" {
+	if got := cfg.rancher.String(); got != "https://rancher.cattle-system.svc" {
 		t.Errorf("rancher URL = %q", got)
 	}
 	if got := cfg.kube.String(); got != "https://kubernetes.default.svc:443" {
@@ -154,7 +158,7 @@ func TestParseRotateConfigInCluster(t *testing.T) {
 	}
 
 	cfg, err := parseRotateConfig([]string{
-		"--rancher-url", "http://rancher.cattle-system.svc",
+		"--rancher-url", "https://rancher.cattle-system.svc",
 		"--credentials-dir", credentials,
 		"--token-secret", "cattle-system/drover-token",
 	}, io.Discard, func(name string) string { return environment[name] })
