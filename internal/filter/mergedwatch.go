@@ -60,8 +60,9 @@ type watchMerge struct {
 	stop chan struct{}
 	once sync.Once
 
-	mu     sync.Mutex
-	bodies []io.Closer
+	mu       sync.Mutex
+	bodies   []io.Closer
+	finished bool
 
 	// watchList is true when the caller asked for the initial events. pending
 	// counts the upstream watches whose initial events did not end yet,
@@ -80,11 +81,10 @@ type watchMerge struct {
 // merged into one stream. The caller gets no permission that it does not have
 // already, because every upstream watch carries its own credentials.
 //
-// The set of upstream watches is fixed while the stream runs. A namespace that
-// the caller gains or loses therefore ends the stream, and the client re-lists
-// and re-watches. An upstream watch that ends ends the merged stream for the
-// same reason: the client repairs a gap with a new list, and a stream that
-// stays open with one dead namespace shows stale data without saying so.
+// trackAllowedSet adds a namespace that the caller gains to the running merge,
+// and it ends the stream when the caller loses a namespace. An upstream watch
+// that ends ends the merged stream too, because a stream that stays open with
+// one dead namespace shows stale data without saying so.
 func (s *Service) mergedWatch(req *http.Request, target collectionTarget, set allowedSet, denied *http.Response, start time.Time, result listResult) *http.Response {
 	ctx := req.Context()
 	names := set.names
@@ -106,9 +106,7 @@ func (s *Service) mergedWatch(req *http.Request, target collectionTarget, set al
 		s.metrics.fanoutCapped(ctx, target.cluster)
 		result.outcome, result.status = outcomeCapped, http.StatusForbidden
 		s.logList(ctx, start, result)
-		message := serviceName + ": the caller may see " + strconv.Itoa(len(names)) +
-			" namespaces, above the fan-out watch limit of " + strconv.Itoa(s.fanoutMaxWatchNamespaces)
-		return statusResponse(req, http.StatusForbidden, reasonForbidden, message)
+		return statusResponse(req, http.StatusForbidden, reasonForbidden, s.watchCapMessage(len(names)))
 	}
 
 	// A caller that may see no namespace gets a stream without an event, as
@@ -152,7 +150,7 @@ func (s *Service) mergedWatch(req *http.Request, target collectionTarget, set al
 		go merge.endInitialEventsWithout(kind, apiVersion)
 	}
 	go merge.finishOnEnd(ctx)
-	go s.endWatchOnAllowedSetChange(ctx, target.cluster, req.Header, names, merge)
+	go s.trackAllowedSet(ctx, req.Clone(ctx), target, names, merge)
 
 	result.outcome, result.status = outcomeFannedOut, resp.StatusCode
 	s.logList(ctx, start, result)
@@ -174,32 +172,42 @@ func (s *Service) openWatches(req *http.Request, target collectionTarget, names 
 		group.Add(1)
 		go func(name string) {
 			defer group.Done()
-			resp, err := s.base.RoundTrip(namespacedWatchRequest(req, target, name))
-			if err != nil {
+			body, status := s.openWatch(ctx, namespacedWatchRequest(req, target, name), target, name)
+			if body == nil {
 				s.metrics.fanoutSkipped(ctx, target.cluster)
-				s.logger.DebugContext(ctx, "the namespaced watch failed",
-					"cluster", target.cluster, "resource", target.resource, "namespace", name, "error", err.Error())
-				return
-			}
-			if resp.StatusCode != http.StatusOK {
-				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBody))
-				_ = resp.Body.Close()
-				s.metrics.fanoutSkipped(ctx, target.cluster)
-				s.logger.DebugContext(ctx, "the namespaced watch returned no stream",
-					"cluster", target.cluster, "resource", target.resource, "namespace", name, "status", resp.StatusCode)
-				mu.Lock()
-				clusterScoped = clusterScoped || resp.StatusCode == http.StatusNotFound
-				mu.Unlock()
-				return
 			}
 			mu.Lock()
-			streams = append(streams, upstreamWatch{namespace: name, body: resp.Body})
-			mu.Unlock()
+			defer mu.Unlock()
+			if body == nil {
+				clusterScoped = clusterScoped || status == http.StatusNotFound
+				return
+			}
+			streams = append(streams, upstreamWatch{namespace: name, body: body})
 		}(name)
 	}
 
 	group.Wait()
 	return streams, clusterScoped
+}
+
+// openWatch sends one upstream watch request, and returns the body of a 200
+// answer. It drains and closes any other answer, and returns its status, or 0
+// for a request that failed.
+func (s *Service) openWatch(ctx context.Context, out *http.Request, target collectionTarget, name string) (io.ReadCloser, int) {
+	resp, err := s.base.RoundTrip(out)
+	if err != nil {
+		s.logger.DebugContext(ctx, "the namespaced watch failed",
+			"cluster", target.cluster, "resource", target.resource, "namespace", name, "error", err.Error())
+		return nil, 0
+	}
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBody))
+		_ = resp.Body.Close()
+		s.logger.DebugContext(ctx, "the namespaced watch returned no stream",
+			"cluster", target.cluster, "resource", target.resource, "namespace", name, "status", resp.StatusCode)
+		return nil, resp.StatusCode
+	}
+	return resp.Body, http.StatusOK
 }
 
 func closeWatches(streams []upstreamWatch) {
@@ -489,17 +497,38 @@ func (m *watchMerge) writeRaw(p []byte) error {
 }
 
 // hold keeps the body of one upstream watch, so the end of the merge closes it.
-func (m *watchMerge) hold(body io.Closer) {
+// It reports false once finishOnEnd took the bodies, and the caller then
+// closes the body itself.
+func (m *watchMerge) hold(body io.Closer) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.finished {
+		return false
+	}
 	m.bodies = append(m.bodies, body)
+	return true
 }
 
 // end ends the merged stream with a clean end of the stream. An upgraded
 // stream gets a websocket close frame first. The first caller wins, because
 // every upstream watch ends the merge on its own end.
 func (m *watchMerge) end(message string, attrs ...any) {
+	m.endWith(nil, message, attrs...)
+}
+
+// expire ends the merged stream as end does, after an ERROR event with the
+// Status 410 Expired and the text status. A watch client takes that event as
+// the end of its resourceVersion window, and it lists again before it watches.
+func (m *watchMerge) expire(status, message string, attrs ...any) {
+	m.endWith(expiredEvent(status), message, attrs...)
+}
+
+// endWith ends the merged stream, after event when event is not nil.
+func (m *watchMerge) endWith(event json.RawMessage, message string, attrs ...any) {
 	m.once.Do(func() {
+		if event != nil {
+			_ = m.write(event)
+		}
 		attrs = append([]any{"cluster", m.cluster, "resource", m.resource}, attrs...)
 		m.svc.logger.Info(message, attrs...)
 		m.svc.watches.end(m.writer)
@@ -521,6 +550,7 @@ func (m *watchMerge) finishOnEnd(ctx context.Context) {
 	_ = m.writer.Close()
 
 	m.mu.Lock()
+	m.finished = true
 	bodies := m.bodies
 	m.bodies = nil
 	m.mu.Unlock()
@@ -569,14 +599,18 @@ func controlFrame(opcode byte, payload []byte) []byte {
 	return append(frame, payload...)
 }
 
-// endWatchOnAllowedSetChange ends the merged stream once the allowed
-// namespaces of the caller differ from the set that the upstream watches
-// cover. That set is fixed while the stream runs, so a namespace that Rancher
-// grants later reaches the client only through a new watch. The client re-lists
-// and re-watches after the end of the stream, and the new merge covers the new
-// set. The re-read of the allowed set goes through the cache of a plain list,
-// so it adds no request beyond the one fetch per cache TTL.
-func (s *Service) endWatchOnAllowedSetChange(ctx context.Context, cluster string, header http.Header, names []string, merge *watchMerge) {
+// trackAllowedSet re-reads the allowed namespaces of the caller once per cache
+// TTL, through the cache of a plain list, so it adds no request beyond the one
+// fetch per cache TTL. A gained namespace joins the running merge through
+// addWatch. A lost namespace ends the stream, and so does a gain above the
+// fan-out watch limit. Both ends send the ERROR event of expire first.
+//
+// A name of the first set whose watch did not open stays out, as in
+// openWatches. A gained name that does not open gets a new try on the next
+// tick, because Rancher creates the role bindings of a new namespace some
+// seconds after the namespace.
+func (s *Service) trackAllowedSet(ctx context.Context, req *http.Request, target collectionTarget, names []string, merge *watchMerge) {
+	watched := slices.Clone(names)
 	ticker := time.NewTicker(s.cache.ttl)
 	defer ticker.Stop()
 
@@ -589,19 +623,72 @@ func (s *Service) endWatchOnAllowedSetChange(ctx context.Context, cluster string
 		case <-ticker.C:
 		}
 
-		set, denied, err := s.allowed(ctx, cluster, header)
+		set, denied, err := s.allowed(ctx, target.cluster, req.Header)
 		if denied != nil {
 			_ = denied.Body.Close()
 		}
 		if denied != nil || err != nil {
 			continue
 		}
-		if slices.Equal(set.names, names) {
-			continue
+		if slices.ContainsFunc(watched, func(name string) bool { return !slices.Contains(set.names, name) }) {
+			merge.expire(serviceName+": the caller lost a namespace of the merged watch",
+				"ended a merged watch, because the allowed namespaces of the caller changed")
+			return
 		}
-		merge.end("ended a merged watch, because the allowed namespaces of the caller changed")
-		return
+		gained := slices.DeleteFunc(slices.Clone(set.names), func(name string) bool { return slices.Contains(watched, name) })
+		if count := len(watched) + len(gained); count > s.fanoutMaxWatchNamespaces {
+			merge.expire(s.watchCapMessage(count),
+				"ended a merged watch, because the allowed namespaces of the caller are above the fan-out watch limit",
+				"count", count, "limit", s.fanoutMaxWatchNamespaces)
+			return
+		}
+		for _, name := range gained {
+			if s.addWatch(ctx, req, target, name, merge) {
+				watched = append(watched, name)
+			}
+		}
 	}
+}
+
+// addWatch opens the upstream watch of a gained namespace, and adds it to the
+// running merge. The request has no resourceVersion, so the upstream sends an
+// ADDED event for every object that exists, then the live events. It reports
+// whether the namespace joined the merge.
+func (s *Service) addWatch(ctx context.Context, req *http.Request, target collectionTarget, name string, merge *watchMerge) bool {
+	out := namespacedWatchRequest(req, target, name)
+	query := out.URL.Query()
+	// Without allowWatchBookmarks and sendInitialEvents the stream sends no
+	// BOOKMARK, so it leaves pending of a watch-list as it is.
+	for _, key := range []string{"resourceVersion", "resourceVersionMatch", "sendInitialEvents", "allowWatchBookmarks"} {
+		query.Del(key)
+	}
+	out.URL.RawQuery = query.Encode()
+
+	body, _ := s.openWatch(ctx, out, target, name)
+	if body == nil {
+		return false
+	}
+	if !merge.hold(body) {
+		_ = body.Close()
+		return false
+	}
+	go merge.follow(ctx, upstreamWatch{namespace: name, body: body})
+	s.logger.InfoContext(ctx, "added a namespace to a merged watch",
+		"cluster", target.cluster, "resource", target.resource, "namespace", name)
+	return true
+}
+
+// watchCapMessage returns the Status message for an allowed set of count
+// namespaces above the fan-out watch limit.
+func (s *Service) watchCapMessage(count int) string {
+	return serviceName + ": the caller may see " + strconv.Itoa(count) +
+		" namespaces, above the fan-out watch limit of " + strconv.Itoa(s.fanoutMaxWatchNamespaces)
+}
+
+// expiredEvent returns the ERROR event of a watch with the Status 410 Expired
+// and message.
+func expiredEvent(message string) json.RawMessage {
+	return json.RawMessage(`{"type":"ERROR","object":` + string(statusJSON(http.StatusGone, reasonExpired, message)) + `}`)
 }
 
 // isWebsocketUpgrade reports whether the caller asks for a websocket.
