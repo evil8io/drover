@@ -12,13 +12,15 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"time"
 )
 
 const (
-	// base64Subprotocol is the websocket subprotocol whose message payload is
-	// base64 text. Every other subprotocol sends the message unencoded.
+	// base64Subprotocol is the websocket subprotocol under which a message
+	// can have base64 text. Under every other subprotocol a message has the
+	// bytes of the stream as they are.
 	base64Subprotocol = "base64.binary.k8s.io"
 
 	// extensionsHeader names the websocket extensions of a connection. An
@@ -130,7 +132,14 @@ func filterWatchUpgrade(ctx context.Context, resp *http.Response, allow func(nam
 
 	go func() {
 		defer end()
-		_ = writer.CloseWithError(filter.run())
+		err := filter.run()
+		if filter.upstreamEnded(err) {
+			_ = writer.CloseWithError(err)
+			return
+		}
+		logger.WarnContext(ctx, "ended an upgraded namespace watch, because the upstream stream failed",
+			"cluster", cluster, "error", err.Error())
+		registry.end(writer)
 	}()
 
 	return writer, nil
@@ -139,11 +148,12 @@ func filterWatchUpgrade(ctx context.Context, resp *http.Response, allow func(nam
 // frameFilter reads the RFC 6455 frames of a namespace watch, and writes the
 // events that pass to dst.
 //
-// A message of the API server is an arbitrary slice of the newline-delimited
-// JSON watch stream, not one event. The filter therefore assembles a message
-// from its frames, decodes it, and appends the bytes to a stream buffer. It
-// then takes one complete event at a time from that buffer, and it writes
-// each event that passes as a new message of its own.
+// The API server sends one event per text frame, as plain JSON, under every
+// subprotocol. A proxy can re-slice the newline-delimited stream, or send it
+// as base64 text. The filter therefore assembles a message from its frames,
+// decides its form, and appends the bytes to a stream buffer. It then takes
+// one complete event at a time from that buffer, and it writes each event
+// that passes as a new message of its own, in the form of the last message.
 type frameFilter struct {
 	ctx     context.Context
 	src     *bufio.Reader
@@ -156,6 +166,13 @@ type frameFilter struct {
 
 	message []byte
 	buffer  []byte
+
+	// messageOpcode is the opcode of the first frame of the message that
+	// the filter assembles. opcode and encoded are the form of the last
+	// complete message.
+	messageOpcode byte
+	opcode        byte
+	encoded       bool
 }
 
 // run reads frames until the upstream ends, the write side fails, or the
@@ -182,6 +199,18 @@ func (f *frameFilter) run() error {
 	}
 }
 
+// upstreamEnded reports whether err of run is a normal end of the stream: a
+// close frame or the end of the upstream connection, the end of the request,
+// or a pipe that the client or the registry closed.
+func (f *frameFilter) upstreamEnded(err error) bool {
+	return err == nil ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, net.ErrClosed) ||
+		f.ctx.Err() != nil
+}
+
 // forwardControl passes a close, a ping, or a pong frame to the caller at
 // once, also while a message is still incomplete.
 func (f *frameFilter) forwardControl(header frameHeader) error {
@@ -198,6 +227,13 @@ func (f *frameFilter) forwardControl(header frameHeader) error {
 // readData buffers one text, binary, or continuation frame. It reads the
 // message once the frame has the FIN bit.
 func (f *frameFilter) readData(header frameHeader) error {
+	switch header.opcode {
+	case opcodeText, opcodeBinary:
+		f.messageOpcode = header.opcode
+	case opcodeContinuation:
+	default:
+		return fmt.Errorf("websocket frame has the reserved opcode %#x", header.opcode)
+	}
 	if uint64(len(f.message))+header.length > maxBuffer {
 		return fmt.Errorf("websocket message is above the limit of %d bytes", maxBuffer)
 	}
@@ -209,29 +245,42 @@ func (f *frameFilter) readData(header frameHeader) error {
 	if !header.fin {
 		return nil
 	}
-	message := f.message
-	f.message = nil
-	return f.consume(message)
+	message, opcode := f.message, f.messageOpcode
+	f.message, f.messageOpcode = nil, opcodeContinuation
+	if opcode == opcodeContinuation {
+		return errors.New("websocket message starts with a continuation frame")
+	}
+	return f.consume(opcode, message)
 }
 
 // consume decodes one complete message, appends its bytes to the stream
 // buffer, and writes every complete event that the buffer now holds. A
-// message that does not decode ends the stream, because the position in the
-// stream is then lost.
-func (f *frameFilter) consume(message []byte) error {
+// message that starts with { is plain JSON. Under the base64 subprotocol,
+// every other message is base64 text. A message that does not decode ends
+// the stream, because the position in the stream is then lost.
+func (f *frameFilter) consume(opcode byte, message []byte) error {
 	chunk := message
-	if f.base64 {
+	encoded := f.base64 && !startsWithObject(message)
+	if encoded {
 		decoded, err := base64.StdEncoding.AppendDecode(nil, message)
 		if err != nil {
-			return fmt.Errorf("decode a base64 websocket message: %w", err)
+			return fmt.Errorf("decode a websocket message that is neither JSON nor base64: %w", err)
 		}
 		chunk = decoded
 	}
+	f.opcode, f.encoded = opcode, encoded
 	if len(f.buffer)+len(chunk) > maxBuffer {
 		return fmt.Errorf("websocket watch stream buffered more than %d bytes without a complete event", maxBuffer)
 	}
 	f.buffer = append(f.buffer, chunk...)
 	return f.drain()
+}
+
+// startsWithObject reports whether the first byte of message after JSON white
+// space is {. No base64 text has that byte.
+func startsWithObject(message []byte) bool {
+	trimmed := bytes.TrimLeft(message, " \t\r\n")
+	return len(trimmed) > 0 && trimmed[0] == '{'
 }
 
 // drain takes every complete JSON value from the stream buffer, and keeps the
@@ -261,9 +310,9 @@ func (f *frameFilter) drain() error {
 }
 
 // emit applies the event filter to one event, and writes the event when it
-// passes. An ADDED, a MODIFIED, and a DELETED event needs a namespace that
-// allow accepts. Every other event passes, and so does a value that is no
-// watch event.
+// passes, in the form of the last message. An ADDED, a MODIFIED, and a
+// DELETED event needs a namespace that allow accepts. Every other event
+// passes, and so does a value that is no watch event.
 func (f *frameFilter) emit(raw json.RawMessage) error {
 	var event watchEvent
 	if json.Unmarshal(raw, &event) == nil {
@@ -281,21 +330,15 @@ func (f *frameFilter) emit(raw json.RawMessage) error {
 	line := make([]byte, 0, len(raw)+1)
 	line = append(line, raw...)
 	line = append(line, '\n')
-	return f.write(encodeMessage(f.base64, line))
+	if f.encoded {
+		line = []byte(base64.StdEncoding.EncodeToString(line))
+	}
+	return f.write(dataFrame(f.opcode, line))
 }
 
-// encodeMessage returns one final unmasked frame with the event. The base64
-// subprotocol takes a text frame with the base64 text of the event, and every
-// other subprotocol takes a binary frame with the event itself. A
+// dataFrame returns one final unmasked frame with opcode and payload. A
 // server-to-client frame has no mask.
-func encodeMessage(base64Encode bool, event []byte) []byte {
-	opcode := byte(opcodeBinary)
-	payload := event
-	if base64Encode {
-		opcode = opcodeText
-		payload = []byte(base64.StdEncoding.EncodeToString(event))
-	}
-
+func dataFrame(opcode byte, payload []byte) []byte {
 	frame := []byte{0x80 | opcode}
 	switch {
 	case len(payload) < 126:

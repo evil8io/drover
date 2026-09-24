@@ -27,8 +27,8 @@ const (
 	// handshake is the SHA-1 of the key of the client and this value.
 	websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-	// binarySubprotocol is the websocket subprotocol whose message payload is
-	// the watch stream itself.
+	// binarySubprotocol is a websocket subprotocol that a watch client offers,
+	// next to base64Subprotocol.
 	binarySubprotocol = "binary.k8s.io"
 
 	watchBookmark = "BOOKMARK"
@@ -46,8 +46,9 @@ type upstreamWatch struct {
 
 // watchMerge is one merged watch stream. The service writes the events of
 // every upstream watch into writer, and the client reads the other side of
-// that pipe. An upgraded merge writes each event as one websocket frame, and
-// a chunked merge writes it as one line of the newline-delimited stream.
+// that pipe. An upgraded merge writes each event as one text frame with plain
+// JSON, as the API server does under every subprotocol, and a chunked merge
+// writes it as one line of the newline-delimited stream.
 type watchMerge struct {
 	svc      *Service
 	cluster  string
@@ -55,7 +56,6 @@ type watchMerge struct {
 
 	writer   *io.PipeWriter
 	upgraded bool
-	base64   bool
 
 	stop chan struct{}
 	once sync.Once
@@ -282,8 +282,8 @@ func (s *Service) newMerge(req *http.Request, target collectionTarget, slot *wat
 		}
 	}
 
-	subprotocol, base64Encode := pickSubprotocol(req.Header.Get("Sec-Websocket-Protocol"))
-	merge.upgraded, merge.base64 = true, base64Encode
+	subprotocol := pickSubprotocol(req.Header.Get("Sec-Websocket-Protocol"))
+	merge.upgraded = true
 	header := http.Header{
 		"Connection":           []string{"Upgrade"},
 		"Upgrade":              []string{"websocket"},
@@ -474,7 +474,7 @@ func (m *watchMerge) write(raw json.RawMessage) error {
 	line = append(line, raw...)
 	line = append(line, '\n')
 	if m.upgraded {
-		line = encodeMessage(m.base64, line)
+		line = dataFrame(opcodeText, line)
 	}
 	return m.writeRaw(line)
 }
@@ -619,19 +619,18 @@ func isWebsocketUpgrade(header http.Header) bool {
 	return false
 }
 
-// pickSubprotocol takes the first subprotocol of the offer that the merge
-// encodes, in the order of the offer, as the API server does. An offer without
-// such a subprotocol gives no subprotocol and binary frames.
-func pickSubprotocol(offer string) (name string, base64Encode bool) {
+// pickSubprotocol takes the first subprotocol of the offer that is
+// binary.k8s.io or base64.binary.k8s.io, in the order of the offer, as the API
+// server does. An offer without such a subprotocol gives no subprotocol. The
+// subprotocol does not change the frames of the merge.
+func pickSubprotocol(offer string) string {
 	for _, entry := range strings.Split(offer, ",") {
-		switch strings.TrimSpace(entry) {
-		case binarySubprotocol:
-			return binarySubprotocol, false
-		case base64Subprotocol:
-			return base64Subprotocol, true
+		switch name := strings.TrimSpace(entry); name {
+		case binarySubprotocol, base64Subprotocol:
+			return name
 		}
 	}
-	return "", false
+	return ""
 }
 
 // websocketAccept returns the Sec-WebSocket-Accept value of the handshake.

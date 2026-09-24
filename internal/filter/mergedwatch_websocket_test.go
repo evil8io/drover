@@ -3,7 +3,6 @@ package filter
 import (
 	"bufio"
 	"bytes"
-	"encoding/base64"
 	"errors"
 	"io"
 	"net"
@@ -70,24 +69,17 @@ func nextFrame(t *testing.T, reader *bufio.Reader) wsTestFrame {
 	return frame
 }
 
-// frameEvent returns the event of one message frame, in the encoding that the
-// opcode names. A text frame has the base64 text of the event.
-func frameEvent(t *testing.T, frame wsTestFrame, opcode byte) string {
+// frameEvent checks that frame is one final text frame, and returns its
+// payload, the event as plain JSON.
+func frameEvent(t *testing.T, frame wsTestFrame) string {
 	t.Helper()
 	if !frame.fin {
 		t.Fatalf("frame = %+v, want a final frame", frame)
 	}
-	if frame.opcode != opcode {
-		t.Fatalf("opcode = %#x, want %#x", frame.opcode, opcode)
+	if frame.opcode != opcodeText {
+		t.Fatalf("opcode = %#x, want the text opcode %#x", frame.opcode, opcodeText)
 	}
-	if opcode != opcodeText {
-		return string(frame.payload)
-	}
-	decoded, err := base64.StdEncoding.DecodeString(string(frame.payload))
-	if err != nil {
-		t.Fatalf("decode the message %q: %v", frame.payload, err)
-	}
-	return string(decoded)
+	return string(frame.payload)
 }
 
 // upgradedMergeHarness answers the watch of one namespace with one event, and
@@ -101,22 +93,22 @@ func upgradedMergeHarness(t *testing.T, release <-chan struct{}) *harness {
 }
 
 // TestMergedWatchUpgradeSwitchesProtocols checks the handshake that the merge
-// answers itself, and the frame encoding of each subprotocol. The merge has
-// no single upstream connection, so it has no 101 answer to relay.
+// answers itself, and that every subprotocol gets a text frame with plain
+// JSON, as the API server sends it. The merge has no single upstream
+// connection, so it has no 101 answer to relay.
 func TestMergedWatchUpgradeSwitchesProtocols(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name     string
 		offer    string
 		protocol string
-		opcode   byte
 	}{
-		{"binary", binarySubprotocol, binarySubprotocol, opcodeBinary},
-		{"base64", base64Subprotocol, base64Subprotocol, opcodeText},
-		{"binary first of the offer", binarySubprotocol + ", " + base64Subprotocol, binarySubprotocol, opcodeBinary},
-		{"base64 first of the offer", base64Subprotocol + ", " + binarySubprotocol, base64Subprotocol, opcodeText},
-		{"an offer that the merge does not encode", "v4.channel.k8s.io", "", opcodeBinary},
-		{"no offer", "", "", opcodeBinary},
+		{"binary", binarySubprotocol, binarySubprotocol},
+		{"base64", base64Subprotocol, base64Subprotocol},
+		{"binary first of the offer", binarySubprotocol + ", " + base64Subprotocol, binarySubprotocol},
+		{"base64 first of the offer", base64Subprotocol + ", " + binarySubprotocol, base64Subprotocol},
+		{"an offer that the merge does not name", "v4.channel.k8s.io", ""},
+		{"no offer", "", ""},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -145,7 +137,7 @@ func TestMergedWatchUpgradeSwitchesProtocols(t *testing.T) {
 				t.Errorf("%s = %q, want no extension", extensionsHeader, got)
 			}
 
-			if got := frameEvent(t, nextFrame(t, reader), test.opcode); got != podEvent("a") {
+			if got := frameEvent(t, nextFrame(t, reader)); got != podEvent("a") {
 				t.Errorf("event = %q, want %q", got, podEvent("a"))
 			}
 		})
@@ -165,7 +157,7 @@ func TestMergedWatchUpgradeDropsTheHandshakeHeaders(t *testing.T) {
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		t.Fatalf("status = %d, want 101", resp.StatusCode)
 	}
-	if got := frameEvent(t, nextFrame(t, reader), opcodeBinary); got != podEvent("a") {
+	if got := frameEvent(t, nextFrame(t, reader)); got != podEvent("a") {
 		t.Fatalf("event = %q, want %q", got, podEvent("a"))
 	}
 
@@ -207,7 +199,7 @@ func TestMergedWatchUpgradeEndsOnClientCloseFrame(t *testing.T) {
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		t.Fatalf("status = %d, want 101", resp.StatusCode)
 	}
-	if got := frameEvent(t, nextFrame(t, reader), opcodeBinary); got != podEvent("a") {
+	if got := frameEvent(t, nextFrame(t, reader)); got != podEvent("a") {
 		t.Fatalf("event = %q, want %q", got, podEvent("a"))
 	}
 
@@ -236,7 +228,7 @@ func TestMergedWatchUpgradeAnswersPingWithPong(t *testing.T) {
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		t.Fatalf("status = %d, want 101", resp.StatusCode)
 	}
-	if got := frameEvent(t, nextFrame(t, reader), opcodeBinary); got != podEvent("a") {
+	if got := frameEvent(t, nextFrame(t, reader)); got != podEvent("a") {
 		t.Fatalf("event = %q, want %q", got, podEvent("a"))
 	}
 
@@ -267,7 +259,7 @@ func TestMaxWatchesPerCallerCapsAnUpgradedMergedWatch(t *testing.T) {
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		t.Fatalf("status = %d, want 101", resp.StatusCode)
 	}
-	if got := frameEvent(t, nextFrame(t, reader), opcodeBinary); got != podEvent("a") {
+	if got := frameEvent(t, nextFrame(t, reader)); got != podEvent("a") {
 		t.Fatalf("event = %q, want %q", got, podEvent("a"))
 	}
 

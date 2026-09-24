@@ -59,13 +59,20 @@ func wsMaskedFrame(opcode byte, mask [4]byte, payload []byte) []byte {
 }
 
 // wsMessage builds the frame of one message that has slice, a part of the
-// watch stream. The API server sends at most 2048 bytes of the stream per
-// message, on no event boundary.
+// watch stream, as a proxy that re-slices the stream sends it: base64 text in
+// a text frame for the base64 subprotocol, and the bytes in a binary frame for
+// every other subprotocol.
 func wsMessage(subprotocol string, slice []byte) []byte {
 	if subprotocol == base64Subprotocol {
 		return wsFrame(true, opcodeText, []byte(base64.StdEncoding.EncodeToString(slice)))
 	}
 	return wsFrame(true, opcodeBinary, slice)
+}
+
+// wsTextMessage builds one text frame with payload as it is. The API server
+// sends each watch event in this form, under every subprotocol.
+func wsTextMessage(payload []byte) []byte {
+	return wsFrame(true, opcodeText, payload)
 }
 
 // wsStream builds the frames of one message per slice.
@@ -208,6 +215,20 @@ func newUpgradeHarness(t *testing.T, source io.Reader, allow func(string, map[st
 // the 101 answer.
 func newUpgradeHarnessWith(t *testing.T, source io.Reader, allow func(string, map[string]string) bool, m *metrics, subprotocol, extensions string) *upgradeHarness {
 	t.Helper()
+	return startUpgradeHarness(t, source, allow, m, subprotocol, extensions, testLogger())
+}
+
+// newLoggedUpgradeHarness is newUpgradeHarness with a logger that writes to
+// the returned buffer at the debug level.
+func newLoggedUpgradeHarness(t *testing.T, source io.Reader, allow func(string, map[string]string) bool, subprotocol string) (*upgradeHarness, *syncBuffer) {
+	t.Helper()
+	logs := &syncBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return startUpgradeHarness(t, source, allow, testMetrics(t), subprotocol, "", logger), logs
+}
+
+func startUpgradeHarness(t *testing.T, source io.Reader, allow func(string, map[string]string) bool, m *metrics, subprotocol, extensions string, logger *slog.Logger) *upgradeHarness {
+	t.Helper()
 	upstream := &fakeUpgrade{source: source, done: make(chan struct{})}
 	resp := &http.Response{
 		StatusCode: http.StatusSwitchingProtocols,
@@ -221,7 +242,6 @@ func newUpgradeHarnessWith(t *testing.T, source io.Reader, allow func(string, ma
 		resp.Header.Set(extensionsHeader, extensions)
 	}
 	registry, slot := newTestRegistry(t)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	if _, err := filterWatchUpgrade(context.Background(), resp, allow, logger, registry, slot, m, "c-1"); err != nil {
 		t.Fatalf("filterWatchUpgrade: %v", err)
 	}
@@ -266,6 +286,37 @@ func (h *upgradeHarness) nextMessage(t *testing.T, subprotocol string) string {
 		t.Fatalf("decode the message: %v", err)
 	}
 	return string(decoded)
+}
+
+// nextPlainEvent reads the next message that reaches the caller, checks that
+// it is one final frame with opcode, and returns its payload, which is plain
+// JSON.
+func (h *upgradeHarness) nextPlainEvent(t *testing.T, opcode byte) string {
+	t.Helper()
+	frame := h.next(t)
+	if !frame.fin || frame.opcode != opcode {
+		t.Fatalf("frame = %+v, want a final frame with the opcode %#x", frame, opcode)
+	}
+	return string(frame.payload)
+}
+
+// wantClosed checks that the caller gets a close frame with status 1000 and
+// then the end of the stream, and that the stream leaves the registry.
+func (h *upgradeHarness) wantClosed(t *testing.T) {
+	t.Helper()
+	frame := h.next(t)
+	if frame.opcode != opcodeClose || !bytes.Equal(frame.payload, []byte{0x03, 0xe8}) {
+		t.Fatalf("frame = %+v, want the close frame with status 1000", frame)
+	}
+	h.wantEnd(t)
+	select {
+	case <-h.upstream.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the goroutine did not end after the close frame")
+	}
+	if got := h.registry.len(); got != 0 {
+		t.Errorf("registry length after the close frame = %d, want 0", got)
+	}
 }
 
 // wantEnd checks that no further frame reaches the caller.
@@ -400,8 +451,9 @@ func TestUpgradeUnmasksFrame(t *testing.T) {
 	h.wantEnd(t)
 }
 
-// TestUpgradeReadsSlicesOfTheStream checks a long stream that arrives in
-// 2048-byte slices, the slice size of the API server.
+// TestUpgradeReadsSlicesOfTheStream checks a long stream that a proxy
+// re-slices into 2048-byte messages. The events that pass reach the caller in
+// the form of those messages.
 func TestUpgradeReadsSlicesOfTheStream(t *testing.T) {
 	t.Parallel()
 	var stream []byte
@@ -416,18 +468,77 @@ func TestUpgradeReadsSlicesOfTheStream(t *testing.T) {
 		stream = append(stream, eventLine(name)...)
 	}
 
-	var source []byte
-	for start := 0; start < len(stream); start += 2048 {
-		source = append(source, wsMessage("", stream[start:min(start+2048, len(stream))])...)
-	}
-	h := newUpgradeHarness(t, bytes.NewReader(source), allowNames(names...), testMetrics(t), "")
+	for _, subprotocol := range subprotocols {
+		t.Run(subprotocolName(subprotocol), func(t *testing.T) {
+			t.Parallel()
+			var source []byte
+			for start := 0; start < len(stream); start += 2048 {
+				source = append(source, wsMessage(subprotocol, stream[start:min(start+2048, len(stream))])...)
+			}
+			h := newUpgradeHarness(t, bytes.NewReader(source), allowNames(names...), testMetrics(t), subprotocol)
 
-	for _, event := range want {
-		if got := h.nextMessage(t, ""); got != event {
-			t.Fatalf("message = %q, want %q", got, event)
-		}
+			for _, event := range want {
+				if got := h.nextMessage(t, subprotocol); got != event {
+					t.Fatalf("message = %q, want %q", got, event)
+				}
+			}
+			h.wantEnd(t)
+		})
+	}
+}
+
+// TestUpgradeRelaysPlainJSONUnderBase64 checks the form of the API server
+// under the base64 subprotocol, one plain JSON event per text frame. The
+// allowed event reaches the caller as a text frame with plain JSON, and the
+// other event does not.
+func TestUpgradeRelaysPlainJSONUnderBase64(t *testing.T) {
+	t.Parallel()
+	source := append(wsTextMessage(eventLine("z")), wsTextMessage(eventLine("a"))...)
+	h := newUpgradeHarness(t, bytes.NewReader(source), allowNames("a"), testMetrics(t), base64Subprotocol)
+
+	if got := h.nextPlainEvent(t, opcodeText); got != string(eventLine("a")) {
+		t.Errorf("message = %q, want the allowed event %q", got, eventLine("a"))
 	}
 	h.wantEnd(t)
+}
+
+// TestUpgradeAnswersInTheOpcodeOfTheUpstream checks that an event reaches a
+// caller without a subprotocol in the opcode of its upstream message.
+func TestUpgradeAnswersInTheOpcodeOfTheUpstream(t *testing.T) {
+	t.Parallel()
+	for name, opcode := range map[string]byte{"text": opcodeText, "binary": opcodeBinary} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			source := append(wsFrame(true, opcode, eventLine("z")), wsFrame(true, opcode, eventLine("a"))...)
+			h := newUpgradeHarness(t, bytes.NewReader(source), allowNames("a"), testMetrics(t), "")
+
+			if got := h.nextPlainEvent(t, opcode); got != string(eventLine("a")) {
+				t.Errorf("message = %q, want the allowed event %q", got, eventLine("a"))
+			}
+			h.wantEnd(t)
+		})
+	}
+}
+
+// TestUpgradeEndsOnMessageThatIsNeitherJSONNorBase64 checks that such a
+// message under the base64 subprotocol ends the stream with a close frame and
+// a warn line.
+func TestUpgradeEndsOnMessageThatIsNeitherJSONNorBase64(t *testing.T) {
+	t.Parallel()
+	source := append(wsTextMessage(eventLine("a")), wsTextMessage([]byte("!!! not base64"))...)
+	h, logs := newLoggedUpgradeHarness(t, bytes.NewReader(source), allowNames("a"), base64Subprotocol)
+
+	if got := h.nextPlainEvent(t, opcodeText); got != string(eventLine("a")) {
+		t.Errorf("message = %q, want the allowed event %q", got, eventLine("a"))
+	}
+	h.wantClosed(t)
+
+	line := logs.String()
+	for _, want := range []string{"level=WARN", "cluster=c-1", "neither JSON nor base64"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("logs = %q, want %q", line, want)
+		}
+	}
 }
 
 // TestUpgradeEndsOnWebsocketExtension checks that an answer with an extension
@@ -449,17 +560,17 @@ func TestUpgradeEndsOnWebsocketExtension(t *testing.T) {
 }
 
 // TestUpgradeEndsAboveTheBufferBound checks that a stream that never
-// completes an event ends once the buffer passes the bound.
+// completes an event ends with a close frame once the buffer passes the bound.
 func TestUpgradeEndsAboveTheBufferBound(t *testing.T) {
 	t.Parallel()
 	head := []byte(`{"type":"ADDED","object":{"metadata":{"name":"`)
 	pad := bytes.Repeat([]byte("x"), 400*1024)
 	source := wsStream("", append(head, pad...), pad, pad)
-	h := newUpgradeHarness(t, bytes.NewReader(source), allowNames("a"), testMetrics(t), "")
+	h, logs := newLoggedUpgradeHarness(t, bytes.NewReader(source), allowNames("a"), "")
 
-	_, err := h.reader.ReadByte()
-	if err == nil || !strings.Contains(err.Error(), "without a complete event") {
-		t.Fatalf("read = %v, want the error of the buffer bound", err)
+	h.wantClosed(t)
+	if line := logs.String(); !strings.Contains(line, "without a complete event") {
+		t.Errorf("logs = %q, want the error of the buffer bound", line)
 	}
 }
 
@@ -556,20 +667,19 @@ func wantRejected(t *testing.T, reader *sdkmetric.ManualReader, limit string, wa
 }
 
 // TestUpgradeEndsOnUndecodableTrailingBytes checks that a message with a
-// valid event followed by bytes that are not JSON ends the stream with an
-// error, instead of leaving it open.
+// valid event followed by bytes that are not JSON ends the stream with a
+// close frame, instead of leaving it open.
 func TestUpgradeEndsOnUndecodableTrailingBytes(t *testing.T) {
 	t.Parallel()
 	message := append(eventLine("a"), []byte("not json\n")...)
-	h := newUpgradeHarness(t, bytes.NewReader(wsStream("", message)), allowNames("a"), testMetrics(t), "")
+	h, logs := newLoggedUpgradeHarness(t, bytes.NewReader(wsStream("", message)), allowNames("a"), "")
 
 	if got := h.nextMessage(t, ""); got != string(eventLine("a")) {
 		t.Fatalf("message = %q, want the ADDED event %q", got, eventLine("a"))
 	}
-
-	_, err := h.reader.ReadByte()
-	if err == nil || !strings.Contains(err.Error(), "decode a websocket watch event") {
-		t.Fatalf("read after the malformed tail = %v, want an error that names the decode failure", err)
+	h.wantClosed(t)
+	if line := logs.String(); !strings.Contains(line, "decode a websocket watch event") {
+		t.Errorf("logs = %q, want the decode failure", line)
 	}
 }
 
