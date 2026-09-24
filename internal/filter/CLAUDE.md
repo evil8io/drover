@@ -39,6 +39,7 @@ Human doc: `docs/api-filter.md`. Update it with a behaviour change.
 
 - The merged answer writes `metadata` after the elements, and its `resourceVersion` is the lowest of the answers, because a watch from the lowest value loses no event. An earlier version wrote the highest and lost the events of a namespace listed at a lower revision. The value is known at the end of the stream only.
 - The dispatcher takes a concurrency slot before it starts a request, and it starts the requests in name order, so the in-order reader never waits for a request that has no slot. That order is the deadlock fix. Keep it.
+- The global in-flight cap waits in the dispatcher only, after the per-request slot, so the in-order reader never waits on a request without a slot.
 - A 404 from one namespace stops the whole fan-out, because a cluster-scoped kind answers 404 in every namespace. `kubectl get nodes` then costs at most the concurrency plus one requests.
 - A caller that may see no object gets an empty collection, not the native 403. The kind then comes from the discovery document with the caller credentials, because no answer names it. A Rancher user with zero projects reaches Steve and gets an empty collection, so that caller takes this path too.
 - `kubectl netshoot run` warns `couldn't attach` on a direct cluster connection too. It is not a routing defect.

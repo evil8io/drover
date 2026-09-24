@@ -36,6 +36,7 @@ type config struct {
 	fanout             bool
 	fanoutMaxNS        int
 	fanoutWorkers      int
+	fanoutMaxInflight  int
 	fanoutWatchMaxNS   int
 	maxWatches         int
 	callerMaxWatches   int
@@ -87,6 +88,7 @@ func runAPIFilter(args []string) int {
 		Fanout:                   cfg.fanout,
 		FanoutMaxNamespaces:      cfg.fanoutMaxNS,
 		FanoutConcurrency:        cfg.fanoutWorkers,
+		FanoutMaxInflight:        cfg.fanoutMaxInflight,
 		FanoutMaxWatchNamespaces: cfg.fanoutWatchMaxNS,
 		MaxWatches:               cfg.maxWatches,
 		MaxWatchesPerCaller:      cfg.callerMaxWatches,
@@ -128,6 +130,7 @@ func runAPIFilter(args []string) int {
 		"fanout", cfg.fanout,
 		"fanout_max_namespaces", cfg.fanoutMaxNS,
 		"fanout_concurrency", cfg.fanoutWorkers,
+		"fanout_max_inflight", cfg.fanoutMaxInflight,
 		"fanout_max_watch_namespaces", cfg.fanoutWatchMaxNS,
 		"max_watches", cfg.maxWatches,
 		"max_watches_per_caller", cfg.callerMaxWatches,
@@ -177,6 +180,7 @@ func parseConfig(args []string, output io.Writer, getenv func(string) string) (c
 	flags.BoolVar(&cfg.fanout, "fanout", false, "answer a cluster-wide list of a namespaced kind with one request per allowed namespace")
 	flags.IntVar(&cfg.fanoutMaxNS, "fanout-max-namespaces", 200, "count of allowed namespaces above which a fan-out answers 403")
 	flags.IntVar(&cfg.fanoutWorkers, "fanout-concurrency", 16, "namespaced requests of one fan-out that run at a time")
+	flags.IntVar(&cfg.fanoutMaxInflight, "fanout-max-inflight", 64, "namespaced requests of all fan-outs that run at a time")
 	flags.IntVar(&cfg.fanoutWatchMaxNS, "fanout-max-watch-namespaces", 50, "count of allowed namespaces above which a cluster-wide watch answers 403")
 	flags.IntVar(&cfg.maxWatches, "max-watches", 1000, "count of open watch streams above which a new watch answers 503")
 	flags.IntVar(&cfg.callerMaxWatches, "max-watches-per-caller", 100, "count of open watch streams of one caller above which a new watch of that caller answers 503")

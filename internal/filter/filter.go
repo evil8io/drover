@@ -69,6 +69,9 @@ type Config struct {
 	// that run at a time. Zero selects 16. It also bounds the answers that
 	// the merge holds.
 	FanoutConcurrency int
+	// FanoutMaxInflight is the count of namespaced requests of all fan-outs
+	// that run at a time. Zero selects 64.
+	FanoutMaxInflight int
 	// FanoutMaxWatchNamespaces is the count of allowed namespaces above which
 	// a cluster-wide watch answers 403. Zero selects 50. A merged watch holds
 	// one upstream connection per namespace for its whole life, so its bound
@@ -110,6 +113,7 @@ type Service struct {
 	fanoutEnabled            bool
 	fanoutMaxNamespaces      int
 	fanoutConcurrency        int
+	fanoutGlobal             chan struct{}
 	fanoutMaxWatchNamespaces int
 
 	draining atomic.Bool
@@ -189,6 +193,10 @@ func New(cfg Config) (*Service, error) {
 	if fanoutConcurrency <= 0 {
 		fanoutConcurrency = defaultFanoutConcurrency
 	}
+	fanoutMaxInflight := cfg.FanoutMaxInflight
+	if fanoutMaxInflight <= 0 {
+		fanoutMaxInflight = defaultFanoutMaxInflight
+	}
 	fanoutMaxWatchNamespaces := cfg.FanoutMaxWatchNamespaces
 	if fanoutMaxWatchNamespaces <= 0 {
 		fanoutMaxWatchNamespaces = defaultFanoutMaxWatchNamespaces
@@ -226,6 +234,7 @@ func New(cfg Config) (*Service, error) {
 		fanoutEnabled:            cfg.Fanout,
 		fanoutMaxNamespaces:      fanoutMaxNamespaces,
 		fanoutConcurrency:        fanoutConcurrency,
+		fanoutGlobal:             make(chan struct{}, fanoutMaxInflight),
 		fanoutMaxWatchNamespaces: fanoutMaxWatchNamespaces,
 	}
 	svc.proxy = &httputil.ReverseProxy{
