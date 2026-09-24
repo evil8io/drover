@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
@@ -210,6 +211,11 @@ func newRotator(cfg Config) (*rotator, error) {
 	}
 	if (cfg.PasswordNamespace == "") != (cfg.PasswordSecret == "") {
 		return nil, errors.New("the password Secret needs both a namespace and a name")
+	}
+	if cfg.PasswordSecret != "" {
+		if n := utf8.RuneCountInString(cfg.Password); n < passwordMinLength {
+			return nil, fmt.Errorf("the password has %d characters, and Rancher needs %d or more", n, passwordMinLength)
+		}
 	}
 
 	r := &rotator{cfg: cfg, logger: cfg.Logger, now: cfg.Now}

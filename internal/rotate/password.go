@@ -21,6 +21,7 @@ const (
 	passwordIterations     = 210000
 	passwordKeyLength      = 32
 	passwordSaltLength     = 32
+	passwordMinLength      = 12
 )
 
 func (r *rotator) passwordRef() string {
