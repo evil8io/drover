@@ -196,8 +196,9 @@ func watchSelector(caller string, set allowedSet) (string, bool) {
 
 // namespaceWatch is the state of one namespace watch that
 // trackNamespaceWatch keeps. selector and selected are the case of the current
-// upstream watch, as watchSelector gives it. names is the allowed set that the
-// stream of the client follows.
+// upstream watch, as watchSelector gives it, and projects is the project set
+// of that selector. names is the allowed set that the stream of the client
+// follows.
 type namespaceWatch struct {
 	req     *http.Request
 	cluster string
@@ -206,6 +207,7 @@ type namespaceWatch struct {
 
 	selector string
 	selected bool
+	projects []string
 	names    []string
 
 	// synthesize is false for a stream that takes no event of the service.
@@ -224,6 +226,7 @@ func newNamespaceWatch(req *http.Request, cluster string, set allowedSet, caller
 		caller:   caller,
 		selector: selector,
 		selected: selected,
+		projects: slices.Clone(set.projects),
 		names:    slices.Clone(set.names),
 		synthesize: !transformsObject(filterJSONAccept(req.Header.Get("Accept"))) &&
 			caller == "" && req.URL.Query().Get("fieldSelector") == "",
@@ -283,7 +286,8 @@ func (s *Service) trackNamespaceWatch(ctx context.Context, w *namespaceWatch) {
 // watch without a selector keeps its upstream for its whole life, and a name
 // that the caller gains gets an ADDED event with the object that
 // readNamespace returns. A stream that takes no event of the service ends
-// instead, when a change needs such an event.
+// instead, when a change needs such an event. It stays open on a lost name
+// whose DELETED event the upstream watch sent, as upstreamSentDeletes finds.
 func (s *Service) followAllowedSet(ctx context.Context, w *namespaceWatch, set allowedSet) bool {
 	lost := subtract(w.names, set.names)
 	gained := subtract(set.names, w.names)
@@ -292,13 +296,15 @@ func (s *Service) followAllowedSet(ctx context.Context, w *namespaceWatch, set a
 		return true
 	}
 
-	if !w.synthesize && (len(lost) > 0 || (!w.selected && len(gained) > 0)) {
+	if !w.synthesize && (!s.upstreamSentDeletes(ctx, w, lost) || (!w.selected && len(gained) > 0)) {
 		s.expireNamespaceWatch(ctx, w, "ended a namespace watch that takes no event of the service, because the allowed namespaces of the caller changed")
 		return false
 	}
-	for _, name := range lost {
-		if !s.emitNamespaceEvent(ctx, w, watchDeleted, name, deletedNamespace(name)) {
-			return false
+	if w.synthesize {
+		for _, name := range lost {
+			if !s.emitNamespaceEvent(ctx, w, watchDeleted, name, deletedNamespace(name)) {
+				return false
+			}
 		}
 	}
 	w.names = subtract(w.names, lost)
@@ -333,7 +339,58 @@ func (s *Service) followAllowedSet(ctx context.Context, w *namespaceWatch, set a
 			"cluster", w.cluster, "lost", len(lost), "gained", len(gained))
 		w.selector = selector
 	}
+	w.projects = slices.Clone(set.projects)
 	w.names = slices.Clone(set.names)
+	return true
+}
+
+// upstreamSentDeletes reports whether the upstream watch of w sent the
+// DELETED event of every name of lost. The upstream watch of a project
+// selector sends the DELETED event of a namespace that is gone, and of a
+// namespace whose project label leaves the projects of the selector.
+// upstreamSentDeletes reads each lost namespace once to find these two cases,
+// and it stops at the first name that is in neither case.
+func (s *Service) upstreamSentDeletes(ctx context.Context, w *namespaceWatch, lost []string) bool {
+	// The upstream watch of the match-nothing selector sends no event, so a
+	// lost name there counts as not sent. That selector goes with an empty
+	// allowed set, so it has no lost name.
+	if !w.selected || len(w.projects) == 0 {
+		return len(lost) == 0
+	}
+	for _, name := range lost {
+		if !s.upstreamDeleted(ctx, w, name) {
+			return false
+		}
+	}
+	return true
+}
+
+// upstreamDeleted reports whether the upstream watch of w sent the DELETED
+// event of the lost name: the read of the namespace answers 404, or its
+// project label is not in w.projects. Every other answer counts as a
+// namespace under the selector, so the stream ends and the client keeps no
+// stale namespace.
+func (s *Service) upstreamDeleted(ctx context.Context, w *namespaceWatch, name string) bool {
+	// A table answer has the labels in its rows.
+	status, object, err := s.getNamespace(ctx, w.cluster, name, jsonContentType)
+	var namespace struct {
+		Metadata struct {
+			Labels map[string]string `json:"labels"`
+		} `json:"metadata"`
+	}
+	switch {
+	case status == http.StatusNotFound:
+	case err != nil:
+		s.logger.DebugContext(ctx, "read a lost namespace", "cluster", w.cluster, "namespace", name, "reason", err.Error())
+		return false
+	case json.Unmarshal(object, &namespace) != nil:
+		s.logger.DebugContext(ctx, "read a lost namespace", "cluster", w.cluster, "namespace", name, "reason", "the object does not decode")
+		return false
+	case slices.Contains(w.projects, namespace.Metadata.Labels[projectLabel]):
+		return false
+	}
+	s.logger.DebugContext(ctx, "kept a namespace watch open on a lost namespace, because the upstream watch sent its DELETED event",
+		"cluster", w.cluster, "namespace", name, "status", status)
 	return true
 }
 
@@ -391,44 +448,50 @@ func (s *Service) swapNamespaceWatch(ctx context.Context, w *namespaceWatch, sel
 // read it. It reports false for an answer that is not 200 with one JSON
 // object. The tracker then tries the name again at the next re-read.
 func (s *Service) readNamespace(ctx context.Context, w *namespaceWatch, name string) (json.RawMessage, bool) {
+	_, object, err := s.getNamespace(ctx, w.cluster, name, filterJSONAccept(w.req.Header.Get("Accept")))
+	if err != nil {
+		s.logger.DebugContext(ctx, "read a gained namespace", "cluster", w.cluster, "namespace", name, "reason", err.Error())
+		return nil, false
+	}
+	return object, true
+}
+
+// getNamespace reads the namespace name of cluster with the service token,
+// in the media type accept. It returns the status of the answer, or zero when
+// no answer came. It returns the compacted object for a 200 answer with one
+// JSON object, and an error for every other answer.
+func (s *Service) getNamespace(ctx context.Context, cluster, name, accept string) (int, json.RawMessage, error) {
 	token, err := rancherclient.ReadToken(s.tokenFile)
 	if err != nil {
-		s.logger.DebugContext(ctx, "read a gained namespace", "cluster", w.cluster, "namespace", name, "reason", err.Error())
-		return nil, false
+		return 0, nil, err
 	}
 	target := *s.upstream
-	target.Path = "/k8s/clusters/" + w.cluster + "/api/v1/namespaces/" + name
+	target.Path = "/k8s/clusters/" + cluster + "/api/v1/namespaces/" + name
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
-		s.logger.DebugContext(ctx, "read a gained namespace", "cluster", w.cluster, "namespace", name, "reason", err.Error())
-		return nil, false
+		return 0, nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", filterJSONAccept(w.req.Header.Get("Accept")))
+	req.Header.Set("Accept", accept)
 
 	resp, err := s.base.RoundTrip(req)
 	if err != nil {
-		s.logger.DebugContext(ctx, "read a gained namespace", "cluster", w.cluster, "namespace", name, "reason", err.Error())
-		return nil, false
+		return 0, nil, err
 	}
 	body, tooLarge, err := readLimited(resp.Body, maxDrainBody)
 	_ = resp.Body.Close()
-	var reason string
 	var object bytes.Buffer
 	switch {
 	case err != nil:
-		reason = err.Error()
+		return resp.StatusCode, nil, err
 	case resp.StatusCode != http.StatusOK:
-		reason = "status " + resp.Status
+		return resp.StatusCode, nil, errors.New("status " + resp.Status)
 	case tooLarge:
-		reason = "the response is larger than the limit"
+		return resp.StatusCode, nil, errors.New("the response is larger than the limit")
 	case !startsWithObject(body) || json.Compact(&object, body) != nil:
-		reason = "the response is not one JSON object"
-	default:
-		return object.Bytes(), true
+		return resp.StatusCode, nil, errors.New("the response is not one JSON object")
 	}
-	s.logger.DebugContext(ctx, "read a gained namespace", "cluster", w.cluster, "namespace", name, "reason", reason)
-	return nil, false
+	return resp.StatusCode, object.Bytes(), nil
 }
 
 // emitNamespaceEvent writes the watch event of type with object to the stream
