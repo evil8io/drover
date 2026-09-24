@@ -543,7 +543,14 @@ func openWatch(release <-chan struct{}) http.HandlerFunc {
 // BOOKMARK event of openWatch, so the stream runs when it returns.
 func startWatch(t *testing.T, h *harness) *bufio.Reader {
 	t.Helper()
-	resp, err := h.proxy.Client().Do(h.request(t, http.MethodGet, listPath+"?watch=true", nil, callerHeader()))
+	return startWatchWith(t, h, listPath+"?watch=true", callerHeader())
+}
+
+// startWatchWith is startWatch with the target and the headers of the
+// request.
+func startWatchWith(t *testing.T, h *harness, target string, header http.Header) *bufio.Reader {
+	t.Helper()
+	resp, err := h.proxy.Client().Do(h.request(t, http.MethodGet, target, nil, header))
 	if err != nil {
 		t.Fatalf("do request: %v", err)
 	}
@@ -590,35 +597,349 @@ func waitFor(condition func() bool) bool {
 	return false
 }
 
-// TestWatchEndsOnProjectChange checks that the ticker ends a chunked stream
-// once the caller gets an allowed namespace in a second project. The
-// selector of the watch names the first project only, so Rancher sends no
-// event for the namespace of the second project.
-func TestWatchEndsOnProjectChange(t *testing.T) {
+// matchNothing is the watch selector of a caller with no namespace.
+const matchNothing = "kubernetes.io/metadata.name,!kubernetes.io/metadata.name"
+
+// namespaceLine returns the watch event of type for the namespace, with its
+// project label when project is not empty, and with the newline of the
+// stream.
+func namespaceLine(eventType, name, project string) string {
+	labels := ""
+	if project != "" {
+		labels = `,"labels":{"` + projectLabel + `":"` + project + `"}`
+	}
+	return `{"type":"` + eventType + `","object":{"metadata":{"name":"` + name + `"` + labels + `}}}` + "\n"
+}
+
+// deletedLine returns the DELETED event that the service writes for a
+// namespace that the caller loses.
+func deletedLine(name string) string {
+	return `{"type":"DELETED","object":{"kind":"Namespace","apiVersion":"v1","metadata":{"name":"` + name + `"}}}` + "\n"
+}
+
+// privilegedWatches returns the recorded namespace watches with the service
+// token.
+func privilegedWatches(up *upstream) []recorded {
+	var watches []recorded
+	for _, request := range up.all() {
+		if request.path == listPath && request.header.Get("Authorization") == serviceAuth {
+			watches = append(watches, request)
+		}
+	}
+	return watches
+}
+
+// swappedWatches answers a privileged namespace watch by its labelSelector.
+// The watch with the selector first sends the BOOKMARK event, and it closes
+// closed once the service closes it. A watch with another selector sends the
+// events that lines holds for that selector, and it stays open until release
+// closes. A selector without an entry answers 500.
+func swappedWatches(first string, closed chan<- struct{}, release <-chan struct{}, lines map[string][]string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		selector := r.URL.Query().Get("labelSelector")
+		if selector == first {
+			w.Header().Set("Content-Type", jsonContentType)
+			w.WriteHeader(http.StatusOK)
+			writeWatchLines(w, []string{bookmarkEvent})
+			select {
+			case <-r.Context().Done():
+				close(closed)
+			case <-release:
+			}
+			return
+		}
+		events, ok := lines[selector]
+		if !ok {
+			errorStatus(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", jsonContentType)
+		w.WriteHeader(http.StatusOK)
+		writeWatchLines(w, events)
+		<-release
+	}
+}
+
+// wantSwappedQuery checks that the privileged watch of a swap has selector,
+// and no parameter that sets the start of the stream.
+func wantSwappedQuery(t *testing.T, watch recorded, selector string) {
+	t.Helper()
+	if got := watch.query.Get("labelSelector"); got != selector {
+		t.Errorf("labelSelector of the swap = %q, want %q", got, selector)
+	}
+	if got := watch.query.Get("watch"); got != "true" {
+		t.Errorf("watch of the swap = %q, want true", got)
+	}
+	for _, key := range []string{"resourceVersion", "resourceVersionMatch", "sendInitialEvents"} {
+		if watch.query.Has(key) {
+			t.Errorf("query of the swap = %v, want no %s", watch.query, key)
+		}
+	}
+	if got := watch.header.Get("Authorization"); got != serviceAuth {
+		t.Errorf("Authorization of the swap = %q, want %q", got, serviceAuth)
+	}
+}
+
+// wantClosed waits until closed closes.
+func wantClosed(t *testing.T, closed <-chan struct{}, message string) {
+	t.Helper()
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal(message)
+	}
+}
+
+// TestWatchSwapsTheUpstreamOnTheFirstNamespace checks the first namespace of
+// a project of a caller with an empty allowed set. The watch starts with the
+// selector that matches nothing. After the tick the service opens a second
+// privileged watch with the project selector and without the resourceVersion
+// of the caller, and the client gets its ADDED event. The service closes the
+// first upstream watch, and the stream stays open.
+func TestWatchSwapsTheUpstreamOnTheFirstNamespace(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+	closed := make(chan struct{})
+
+	const projectSelector = projectLabel + " in (p-1)"
+	added := namespaceLine(watchAdded, "a", "p-1")
+	namespaces := newNamespaceSet()
+	h := newHarnessOpt(t, listUpstreamWithProjects(
+		namespaces.handler(),
+		newProjectSet("p-1").handler(),
+		swappedWatches(matchNothing, closed, release, map[string][]string{projectSelector: {added}}),
+	), shortTTL)
+
+	reader := startWatchWith(t, h, listPath+"?watch=true&resourceVersion=42", callerHeader())
+	namespaces.set(steveNamespace{name: "a", project: "p-1"})
+	h.clock.advance(time.Minute)
+
+	if got := nextEvent(t, reader); got != added {
+		t.Fatalf("event = %q, want the ADDED event %q of the swapped upstream", got, added)
+	}
+	watches := privilegedWatches(h.upstream)
+	if len(watches) != 2 {
+		t.Fatalf("privileged watches = %d, want 2", len(watches))
+	}
+	if got := watches[0].query.Get("labelSelector"); got != matchNothing {
+		t.Errorf("labelSelector of the first watch = %q, want %q", got, matchNothing)
+	}
+	if got := watches[0].query.Get("resourceVersion"); got != "42" {
+		t.Errorf("resourceVersion of the first watch = %q, want 42", got)
+	}
+	wantSwappedQuery(t, watches[1], projectSelector)
+	wantClosed(t, closed, "the service did not close the first upstream watch")
+	wantLog(t, h, `msg="swapped the upstream of a namespace watch`, "cluster=c-1", "lost=0", "gained=1")
+	wantOpenAfterTick(t, h, reader)
+}
+
+// TestWatchSwapsTheUpstreamOnALostNamespace checks a caller that loses the
+// only namespace of a project. The client gets the DELETED event of that
+// namespace first, and then the ADDED event of the swapped upstream, whose
+// selector names the other project only. The stream stays open.
+func TestWatchSwapsTheUpstreamOnALostNamespace(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+	closed := make(chan struct{})
+
+	const (
+		bothProjects = projectLabel + " in (p-1,p-2)"
+		oneProject   = projectLabel + " in (p-1)"
+	)
+	added := namespaceLine(watchAdded, "a", "p-1")
+	namespaces := newNamespaceSet(steveNamespace{name: "a", project: "p-1"}, steveNamespace{name: "b", project: "p-2"})
+	h := newHarnessOpt(t, listUpstreamWithProjects(
+		namespaces.handler(),
+		newProjectSet("p-1", "p-2").handler(),
+		swappedWatches(bothProjects, closed, release, map[string][]string{oneProject: {added}}),
+	), shortTTL)
+
+	reader := startWatch(t, h)
+	namespaces.set(steveNamespace{name: "a", project: "p-1"})
+	h.clock.advance(time.Minute)
+
+	if got := nextEvent(t, reader); got != deletedLine("b") {
+		t.Fatalf("event = %q, want the DELETED event %q", got, deletedLine("b"))
+	}
+	if got := nextEvent(t, reader); got != added {
+		t.Fatalf("event = %q, want the ADDED event %q of the swapped upstream", got, added)
+	}
+	watches := privilegedWatches(h.upstream)
+	if len(watches) != 2 {
+		t.Fatalf("privileged watches = %d, want 2", len(watches))
+	}
+	wantSwappedQuery(t, watches[1], oneProject)
+	wantClosed(t, closed, "the service did not close the first upstream watch")
+	wantLog(t, h, `msg="swapped the upstream of a namespace watch`, "lost=1", "gained=0")
+	wantOpenAfterTick(t, h, reader)
+}
+
+// TestTableWatchEndsOnALostNamespace checks that a watch of a server-side
+// table gets no DELETED event of the service, because a table event needs the
+// columns of the stream. The stream ends after the ERROR event with the Status
+// 410 Expired instead, and kubectl lists again.
+func TestTableWatchEndsOnALostNamespace(t *testing.T) {
 	t.Parallel()
 	release := make(chan struct{})
 	defer close(release)
 
-	namespaces := newNamespaceSet(steveNamespace{name: "a", project: "p-1"})
-	projects := newProjectSet("p-1")
+	namespaces := newNamespaceSet(steveNamespace{name: "a", project: "p-1"}, steveNamespace{name: "b", project: "p-1"})
 	h := newHarnessOpt(t, listUpstreamWithProjects(
 		namespaces.handler(),
-		projects.handler(),
+		newProjectSet("p-1").handler(),
 		openWatch(release),
 	), shortTTL)
 
-	ended := streamEnd(startWatch(t, h))
-	namespaces.set(steveNamespace{name: "a", project: "p-1"}, steveNamespace{name: "c", project: "p-2"})
-	projects.set("p-1", "p-2")
+	header := callerHeader()
+	header.Set("Accept", tableAccept)
+	reader := startWatchWith(t, h, listPath+"?watch=true", header)
+	namespaces.set(steveNamespace{name: "a", project: "p-1"})
 	h.clock.advance(time.Minute)
 
-	select {
-	case err := <-ended:
-		if err != nil {
-			t.Errorf("stream error = %v, want a clean end of the stream", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the stream stayed open after the project set changed")
+	wantExpiredEvent(t, nextEvent(t, reader), "the allowed namespaces of the caller changed")
+	wantCleanEnd(t, reader, "the table watch stayed open after the caller lost a namespace")
+	wantLog(t, h, "ended a namespace watch that takes no event of the service", "cluster=c-1")
+	if got := len(privilegedWatches(h.upstream)); got != 1 {
+		t.Errorf("privileged watches = %d, want 1", got)
+	}
+}
+
+// TestWatchWithoutSelectorAddsAGainedNamespace checks a watch without a
+// selector, of a caller with a namespace outside its projects. A gained name
+// gets one privileged read of that namespace, and the client gets an ADDED
+// event with the object of the answer. The upstream watch stays the same. A
+// read that answers 403 gets a new try at the next tick.
+func TestWatchWithoutSelectorAddsAGainedNamespace(t *testing.T) {
+	t.Parallel()
+	const object = `{"kind":"Namespace","apiVersion":"v1","metadata":{"name":"b","resourceVersion":"7"}}`
+	for _, test := range []struct {
+		name  string
+		fails int32
+		reads int32
+	}{
+		{"the read answers 200", 0, 1},
+		{"the first read answers 403", 1, 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			release := make(chan struct{})
+			defer close(release)
+
+			var reads atomic.Int32
+			watch := openWatch(release)
+			namespaces := newNamespaceSet(steveNamespace{name: "a"})
+			h := newHarnessOpt(t, listUpstream(namespaces.handler(), func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != listPath+"/b" {
+					watch(w, r)
+					return
+				}
+				if reads.Add(1) <= test.fails {
+					http.Error(w, "forbidden", http.StatusForbidden)
+					return
+				}
+				w.Header().Set("Content-Type", jsonContentType)
+				_, _ = io.WriteString(w, object)
+			}), shortTTL)
+
+			reader := startWatch(t, h)
+			namespaces.set(steveNamespace{name: "a"}, steveNamespace{name: "b"})
+			h.clock.advance(time.Minute)
+
+			want := `{"type":"ADDED","object":` + object + "}\n"
+			if got := nextEvent(t, reader); got != want {
+				t.Fatalf("event = %q, want %q", got, want)
+			}
+			if got := reads.Load(); got != test.reads {
+				t.Errorf("reads of namespace b = %d, want %d", got, test.reads)
+			}
+			for _, request := range h.upstream.all() {
+				if request.path != listPath+"/b" {
+					continue
+				}
+				if got := request.header.Get("Authorization"); got != serviceAuth {
+					t.Errorf("Authorization of the read = %q, want %q", got, serviceAuth)
+				}
+				if got := request.header.Get("Accept"); got != jsonContentType {
+					t.Errorf("Accept of the read = %q, want %q", got, jsonContentType)
+				}
+			}
+			if got := len(privilegedWatches(h.upstream)); got != 1 {
+				t.Errorf("privileged watches = %d, want 1", got)
+			}
+			wantLog(t, h, `msg="wrote a watch event of the service"`, "type=ADDED", "namespace=b")
+			wantOpenAfterTick(t, h, reader)
+		})
+	}
+}
+
+// TestWatchWithoutSelectorDeletesALostNamespace checks that a watch without a
+// selector gets the DELETED event of a lost namespace, that the upstream watch
+// stays the same, and that the stream stays open.
+func TestWatchWithoutSelectorDeletesALostNamespace(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	namespaces := newNamespaceSet(steveNamespace{name: "a"}, steveNamespace{name: "b"})
+	h := newHarnessOpt(t, listUpstream(namespaces.handler(), openWatch(release)), shortTTL)
+
+	reader := startWatch(t, h)
+	namespaces.set(steveNamespace{name: "a"})
+	h.clock.advance(time.Minute)
+
+	if got := nextEvent(t, reader); got != deletedLine("b") {
+		t.Fatalf("event = %q, want the DELETED event %q", got, deletedLine("b"))
+	}
+	if got := len(privilegedWatches(h.upstream)); got != 1 {
+		t.Errorf("privileged watches = %d, want 1", got)
+	}
+	wantOpenAfterTick(t, h, reader)
+}
+
+// TestWatchEndsWhenTheSwapFails checks that a stream ends after the ERROR
+// event with the Status 410 Expired, when the swap of its upstream fails. The
+// swap fails on an answer other than 200, and without a token of the fetch
+// limit of the caller. A caller with rate 1 has a burst of 2: the first fetch
+// takes one token, and the re-read after 21 ms takes the other.
+func TestWatchEndsWhenTheSwapFails(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name    string
+		advance time.Duration
+		opts    []func(*Config)
+		watches int
+		reason  string
+	}{
+		{"the swap answers 500", time.Minute, nil, 2, "500 Internal Server Error"},
+		{"no token", 21 * time.Millisecond, []func(*Config){func(cfg *Config) { cfg.FetchRatePerCaller = 1 }}, 1, "no free token"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			release := make(chan struct{})
+			defer close(release)
+
+			namespaces := newNamespaceSet(steveNamespace{name: "a", project: "p-1"})
+			projects := newProjectSet("p-1")
+			h := newHarnessOpt(t, listUpstreamWithProjects(
+				namespaces.handler(),
+				projects.handler(),
+				swappedWatches(projectLabel+" in (p-1)", make(chan struct{}), release, nil),
+			), append([]func(*Config){shortTTL}, test.opts...)...)
+
+			reader := startWatch(t, h)
+			namespaces.set(steveNamespace{name: "a", project: "p-1"}, steveNamespace{name: "c", project: "p-2"})
+			projects.set("p-1", "p-2")
+			h.clock.advance(test.advance)
+
+			wantExpiredEvent(t, nextEvent(t, reader), "the allowed namespaces of the caller changed")
+			wantCleanEnd(t, reader, "the stream stayed open after the swap failed")
+			wantLog(t, h, "ended a namespace watch, because the swap of its upstream failed", test.reason)
+			if got := len(privilegedWatches(h.upstream)); got != test.watches {
+				t.Errorf("privileged watches = %d, want %d", got, test.watches)
+			}
+		})
 	}
 }
 
@@ -651,10 +972,10 @@ func TestWatchStaysOpenWithTheSameProjects(t *testing.T) {
 	}
 }
 
-// TestWatchWithoutSelectorHasNoTicker checks that a watch of a caller with a
-// namespace outside its own projects gets no ticker. That watch has no
-// selector, so the event filter shows a new project by itself.
-func TestWatchWithoutSelectorHasNoTicker(t *testing.T) {
+// TestWatchWithoutSelectorKeepsItsUpstream checks that the ticker also
+// re-reads the allowed set of a watch without a selector, and that a new
+// visible project with the same names keeps the stream and its upstream.
+func TestWatchWithoutSelectorKeepsItsUpstream(t *testing.T) {
 	t.Parallel()
 	release := make(chan struct{})
 	defer close(release)
@@ -669,31 +990,33 @@ func TestWatchWithoutSelectorHasNoTicker(t *testing.T) {
 	ended := streamEnd(startWatch(t, h))
 	projects.set("p-1")
 	h.clock.advance(time.Minute)
-	time.Sleep(200 * time.Millisecond)
 
-	if got := h.upstream.countPath(projectsPath); got != 1 {
-		t.Errorf("project list requests = %d, want 1", got)
+	if !waitFor(func() bool { return h.upstream.countPath(projectsPath) > 1 }) {
+		t.Fatal("the ticker did not re-read the projects of the caller")
 	}
 	select {
 	case err := <-ended:
 		t.Fatalf("the stream ended with %v, want an open stream", err)
-	default:
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := len(privilegedWatches(h.upstream)); got != 1 {
+		t.Errorf("privileged watches = %d, want 1", got)
 	}
 }
 
-// TestUpgradedWatchEndsOnProjectChange checks that the ticker also ends an
-// upgraded stream, and that the client reads a close frame before the end.
-func TestUpgradedWatchEndsOnProjectChange(t *testing.T) {
+// TestUpgradedWatchEndsOnANamespaceOutsideProjects checks that an upgraded
+// stream whose allowed set needs a watch without a selector gets the ERROR
+// event with the Status 410 Expired as one text frame, then a close frame.
+func TestUpgradedWatchEndsOnANamespaceOutsideProjects(t *testing.T) {
 	t.Parallel()
 	read := make(chan struct{})
 	defer close(read)
 
 	event := eventLine("a")
 	namespaces := newNamespaceSet(steveNamespace{name: "a", project: "p-1"})
-	projects := newProjectSet("p-1")
 	h := newHarnessOpt(t, listUpstreamWithProjects(
 		namespaces.handler(),
-		projects.handler(),
+		newProjectSet("p-1").handler(),
 		func(w http.ResponseWriter, r *http.Request) {
 			hijacker, ok := w.(http.Hijacker)
 			if !ok {
@@ -752,10 +1075,17 @@ func TestUpgradedWatchEndsOnProjectChange(t *testing.T) {
 		t.Fatalf("first frame = %q, want the allowed event %q", frame.payload, event)
 	}
 
-	namespaces.set(steveNamespace{name: "a", project: "p-1"}, steveNamespace{name: "c", project: "p-2"})
-	projects.set("p-1", "p-2")
+	namespaces.set(steveNamespace{name: "a", project: "p-1"}, steveNamespace{name: "b"})
 	h.clock.advance(time.Minute)
 
+	frame, err = readWSFrame(reader)
+	if err != nil {
+		t.Fatalf("read the ERROR frame: %v", err)
+	}
+	if frame.opcode != opcodeText {
+		t.Errorf("opcode = %#x, want the text opcode %#x", frame.opcode, opcodeText)
+	}
+	wantExpiredEvent(t, string(frame.payload), "the allowed namespaces of the caller changed")
 	frame, err = readWSFrame(reader)
 	if err != nil {
 		t.Fatalf("read the close frame: %v", err)
@@ -769,9 +1099,10 @@ func TestUpgradedWatchEndsOnProjectChange(t *testing.T) {
 }
 
 // TestWatchEndsOnNamespaceOutsideProjects checks that the ticker ends the
-// stream once the caller gets a namespace outside its own projects. The
-// selector of the watch holds the projects of the caller only, and Rancher
-// drops that namespace server-side, so no event reaches the event filter.
+// stream once the caller gets a namespace outside its own projects, after the
+// ERROR event with the Status 410 Expired. The allowed set then needs a watch
+// without a selector, and a new upstream watch without a selector replays
+// every namespace of the cluster.
 func TestWatchEndsOnNamespaceOutsideProjects(t *testing.T) {
 	t.Parallel()
 	release := make(chan struct{})
@@ -784,23 +1115,22 @@ func TestWatchEndsOnNamespaceOutsideProjects(t *testing.T) {
 		openWatch(release),
 	), shortTTL)
 
-	ended := streamEnd(startWatch(t, h))
+	reader := startWatch(t, h)
 	namespaces.set(steveNamespace{name: "a", project: "p-1"}, steveNamespace{name: "b"})
 	h.clock.advance(time.Minute)
 
-	select {
-	case err := <-ended:
-		if err != nil {
-			t.Errorf("stream error = %v, want a clean end of the stream", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the stream stayed open after the caller got a namespace outside its projects")
+	wantExpiredEvent(t, nextEvent(t, reader), "the allowed namespaces of the caller changed")
+	wantCleanEnd(t, reader, "the stream stayed open after the caller got a namespace outside its projects")
+	wantLog(t, h, "ended a namespace watch, because the allowed namespaces of the caller need a watch without a selector")
+	if got := len(privilegedWatches(h.upstream)); got != 1 {
+		t.Errorf("privileged watches = %d, want 1", got)
 	}
 }
 
 // TestWatchStaysOpenOnNamespaceInsideProjects checks that a new namespace in a
-// project of the caller keeps the stream open. The selector for the same
-// projects is the same string, and Rancher sends the event for that namespace.
+// project of the caller keeps the stream and its upstream. The selector for
+// the same projects is the same string, and Rancher sends the event for that
+// namespace.
 func TestWatchStaysOpenOnNamespaceInsideProjects(t *testing.T) {
 	t.Parallel()
 	release := make(chan struct{})
@@ -825,6 +1155,9 @@ func TestWatchStaysOpenOnNamespaceInsideProjects(t *testing.T) {
 	case err := <-ended:
 		t.Fatalf("the stream ended with %v, want an open stream", err)
 	case <-time.After(100 * time.Millisecond):
+	}
+	if got := len(privilegedWatches(h.upstream)); got != 1 {
+		t.Errorf("privileged watches = %d, want 1", got)
 	}
 }
 

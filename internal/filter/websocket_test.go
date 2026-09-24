@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -739,5 +741,118 @@ func TestWatchRegistryEndIsIdempotentForAnUpgradedStream(t *testing.T) {
 	}
 	if frames[0].opcode != opcodeClose {
 		t.Errorf("opcode = %#x, want the close opcode %#x", frames[0].opcode, opcodeClose)
+	}
+}
+
+// upgradedWatches answers a privileged namespace watch with a protocol switch,
+// by its labelSelector. The watch with the selector first sends the BOOKMARK
+// event as one text frame, and it closes closed once the service closes the
+// connection. A watch with another selector sends the events that events
+// holds for that selector, one text frame each, and it stays open until
+// release closes.
+func upgradedWatches(t *testing.T, first string, closed chan<- struct{}, release <-chan struct{}, events map[string][]string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		selector := r.URL.Query().Get("labelSelector")
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("the upstream response writer has no hijacker")
+			return
+		}
+		conn, buffered, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = buffered.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		if selector == first {
+			_, _ = buffered.Write(wsTextMessage([]byte(bookmarkEvent)))
+			if err := buffered.Flush(); err != nil {
+				t.Errorf("write the upgrade response: %v", err)
+				return
+			}
+			_, _ = io.Copy(io.Discard, buffered)
+			close(closed)
+			return
+		}
+		for _, event := range events[selector] {
+			_, _ = buffered.Write(wsTextMessage([]byte(event)))
+		}
+		if err := buffered.Flush(); err != nil {
+			t.Errorf("write the upgrade response: %v", err)
+			return
+		}
+		<-release
+	}
+}
+
+// TestUpgradedWatchSwapsTheUpstreamOnTheFirstNamespace is
+// TestWatchSwapsTheUpstreamOnTheFirstNamespace for a websocket watch. The
+// service opens the second upstream with a handshake of its own, with a new
+// key, and the client gets the ADDED event of that upstream as one text frame
+// on the same connection.
+func TestUpgradedWatchSwapsTheUpstreamOnTheFirstNamespace(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+	closed := make(chan struct{})
+
+	const projectSelector = projectLabel + " in (p-1)"
+	added := namespaceLine(watchAdded, "a", "p-1")
+	namespaces := newNamespaceSet()
+	h := newHarnessOpt(t, listUpstreamWithProjects(
+		namespaces.handler(),
+		newProjectSet("p-1").handler(),
+		upgradedWatches(t, matchNothing, closed, release, map[string][]string{projectSelector: {added}}),
+	), shortTTL)
+
+	resp, reader, conn := dialMergedWatch(t, h, listPath+"?watch=true&resourceVersion=42", base64Subprotocol)
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("status = %d, want 101", resp.StatusCode)
+	}
+	if got := frameEvent(t, nextFrame(t, reader)); got != bookmarkEvent {
+		t.Fatalf("event = %q, want the BOOKMARK event", got)
+	}
+
+	namespaces.set(steveNamespace{name: "a", project: "p-1"})
+	h.clock.advance(time.Minute)
+	if got := frameEvent(t, nextFrame(t, reader)); got != added {
+		t.Fatalf("event = %q, want the ADDED event %q of the swapped upstream", got, added)
+	}
+
+	watches := privilegedWatches(h.upstream)
+	if len(watches) != 2 {
+		t.Fatalf("privileged watches = %d, want 2", len(watches))
+	}
+	wantSwappedQuery(t, watches[1], projectSelector)
+	header := watches[1].header
+	if got := header.Get("Upgrade"); got != "websocket" {
+		t.Errorf("Upgrade of the swap = %q, want websocket", got)
+	}
+	if got := header.Get("Sec-WebSocket-Protocol"); got != base64Subprotocol {
+		t.Errorf("Sec-WebSocket-Protocol of the swap = %q, want %q", got, base64Subprotocol)
+	}
+	if got := header.Get("Sec-WebSocket-Version"); got != "13" {
+		t.Errorf("Sec-WebSocket-Version of the swap = %q, want 13", got)
+	}
+	if key := header.Get("Sec-WebSocket-Key"); key == "" || key == handshakeKey || key == watches[0].header.Get("Sec-WebSocket-Key") {
+		t.Errorf("Sec-WebSocket-Key of the swap = %q, want a new key", key)
+	}
+	if got := header.Get(extensionsHeader); got != "" {
+		t.Errorf("%s of the swap = %q, want no extension", extensionsHeader, got)
+	}
+	wantClosed(t, closed, "the service did not close the first upstream connection")
+
+	before := h.upstream.countPath(stevePath)
+	h.clock.advance(time.Minute)
+	if !waitFor(func() bool { return h.upstream.countPath(stevePath) > before }) {
+		t.Fatal("the ticker did not re-read the allowed set of the caller")
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatalf("set the read deadline: %v", err)
+	}
+	var timeout net.Error
+	if _, err := reader.ReadByte(); !errors.As(err, &timeout) || !timeout.Timeout() {
+		t.Errorf("read after the tick = %v, want a timeout of an open stream", err)
 	}
 }

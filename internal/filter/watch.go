@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -235,34 +237,163 @@ func (r *watchRegistry) closeAll() int {
 	return len(writers)
 }
 
+// upstreamHolder is the upstream body of one namespace watch. The relay
+// goroutine reads the current body, and the tracker of the allowed set can
+// put a new body in its place while the stream runs. generation counts the
+// swaps, so the relay knows whether a failed read was the read of a body that
+// a swap closed.
+type upstreamHolder[T io.ReadCloser] struct {
+	mu         sync.Mutex
+	body       T
+	generation int
+	finished   bool
+}
+
+func newUpstreamHolder[T io.ReadCloser](body T) *upstreamHolder[T] {
+	return &upstreamHolder[T]{body: body}
+}
+
+func (h *upstreamHolder[T]) current() (T, int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.body, h.generation
+}
+
+// swap puts body in place of the current body, and closes the old body, so
+// the read of the relay fails and the relay goes on with body. It reports
+// false, and closes body, when the stream ended already.
+func (h *upstreamHolder[T]) swap(body T) bool {
+	h.mu.Lock()
+	if h.finished {
+		h.mu.Unlock()
+		_ = body.Close()
+		return false
+	}
+	old := h.body
+	h.body = body
+	h.generation++
+	h.mu.Unlock()
+	_ = old.Close()
+	return true
+}
+
+// next returns the body that a swap put in place after generation, once a
+// read of the body of generation failed. It reports false when no swap
+// followed. The stream then ends, and every later swap fails.
+func (h *upstreamHolder[T]) next(generation int) (T, int, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.finished || h.generation == generation {
+		h.finished = true
+		var none T
+		return none, generation, false
+	}
+	return h.body, h.generation, true
+}
+
+// finish marks the stream as ended, and closes the current body.
+func (h *upstreamHolder[T]) finish() {
+	h.mu.Lock()
+	h.finished = true
+	body := h.body
+	h.mu.Unlock()
+	_ = body.Close()
+}
+
+// errStreamEnded marks a swap of the upstream that came after the end of the
+// stream.
+var errStreamEnded = errors.New("the watch stream ended")
+
+// watchRelay is one running namespace watch, as the tracker of the allowed set
+// of the caller drives it. writer is the write side of the stream of the
+// client, and the key of the stream in the registry. Exactly one of chunked
+// and upgraded holds the upstream.
+type watchRelay struct {
+	writer   *io.PipeWriter
+	chunked  *upstreamHolder[io.ReadCloser]
+	upgraded *upstreamHolder[io.ReadWriteCloser]
+
+	// mu makes each write to writer whole, so a synthesized event never goes
+	// into the middle of an event of the upstream.
+	mu sync.Mutex
+}
+
+// Write writes p to the stream of the client in one piece.
+func (r *watchRelay) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.writer.Write(p)
+}
+
+// emit writes one event that the service makes itself: one line on a chunked
+// stream, and one text frame with plain JSON on an upgraded stream.
+func (r *watchRelay) emit(event json.RawMessage) error {
+	line := make([]byte, 0, len(event)+1)
+	line = append(append(line, event...), '\n')
+	if r.upgraded != nil {
+		line = dataFrame(opcodeText, line)
+	}
+	_, err := r.Write(line)
+	return err
+}
+
+// swap puts the body of resp, the answer of a new privileged watch, in place
+// of the upstream of the stream, and closes the old upstream.
+func (r *watchRelay) swap(resp *http.Response) error {
+	if r.upgraded == nil {
+		if !r.chunked.swap(resp.Body) {
+			return errStreamEnded
+		}
+		return nil
+	}
+	body, ok := resp.Body.(io.ReadWriteCloser)
+	if !ok {
+		_ = resp.Body.Close()
+		return fmt.Errorf("the upgraded watch has a read-only body of type %T", resp.Body)
+	}
+	if !r.upgraded.swap(body) {
+		return errStreamEnded
+	}
+	return nil
+}
+
 // filterWatchBody reads a namespace watch stream from upstream, and returns a
-// stream with only the events that allow lets through, plus the write side of
-// that stream. A BOOKMARK, an ERROR, and any event the filter cannot parse
-// always pass. It registers the write side in registry with slot while the
-// goroutine runs, so a drain and a project change can end the stream. The goroutine
-// ends, and closes upstream, in two cases: a read of upstream fails, for
-// example because ctx cancels, or a write to the pipe fails because the
-// reader closed it or the registry ended it. It raises
-// drover.filter.watches.open while the stream is open, and counts a dropped
-// event on cluster in drover.filter.events.dropped.
-func filterWatchBody(ctx context.Context, upstream io.ReadCloser, allow func(name string, labels map[string]string) bool, logger *slog.Logger, registry *watchRegistry, slot *watchSlot, metrics *metrics, cluster string) (io.ReadCloser, *io.PipeWriter) {
+// stream with only the events that allow lets through, plus the relay of that
+// stream. A BOOKMARK, an ERROR, and any event the filter cannot parse always
+// pass. It registers the write side in registry with slot while the goroutine
+// runs, so a drain and the tracker of the allowed set can end the stream. A
+// read of upstream that fails after a swap of the relay goes on with the new
+// upstream. The goroutine ends, and closes the current upstream, in two cases:
+// a read of upstream fails without a swap, for example because ctx cancels,
+// or a write to the pipe fails because the reader closed it or the registry
+// ended it. It raises drover.filter.watches.open while the stream is open, and
+// counts a dropped event on cluster in drover.filter.events.dropped.
+func filterWatchBody(ctx context.Context, upstream io.ReadCloser, allow func(name string, labels map[string]string) bool, logger *slog.Logger, registry *watchRegistry, slot *watchSlot, metrics *metrics, cluster string) (io.ReadCloser, *watchRelay) {
 	reader, writer := io.Pipe()
 	registry.add(writer, false, slot)
 	metrics.watchOpened(ctx)
+	relay := &watchRelay{writer: writer, chunked: newUpstreamHolder(upstream)}
 
 	go func() {
 		defer func() {
 			registry.remove(writer)
 			metrics.watchClosed(ctx)
-			_ = upstream.Close()
+			relay.chunked.finish()
 		}()
 
-		decoder := json.NewDecoder(upstream)
+		body, generation := relay.chunked.current()
+		decoder := json.NewDecoder(body)
 		for {
 			var raw json.RawMessage
 			if err := decoder.Decode(&raw); err != nil {
-				_ = writer.CloseWithError(err)
-				return
+				next, swapped, ok := relay.chunked.next(generation)
+				if !ok {
+					_ = writer.CloseWithError(err)
+					return
+				}
+				generation = swapped
+				decoder = json.NewDecoder(next)
+				continue
 			}
 
 			var event watchEvent
@@ -281,14 +412,11 @@ func filterWatchBody(ctx context.Context, upstream io.ReadCloser, allow func(nam
 				continue
 			}
 
-			if _, err := writer.Write(raw); err != nil {
-				return
-			}
-			if _, err := io.WriteString(writer, "\n"); err != nil {
+			if _, err := relay.Write(append(raw, '\n')); err != nil {
 				return
 			}
 		}
 	}()
 
-	return reader, writer
+	return reader, relay
 }
