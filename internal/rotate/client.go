@@ -37,5 +37,12 @@ func NewClient(caFile string, insecureSkipVerify bool) (*http.Client, error) {
 		}
 		transport.TLSClientConfig.RootCAs = pool
 	}
-	return &http.Client{Transport: transport, Timeout: 30 * time.Second}, nil
+	return &http.Client{Transport: transport, Timeout: 30 * time.Second, CheckRedirect: noRedirect}, nil
+}
+
+// noRedirect keeps every redirect answer as a normal response. A followed 307
+// or 308 answer resends the login body, with the password, to the redirect
+// target.
+func noRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
 }

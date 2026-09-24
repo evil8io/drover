@@ -130,22 +130,23 @@ func (t *fakeToken) item(now time.Time, current bool) map[string]any {
 // fakeRancher answers the six Rancher calls of the rotation. It keeps the tokens
 // of one user, as the real API does.
 type fakeRancher struct {
-	server      *httptest.Server
-	mu          sync.Mutex
-	calls       []recordedCall
-	tokens      map[string]*fakeToken
-	issued      []string
-	session     string
-	loginStatus int
-	grantedTTL  int64
-	counter     int
-	now         time.Time
+	server        *httptest.Server
+	mu            sync.Mutex
+	calls         []recordedCall
+	tokens        map[string]*fakeToken
+	issued        []string
+	session       string
+	loginStatus   int
+	grantedTTL    int64
+	counter       int
+	now           time.Time
+	redirectLogin bool
 }
 
 func newFakeRancher(t *testing.T) *fakeRancher {
 	t.Helper()
 	f := &fakeRancher{tokens: map[string]*fakeToken{}, now: testNow}
-	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
+	f.server = httptest.NewTLSServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.server.Close)
 	return f
 }
@@ -238,6 +239,11 @@ func (f *fakeRancher) caller(r *http.Request) *fakeToken {
 }
 
 func (f *fakeRancher) serveLogin(w http.ResponseWriter, body []byte) {
+	if f.redirectLogin {
+		w.Header().Set("Location", "/moved")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+		return
+	}
 	if f.loginStatus != 0 && f.loginStatus != http.StatusCreated {
 		http.Error(w, "the login failed", f.loginStatus)
 		return

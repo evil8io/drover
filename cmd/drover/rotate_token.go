@@ -131,7 +131,7 @@ func parseRotateConfig(args []string, output io.Writer, getenv func(string) stri
 		serviceAccount string
 		logLevel       string
 	)
-	flags.StringVar(&rancherURL, "rancher-url", "", "Rancher URL, http:// or https://")
+	flags.StringVar(&rancherURL, "rancher-url", "", "Rancher URL, https:// only")
 	flags.StringVar(&cfg.rancherCAFile, "rancher-ca-file", "", "PEM bundle that verifies an https Rancher URL")
 	flags.BoolVar(&cfg.rancherInsecureSkipVerify, "rancher-insecure-skip-verify", false, "skip the certificate verification of an https Rancher URL")
 	flags.StringVar(&credentialsDir, "credentials-dir", "", "directory with the files username and password")
@@ -163,7 +163,7 @@ func parseRotateConfig(args []string, output io.Writer, getenv func(string) stri
 	if rancherURL == "" {
 		return rotateConfig{}, errors.New("-rancher-url is required")
 	}
-	if cfg.rancher, err = parseServiceURL("-rancher-url", rancherURL); err != nil {
+	if cfg.rancher, err = parseServiceURL("-rancher-url", rancherURL, true); err != nil {
 		return rotateConfig{}, err
 	}
 
@@ -174,7 +174,7 @@ func parseRotateConfig(args []string, output io.Writer, getenv func(string) stri
 		}
 		kubeURL = "https://" + net.JoinHostPort(host, port)
 	}
-	if cfg.kube, err = parseServiceURL("-kube-url", kubeURL); err != nil {
+	if cfg.kube, err = parseServiceURL("-kube-url", kubeURL, false); err != nil {
 		return rotateConfig{}, err
 	}
 
@@ -227,10 +227,13 @@ func parseRotateConfig(args []string, output io.Writer, getenv func(string) stri
 	return cfg, nil
 }
 
-func parseServiceURL(name, raw string) (*url.URL, error) {
+func parseServiceURL(name, raw string, httpsOnly bool) (*url.URL, error) {
 	target, err := url.Parse(raw)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", name, err)
+	}
+	if httpsOnly && target.Scheme != "https" {
+		return nil, fmt.Errorf("%s scheme %q is not https", name, target.Scheme)
 	}
 	if target.Scheme != "http" && target.Scheme != "https" {
 		return nil, fmt.Errorf("%s scheme %q is not http or https", name, target.Scheme)

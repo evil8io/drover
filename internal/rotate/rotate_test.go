@@ -243,6 +243,43 @@ func TestRunLoginFailure(t *testing.T) {
 	h.assertNoSecret(t)
 }
 
+func TestRunDoesNotFollowARedirect(t *testing.T) {
+	t.Parallel()
+	rancher := newFakeRancher(t)
+	rancher.redirectLogin = true
+	kube := newFakeKube(t, nil)
+	h := newHarness(t, kube, rancher)
+
+	err := h.run()
+	if err == nil {
+		t.Fatal("Run returned no error")
+	}
+	if !strings.Contains(err.Error(), "status 307") {
+		t.Errorf("the error is %q, and the test expects status 307", err)
+	}
+	assertRoutes(t, rancher.routes(), []string{"POST /v3-public/localProviders/local?action=login"})
+	if got := kube.value(testKey); got != "" {
+		t.Errorf("the Secret has the token %q after the redirect", got)
+	}
+	h.assertNoSecret(t)
+}
+
+func TestNewRejectsAnHTTPRancherURL(t *testing.T) {
+	t.Parallel()
+	rancher := newFakeRancher(t)
+	kube := newFakeKube(t, nil)
+	h := newHarness(t, kube, rancher)
+	h.cfg.Rancher = mustParseURL(t, "http://rancher.example")
+
+	err := h.run()
+	if err == nil {
+		t.Fatal("Run returned no error")
+	}
+	if !strings.Contains(err.Error(), "https") {
+		t.Errorf("the error is %q, and the test expects https", err)
+	}
+}
+
 func TestRunMissingSecret(t *testing.T) {
 	t.Parallel()
 	kube := newFakeKube(t, nil)
