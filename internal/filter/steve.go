@@ -24,16 +24,21 @@ const (
 	maxSteveBody    = 32 << 20
 	maxAllowedNames = 20000
 
-	defaultMaxCacheEntries = 1000
-	defaultFetchRate       = 50
-	fetchWaitCap           = 5 * time.Second
+	defaultMaxCacheEntries    = 1000
+	defaultFetchRate          = 50
+	defaultFetchRatePerCaller = 5
+	fetchWaitCap              = 5 * time.Second
+
+	limitShared  = "shared"
+	limitCaller  = "caller"
+	noCredential = "none"
 
 	projectsPath = "/v3/projects"
 	// projectLabel is the label of Rancher on a namespace of a project. Its
 	// value is the part of the project id after the colon.
 	projectLabel = "field.cattle.io/projectId"
-	// sessionCookie is the cookie that Rancher reads when the request has no
-	// Authorization header.
+	// sessionCookie is the cookie that Rancher reads when the first
+	// Authorization value is empty or absent.
 	sessionCookie = "R_SESS"
 
 	maxKnownClusters = 1024
@@ -91,44 +96,62 @@ func (s *Service) allowedNamespace(ctx context.Context, cluster string, header h
 
 // allowed returns the cached allowed set of the caller. A non-nil response is
 // the 401 or 403 answer of Steve or of the project list, or the 429 answer of
-// the fetch rate limit, for the caller.
+// a fetch rate limit, for the caller.
 func (s *Service) allowed(ctx context.Context, cluster string, header http.Header) (allowedSet, *http.Response, error) {
 	auth := header.Get("Authorization")
 	cookie := strings.Join(header.Values("Cookie"), "; ")
-	sum := sha256.Sum256([]byte(credentialKey(header)))
-	key := cluster + "\n" + hex.EncodeToString(sum[:])
+	caller := callerHash(header)
+	key := cluster + "\n" + caller
 
 	return s.cache.do(ctx, key, func() (allowedSet, *http.Response, error) {
-		if err := s.limiter.wait(ctx, fetchWaitCap); err != nil {
-			if errors.Is(err, errFetchThrottled) {
-				s.metrics.fetchThrottled(ctx)
-				message := serviceName + ": the fetch rate limit has no free token"
-				return allowedSet{}, statusResponse(nil, http.StatusTooManyRequests, reasonThrottled, message), nil
-			}
-			return allowedSet{}, nil, err
+		// The caller limit runs first, so a throttled caller takes no shared token.
+		if throttled, err := s.waitFetch(ctx, s.callers.get(caller), limitCaller); throttled != nil || err != nil {
+			return allowedSet{}, throttled, err
+		}
+		if throttled, err := s.waitFetch(ctx, s.limiter, limitShared); throttled != nil || err != nil {
+			return allowedSet{}, throttled, err
 		}
 		return s.fetchAllowed(ctx, cluster, auth, cookie)
 	})
 }
 
+// waitFetch takes one token of l, for the fetch rate limit named limit. It
+// returns a 429 answer when l has no free token inside fetchWaitCap.
+func (s *Service) waitFetch(ctx context.Context, l *limiter, limit string) (*http.Response, error) {
+	err := l.wait(ctx, fetchWaitCap)
+	if err == nil {
+		return nil, nil
+	}
+	if !errors.Is(err, errFetchThrottled) {
+		return nil, err
+	}
+	s.metrics.fetchThrottled(ctx, limit)
+	message := serviceName + ": the fetch rate limit has no free token"
+	if limit == limitCaller {
+		message = serviceName + ": the fetch rate limit per caller has no free token"
+	}
+	return statusResponse(nil, http.StatusTooManyRequests, reasonThrottled, message), nil
+}
+
+// callerHash returns the sha256 hex of the credential key of the headers.
+func callerHash(header http.Header) string {
+	sum := sha256.Sum256([]byte(credentialKey(header)))
+	return hex.EncodeToString(sum[:])
+}
+
 // credentialKey returns the credential that Rancher reads from the headers:
-// every Authorization value, or the session cookie when the header is absent.
-// Another cookie is not part of the key, so a caller cannot fill the cache
-// with one credential and a changed cookie.
+// the first Authorization value, or the first R_SESS cookie as net/http
+// parses it when that value is empty. It returns a fixed key when the headers
+// have neither. A second value and another cookie do not change the key, so
+// one credential gives one key.
 func credentialKey(header http.Header) string {
-	if values := header.Values("Authorization"); len(values) > 0 {
-		return "authorization\n" + strings.Join(values, "\n")
+	if auth := header.Get("Authorization"); auth != "" {
+		return "authorization\n" + auth
 	}
-	var sessions []string
-	for _, line := range header.Values("Cookie") {
-		for _, part := range strings.Split(line, ";") {
-			name, value, ok := strings.Cut(strings.TrimSpace(part), "=")
-			if ok && name == sessionCookie {
-				sessions = append(sessions, value)
-			}
-		}
+	if session, err := (&http.Request{Header: header}).Cookie(sessionCookie); err == nil {
+		return "cookie\n" + session.Value
 	}
-	return "cookie\n" + strings.Join(sessions, "\n")
+	return noCredential
 }
 
 // fetchAllowed reads the namespace names and the project ids of the caller,
@@ -508,9 +531,8 @@ func (c *cache) evictEarliest() {
 // errFetchThrottled marks a wait that ends with no free token inside the cap.
 var errFetchThrottled = errors.New("fetch rate limit: no free token")
 
-// limiter is a token bucket that the whole Service shares, to bound the rate
-// of a fetch. It is hand-written, because the module has no external rate
-// package.
+// limiter is a token bucket that bounds the rate of a fetch. It is
+// hand-written, because the module has no external rate package.
 type limiter struct {
 	rate  float64 // tokens added per second
 	burst float64 // maximum tokens held
@@ -572,4 +594,64 @@ func (l *limiter) refill() {
 		l.tokens = min(l.burst, l.tokens+elapsed.Seconds()*l.rate)
 		l.last = now
 	}
+}
+
+// lastRefill returns the time of the last refill.
+func (l *limiter) lastRefill() time.Time {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.last
+}
+
+// callerLimiters has one fetch limiter per caller credential, keyed on the
+// callerHash of the headers. The set has at most maxEntries limiters.
+type callerLimiters struct {
+	rate       float64
+	burst      float64
+	maxEntries int
+	now        func() time.Time
+
+	mu       sync.Mutex
+	limiters map[string]*limiter
+}
+
+func newCallerLimiters(rate, burst float64, maxEntries int, now func() time.Time) *callerLimiters {
+	return &callerLimiters{
+		rate:       rate,
+		burst:      burst,
+		maxEntries: maxEntries,
+		now:        now,
+		limiters:   make(map[string]*limiter),
+	}
+}
+
+// get returns the limiter of the caller key. A new key gets a full bucket.
+// At the bound, the limiter with the oldest refill goes first.
+func (c *callerLimiters) get(key string) *limiter {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if l, ok := c.limiters[key]; ok {
+		return l
+	}
+	for len(c.limiters) > 0 && len(c.limiters) >= c.maxEntries {
+		c.evictOldest()
+	}
+	l := newLimiter(c.rate, c.burst, c.now)
+	c.limiters[key] = l
+	return l
+}
+
+// evictOldest deletes the limiter with the oldest refill. The caller holds
+// mu, and the limiters map has at least one entry.
+func (c *callerLimiters) evictOldest() {
+	var oldestKey string
+	var oldest time.Time
+	first := true
+	for key, l := range c.limiters {
+		if last := l.lastRefill(); first || last.Before(oldest) {
+			oldestKey, oldest = key, last
+			first = false
+		}
+	}
+	delete(c.limiters, oldestKey)
 }

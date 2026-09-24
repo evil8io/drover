@@ -32,6 +32,7 @@ type config struct {
 	cacheTTL           time.Duration
 	maxCacheEntries    int
 	fetchRate          float64
+	fetchRatePerCaller float64
 	fanout             bool
 	fanoutMaxNS        int
 	fanoutWorkers      int
@@ -80,6 +81,7 @@ func runAPIFilter(args []string) int {
 		CacheTTL:           cfg.cacheTTL,
 		MaxCacheEntries:    cfg.maxCacheEntries,
 		FetchRate:          cfg.fetchRate,
+		FetchRatePerCaller: cfg.fetchRatePerCaller,
 
 		Fanout:                   cfg.fanout,
 		FanoutMaxNamespaces:      cfg.fanoutMaxNS,
@@ -120,6 +122,7 @@ func runAPIFilter(args []string) int {
 		"cache_ttl", cfg.cacheTTL.String(),
 		"max_cache_entries", cfg.maxCacheEntries,
 		"fetch_rate", cfg.fetchRate,
+		"fetch_rate_per_caller", cfg.fetchRatePerCaller,
 		"fanout", cfg.fanout,
 		"fanout_max_namespaces", cfg.fanoutMaxNS,
 		"fanout_concurrency", cfg.fanoutWorkers,
@@ -167,6 +170,7 @@ func parseConfig(args []string, output io.Writer, getenv func(string) string) (c
 	flags.DurationVar(&cfg.cacheTTL, "cache-ttl", 15*time.Second, "lifetime of a cached allowed set")
 	flags.IntVar(&cfg.maxCacheEntries, "max-cache-entries", 1000, "hard bound on the cached allowed sets")
 	flags.Float64Var(&cfg.fetchRate, "fetch-rate", 50, "fetches per second that the shared rate limit allows, for a fetch of an allowed set")
+	flags.Float64Var(&cfg.fetchRatePerCaller, "fetch-rate-per-caller", 5, "fetches per second that the rate limit of one caller credential allows, for a fetch of an allowed set")
 	flags.BoolVar(&cfg.fanout, "fanout", false, "answer a cluster-wide list of a namespaced kind with one request per allowed namespace")
 	flags.IntVar(&cfg.fanoutMaxNS, "fanout-max-namespaces", 200, "count of allowed namespaces above which a fan-out answers 403")
 	flags.IntVar(&cfg.fanoutWorkers, "fanout-concurrency", 16, "namespaced requests of one fan-out that run at a time")

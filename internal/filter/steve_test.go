@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
@@ -138,6 +140,104 @@ func TestFetchThrottledAnswers429(t *testing.T) {
 	if len(sum.DataPoints) != 1 || sum.DataPoints[0].Value != 1 {
 		t.Fatalf("fetch throttled data points = %+v, want one point with value 1", sum.DataPoints)
 	}
+	if limit, _ := sum.DataPoints[0].Attributes.Value(attribute.Key("limit")); limit.AsString() != limitShared {
+		t.Errorf("limit attribute = %q, want %q", limit.AsString(), limitShared)
+	}
+}
+
+// TestFetchThrottledPerCaller checks that the misses of one credential past
+// the burst of the limit per caller answer 429, while a fetch of another
+// credential still gets a token. A denied Steve answer is not cached, so
+// each request of that credential is a miss.
+func TestFetchThrottledPerCaller(t *testing.T) {
+	t.Parallel()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	const attacker = "Bearer attacker"
+	steve := func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == attacker {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		steveHandler("a")(w, r)
+	}
+	h := newHarnessOpt(t, listUpstream(steve, namespaceListHandler), func(cfg *Config) {
+		cfg.FetchRatePerCaller = 1
+		cfg.MeterProvider = provider
+	})
+	attackerHeader := http.Header{"Authorization": []string{attacker}}
+
+	for i := range 2 {
+		resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, attackerHeader))
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("request %d status = %d, want the 403 of Steve inside the burst", i, resp.StatusCode)
+		}
+	}
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, listPath, nil, attackerHeader))
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status past the burst = %d, want 429", resp.StatusCode)
+	}
+	var status statusBody
+	if err := json.Unmarshal(body, &status); err != nil {
+		t.Fatalf("unmarshal status body: %v", err)
+	}
+	if want := serviceName + ": the fetch rate limit per caller has no free token"; status.Message != want {
+		t.Errorf("message = %q, want %q", status.Message, want)
+	}
+	if got := h.upstream.countPath(stevePath); got != 2 {
+		t.Errorf("Steve requests = %d, want 2, the throttled fetch must skip the upstream call", got)
+	}
+
+	resp, _ = h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status of another credential = %d, want 200", resp.StatusCode)
+	}
+
+	var data metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &data); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	sum := findSum(t, data, "drover.filter.fetch.throttled")
+	if len(sum.DataPoints) != 1 || sum.DataPoints[0].Value != 1 {
+		t.Fatalf("fetch throttled data points = %+v, want one point with value 1", sum.DataPoints)
+	}
+	if limit, _ := sum.DataPoints[0].Attributes.Value(attribute.Key("limit")); limit.AsString() != limitCaller {
+		t.Errorf("limit attribute = %q, want %q", limit.AsString(), limitCaller)
+	}
+}
+
+// TestCallerLimitersStayBounded checks that more caller credentials than the
+// cache bound leave that count of limiters per caller, and that the limiter
+// with the oldest refill goes first.
+func TestCallerLimitersStayBounded(t *testing.T) {
+	t.Parallel()
+	h := newHarnessOpt(t, listUpstream(steveHandler("a"), namespaceListHandler), func(cfg *Config) {
+		cfg.MaxCacheEntries = 2
+	})
+
+	headers := make([]http.Header, 0, 5)
+	for i := range 5 {
+		header := http.Header{"Authorization": []string{fmt.Sprintf("Bearer caller-%d", i)}}
+		headers = append(headers, header)
+		resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, header))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d status = %d, want 200", i, resp.StatusCode)
+		}
+		h.clock.advance(time.Second)
+	}
+
+	h.svc.callers.mu.Lock()
+	defer h.svc.callers.mu.Unlock()
+	if got := len(h.svc.callers.limiters); got != 2 {
+		t.Errorf("limiters = %d, want 2", got)
+	}
+	for _, i := range []int{3, 4} {
+		if _, ok := h.svc.callers.limiters[callerHash(headers[i])]; !ok {
+			t.Errorf("the limiter of caller-%d is evicted, want the two newest kept", i)
+		}
+	}
 }
 
 func TestConfigDefaults(t *testing.T) {
@@ -162,6 +262,15 @@ func TestConfigDefaults(t *testing.T) {
 	}
 	if want := 2 * float64(defaultFetchRate); svc.limiter.burst != want {
 		t.Errorf("fetch burst = %v, want %v", svc.limiter.burst, want)
+	}
+	if svc.callers.rate != defaultFetchRatePerCaller {
+		t.Errorf("fetch rate per caller = %v, want %v", svc.callers.rate, defaultFetchRatePerCaller)
+	}
+	if want := 2 * float64(defaultFetchRatePerCaller); svc.callers.burst != want {
+		t.Errorf("fetch burst per caller = %v, want %v", svc.callers.burst, want)
+	}
+	if svc.callers.maxEntries != defaultMaxCacheEntries {
+		t.Errorf("max caller limiters = %d, want %d", svc.callers.maxEntries, defaultMaxCacheEntries)
 	}
 }
 
@@ -263,9 +372,39 @@ func TestCredentialKey(t *testing.T) {
 			want:   "cookie\na",
 		},
 		{
+			name:   "authorization ignores a second value",
+			header: http.Header{"Authorization": []string{"Bearer x", "Bearer y"}},
+			want:   "authorization\nBearer x",
+		},
+		{
+			name:   "session cookie ignores a second session cookie",
+			header: http.Header{"Cookie": []string{"R_SESS=a; R_SESS=b"}},
+			want:   "cookie\na",
+		},
+		{
+			name:   "session cookie ignores a session cookie on a second Cookie line",
+			header: http.Header{"Cookie": []string{"R_SESS=a", "R_SESS=b"}},
+			want:   "cookie\na",
+		},
+		{
+			name:   "empty authorization reads the session cookie",
+			header: http.Header{"Authorization": []string{""}, "Cookie": []string{"R_SESS=a"}},
+			want:   "cookie\na",
+		},
+		{
+			name:   "empty authorization and no cookie",
+			header: http.Header{"Authorization": []string{""}},
+			want:   noCredential,
+		},
+		{
+			name:   "no session cookie",
+			header: http.Header{"Cookie": []string{"CSRF=x"}},
+			want:   noCredential,
+		},
+		{
 			name:   "no credential",
 			header: http.Header{},
-			want:   "cookie\n",
+			want:   noCredential,
 		},
 	}
 	for _, test := range tests {
@@ -385,6 +524,142 @@ func TestAllowedSetCacheKeyReadsSecondCookieLine(t *testing.T) {
 	}
 }
 
+// TestAllowedSetCacheKeyIgnoresSecondSessionCookie checks that list requests
+// with one first R_SESS cookie, and a second R_SESS cookie that changes per
+// request, share one allowed set fetch.
+func TestAllowedSetCacheKeyIgnoresSecondSessionCookie(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstream(steveHandler("a"), namespaceListHandler))
+
+	for i := range 5 {
+		header := http.Header{"Cookie": []string{fmt.Sprintf("R_SESS=alice; R_SESS=random-%d", i)}}
+		resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, header))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d status = %d, want 200", i, resp.StatusCode)
+		}
+	}
+
+	if got := h.upstream.countPath(stevePath); got != 1 {
+		t.Errorf("allowed set requests = %d, want 1", got)
+	}
+}
+
+// TestAllowedSetCacheKeyIgnoresSecondAuthorization checks that list requests
+// with one first Authorization value, and a second value that changes per
+// request, share one allowed set fetch, and that the fetch sends the first
+// value only.
+func TestAllowedSetCacheKeyIgnoresSecondAuthorization(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstream(steveHandler("a"), namespaceListHandler))
+
+	for i := range 5 {
+		header := http.Header{"Authorization": []string{callerToken, fmt.Sprintf("Bearer random-%d", i)}}
+		resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, header))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d status = %d, want 200", i, resp.StatusCode)
+		}
+	}
+
+	if got := h.upstream.countPath(stevePath); got != 1 {
+		t.Errorf("allowed set requests = %d, want 1", got)
+	}
+	for _, request := range h.upstream.all() {
+		if request.path == stevePath && !slices.Equal(request.header.Values("Authorization"), []string{callerToken}) {
+			t.Errorf("Steve Authorization = %q, want only %q", request.header.Values("Authorization"), callerToken)
+		}
+	}
+}
+
+// credentialSteveHandler answers Steve with the one namespace ns-<credential>,
+// for the credential that Rancher reads: the first Authorization value
+// without the Bearer prefix, else the first R_SESS cookie.
+func credentialSteveHandler(w http.ResponseWriter, r *http.Request) {
+	credential := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if credential == "" {
+		if session, err := r.Cookie(sessionCookie); err == nil {
+			credential = session.Value
+		}
+	}
+	steveHandler("ns-"+credential)(w, r)
+}
+
+// TestAllowedSetCacheKeySeparatesFirstCredentials checks that a caller whose
+// second Authorization value or second R_SESS cookie is the credential of
+// another caller gets its own fetch and its own allowed set, never the
+// cached set of the other caller.
+func TestAllowedSetCacheKeySeparatesFirstCredentials(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		victim   http.Header
+		attacker http.Header
+	}{
+		{
+			name:     "authorization",
+			victim:   http.Header{"Authorization": []string{"Bearer bob"}},
+			attacker: http.Header{"Authorization": []string{"Bearer alice", "Bearer bob"}, "Cookie": []string{"R_SESS=bob"}},
+		},
+		{
+			name:     "session cookie",
+			victim:   http.Header{"Cookie": []string{"R_SESS=bob"}},
+			attacker: http.Header{"Cookie": []string{"R_SESS=alice; R_SESS=bob"}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t, listUpstream(credentialSteveHandler, namespaceListHandler))
+
+			steps := []struct {
+				header http.Header
+				want   string
+			}{
+				{test.victim, "ns-bob"},
+				{test.attacker, "ns-alice"},
+				{test.victim, "ns-bob"},
+				{test.attacker, "ns-alice"},
+			}
+			for i, step := range steps {
+				resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, step.header))
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("request %d status = %d, want 200", i, resp.StatusCode)
+				}
+				want := nameLabel + " in (" + step.want + ")"
+				if got := h.upstream.privileged(t).query.Get("labelSelector"); got != want {
+					t.Errorf("request %d labelSelector = %q, want %q", i, got, want)
+				}
+			}
+
+			if got := h.upstream.countPath(stevePath); got != 2 {
+				t.Errorf("allowed set requests = %d, want 2", got)
+			}
+		})
+	}
+}
+
+// TestAllowedSetCacheKeyReadsCookieWithEmptyAuthorization checks that a
+// request with an empty Authorization value keys on its R_SESS cookie, so two
+// such requests with a different cookie get two allowed set fetches.
+func TestAllowedSetCacheKeyReadsCookieWithEmptyAuthorization(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstream(steveHandler("a"), namespaceListHandler))
+
+	for _, session := range []string{"alice", "bob"} {
+		header := http.Header{"Authorization": []string{""}, "Cookie": []string{"R_SESS=" + session}}
+		resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, header))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status with R_SESS=%s = %d, want 200", session, resp.StatusCode)
+		}
+	}
+
+	if native := h.upstream.all()[0].header.Values("Authorization"); !slices.Equal(native, []string{""}) {
+		t.Fatalf("native Authorization = %q, want one empty value", native)
+	}
+	if got := h.upstream.countPath(stevePath); got != 2 {
+		t.Errorf("allowed set requests = %d, want 2", got)
+	}
+}
+
 // projectsHandlerRaw answers /v3/projects with the given ids unchanged,
 // unlike projectsHandler, which prefixes every id with the test cluster. A
 // test that needs an id of another cluster uses this instead.
@@ -434,8 +709,8 @@ func TestFetchProjectIDsIsClusterScoped(t *testing.T) {
 }
 
 // TestConfigDefaultsWithNegativeValues checks that New substitutes the
-// defaults for a negative CacheTTL, MaxCacheEntries, FetchRate and
-// MaxWatches, the same as it does for zero.
+// defaults for a negative CacheTTL, MaxCacheEntries, FetchRate,
+// FetchRatePerCaller and MaxWatches, the same as it does for zero.
 func TestConfigDefaultsWithNegativeValues(t *testing.T) {
 	t.Parallel()
 	tokenFile := filepath.Join(t.TempDir(), "token")
@@ -446,12 +721,13 @@ func TestConfigDefaultsWithNegativeValues(t *testing.T) {
 		t.Fatalf("parse upstream URL: %v", err)
 	}
 	svc, err := New(Config{
-		Upstream:        target,
-		TokenFile:       tokenFile,
-		CacheTTL:        -time.Second,
-		MaxCacheEntries: -1,
-		FetchRate:       -1,
-		MaxWatches:      -1,
+		Upstream:           target,
+		TokenFile:          tokenFile,
+		CacheTTL:           -time.Second,
+		MaxCacheEntries:    -1,
+		FetchRate:          -1,
+		FetchRatePerCaller: -1,
+		MaxWatches:         -1,
 	})
 	if err != nil {
 		t.Fatalf("new handler: %v", err)
@@ -465,6 +741,9 @@ func TestConfigDefaultsWithNegativeValues(t *testing.T) {
 	}
 	if svc.limiter.rate != defaultFetchRate {
 		t.Errorf("fetch rate = %v, want %v", svc.limiter.rate, defaultFetchRate)
+	}
+	if svc.callers.rate != defaultFetchRatePerCaller {
+		t.Errorf("fetch rate per caller = %v, want %v", svc.callers.rate, defaultFetchRatePerCaller)
 	}
 	if svc.maxWatches != defaultMaxWatches {
 		t.Errorf("max watches = %d, want %d", svc.maxWatches, defaultMaxWatches)
