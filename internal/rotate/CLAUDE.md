@@ -18,3 +18,4 @@ Rules:
 - The run is check-and-renew, so a CronJob every 10 minutes is cheap and a missed run is harmless. Do not change it to a fixed rotation on a schedule.
 - Read the ServiceAccount token per request, because the kubelet replaces the file.
 - Password hash, `password.go`: Rancher reads `cattle-local-user-passwords/<User name>` at each local login. The format is PBKDF2-HMAC-SHA3-512 with 210000 iterations, a 32-byte salt, and a 32-byte digest, with the annotation `cattle.io/password-hash: pbkdf2sha3512`. Compare with the stored salt, and leave a current hash alone, because a rewrite changes nothing and churns the Secret. Only this write or the admin `setpassword` action sets a Rancher password; an external secret store cannot.
+- Do not end the run on a failed password step. The token steps run first, and the run exits 1 after them, because a permanent failure of the hash write would otherwise leave every component without a Rancher token after the TTL.

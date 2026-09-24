@@ -6,7 +6,7 @@ The command runs once: it reads the token from the Secret, and it asks Rancher f
 
 The run keeps the new token and the token that it read from the Secret. It deletes the other tokens with the same description, except the newest ones up to `--keep`.
 
-With `--password-secret`, a run first writes the password hash that Rancher reads at a local login. Rancher names that Secret after the User object, in the namespace `cattle-local-user-passwords`. A run that finds the current hash leaves the Secret unchanged. The ServiceAccount needs `get` and `patch` on that one Secret.
+With `--password-secret`, a run first writes the password hash that Rancher reads at a local login. Rancher names that Secret after the User object, in the namespace `cattle-local-user-passwords`. A run that finds the current hash leaves the Secret unchanged. The ServiceAccount needs `get` and `patch` on that one Secret. A failure of the password step does not stop the run. The token steps run, and the run then exits 1 with the error of the password step.
 
 A CronJob is the normal caller, because most runs find a valid token and exit 0.
 

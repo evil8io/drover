@@ -128,8 +128,37 @@ func TestRunMissingPasswordSecret(t *testing.T) {
 	if !strings.Contains(err.Error(), "the Secret "+testPasswordNamespace+"/"+testPasswordSecret+" does not exist") {
 		t.Errorf("the error is %q, and the test expects the absent Secret", err)
 	}
-	assertRoutes(t, kube.routes(), []string{"GET " + testPasswordPath})
-	assertRoutes(t, rancher.routes(), []string{})
+	assertRoutes(t, kube.routes(), []string{
+		"GET " + testPasswordPath,
+		"GET " + testSecretPath,
+		"PATCH " + testSecretPath,
+	})
+	assertRoutes(t, rancher.routes(), rotationRoutes)
+}
+
+func TestRunContinuesAfterAPasswordSyncFailure(t *testing.T) {
+	t.Parallel()
+	kube := newFakeKube(t, nil)
+	kube.password.missing = true
+	rancher := newFakeRancher(t)
+	h := newHarness(t, kube, rancher)
+	withPasswordSecret(h)
+
+	err := h.run()
+	if err == nil {
+		t.Fatal("Run returned no error")
+	}
+	if !strings.Contains(err.Error(), "does not exist") {
+		t.Errorf("the error is %q, and the test expects the absent Secret", err)
+	}
+
+	assertRoutes(t, rancher.routes(), rotationRoutes)
+	if kube.value(testKey) == "" {
+		t.Error("the Secret has no token, and the test expects the token rotation to have run")
+	}
+	h.assertLog(t, `"step":"password_sync"`, `"outcome":"failed"`,
+		"the password sync failed, and the run continues with the token")
+	h.assertNoSecret(t)
 }
 
 func TestNewRejectsAPartialPasswordSecret(t *testing.T) {
