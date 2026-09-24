@@ -139,9 +139,10 @@ func (m *metrics) eventDropped(ctx context.Context, cluster string) {
 	m.eventsDropped.Add(ctx, 1, metric.WithAttributes(attribute.String("cluster", cluster)))
 }
 
-// fetchThrottled records one fetch that the rate limit throttles, with a 429 answer.
-func (m *metrics) fetchThrottled(ctx context.Context) {
-	m.fetchesThrottled.Add(ctx, 1)
+// fetchThrottled records one fetch that a rate limit throttles, with a 429
+// answer. limit is shared or caller.
+func (m *metrics) fetchThrottled(ctx context.Context, limit string) {
+	m.fetchesThrottled.Add(ctx, 1, metric.WithAttributes(attribute.String("limit", limit)))
 }
 
 // fanoutNamespaces records the namespace count of one fan-out, for the cluster.

@@ -12,7 +12,8 @@ Human doc: `docs/api-filter.md`. Update it with a behaviour change.
 ## Allowed set
 
 - Steve (`/k8s/clusters/<id>/v1/namespaces`) returns the RBAC-filtered list in its own shape, without `labelSelector` and without watch. It is the source of the allowed set only.
-- The cache key is the cluster plus the credential that Rancher reads: the `Authorization` header, else the `R_SESS` cookie. Another cookie must not enter the key.
+- Key the allowed set on the cluster plus the first `Authorization` value, else the first `R_SESS` cookie as net/http parses it, because Rancher reads exactly that credential. A second header value or cookie must not create a second key, because every key costs a token of the shared fetch limit.
+- Key the fetch limit per caller on the credential alone, without the cluster. One caller with many clusters is one caller, and a key per cluster multiplies its rate by the cluster count.
 - The caller name comes from `POST .../selfsubjectreviews` with the caller credentials, cached in `allowedSet.user`, and it fails open. Put it in a log line and a span only, never in a metric attribute, because the value set is unbounded.
 - Rancher accepts a ServiceAccount JWT on `/k8s/clusters/<id>/` only, per cluster, behind a `ClusterProxyConfig` with `enabled: true` (Rancher 2.9.0 and later).
 - A ServiceAccount JWT caller gets 401 from Steve, because the Steve cluster proxy runs before the ServiceAccount authenticator in the Rancher handler chain, and the filter returns that 401. An RBAC leg through a `SelfSubjectRulesReview` is the open design for that caller. Do not derive its project from a label on the ServiceAccount namespace, because a project owner can set that label.

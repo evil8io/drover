@@ -24,7 +24,7 @@ The service handles two request patterns from a Rancher kubeconfig. It passes ev
 
 A request is a watch when its `watch` parameter is present with a value other than `0` or `false`, as the API server reads it. A watch request streams over chunked HTTP, or over a websocket connection after a protocol switch. A namespace that Rancher grants after the start of the watch becomes visible in one of three ways. A project selector matches a new namespace of a project of the caller at once. A watch with no selector gets the event too, because the event filter reads the allowed set through the same cache as a plain list. In every other case the service ends the watch, and the client sees the namespace on its next watch.
 
-The cache of an allowed set has one entry per credential that Rancher reads: the `Authorization` header, or the `R_SESS` cookie when that header is absent. Another cookie is not part of the key.
+The cache of an allowed set has one entry per credential that Rancher reads: the first `Authorization` value, or the first `R_SESS` cookie when that value is empty or absent. A second value, a second `R_SESS` cookie, and another cookie are not part of the key.
 
 The service ends a watch with a selector when the selector of the caller changes. A timer re-reads the allowed set of the caller once per cache TTL, from the cache of a plain list, so it adds no request. It builds the selector again from that set. A different selector, or an allowed set that gets no selector at all, ends the stream with a clean end of the stream. The client then re-lists and re-watches, and the new watch gets the selector of the new allowed set. An upgraded stream gets a websocket close frame with status 1000 first, so the client reports a normal closure. A new namespace in a project of the caller keeps the selector the same, so the stream stays open. A watch with no selector needs no timer, because the event filter reads the new allowed set by itself.
 
@@ -103,6 +103,7 @@ With these routes, the service becomes the data path for most reads of a tenant.
 | `--cache-ttl` | `15s` | Lifetime of a cached allowed set. |
 | `--max-cache-entries` | `1000` | Hard bound on the cached allowed sets. |
 | `--fetch-rate` | `50` | Fetches per second that the shared rate limit allows, for a fetch of an allowed set. The burst is twice the rate. |
+| `--fetch-rate-per-caller` | `5` | Fetches per second that the rate limit of one caller credential allows, for a fetch of an allowed set. The burst is twice the rate. |
 | `--fanout` | `false` | Answer a cluster-wide list of a namespaced kind with one request per allowed namespace. |
 | `--fanout-max-namespaces` | `200` | Count of allowed namespaces above which such a list answers 403. |
 | `--fanout-concurrency` | `16` | Namespaced requests of one fan-out that run at a time. It also bounds the memory of one fan-out. |
@@ -137,7 +138,7 @@ The service starts with no token file and returns a 502 Status on a filtered req
 | Merged watch bookmark | A merged cluster-wide watch sends no `BOOKMARK` event, also when the client asks for one. A watch-list gets the one `BOOKMARK` that ends its initial events. |
 | Empty answer | A cluster-wide list of a namespaced kind gets an empty collection, not Forbidden, when the caller may see no object of that kind. |
 | Self-check | `kubectl auth can-i list namespaces` returns yes when the caller has at least one allowed namespace, while RBAC returns no. With `--fanout` on, the same applies to `list` and `watch` on any named resource, cluster-wide, also a cluster-scoped one, whose list then keeps its 403 error. |
-| Fetch rate | A fetch of an allowed set past `--fetch-rate` waits up to 5 s for a free token, then gets a 429 Status. |
+| Fetch rate | A fetch of an allowed set past `--fetch-rate` waits up to 5 s for a free token, then gets a 429 Status. The limit per caller, `--fetch-rate-per-caller`, applies first with the same wait and the same 429 Status, for one credential across all clusters. A fetch that it throttles takes no token of the shared limit. |
 | Trust level | The service is a privileged component. It uses the service token for the filtered namespace list and for the watch stream. |
 | Project scope | A project selector has the projects of the requested cluster only. The project part of a Rancher project id is unique inside one cluster, and the namespace label has that part alone. |
 
@@ -174,12 +175,14 @@ With `--otlp-endpoint` set, the service also exports these metrics:
 | `drover.filter.watches.open` | UpDownCounter | `1` | |
 | `drover.filter.watches.rejected` | Counter | `1` | `cluster` |
 | `drover.filter.events.dropped` | Counter | `1` | `cluster` |
-| `drover.filter.fetch.throttled` | Counter | `1` | |
+| `drover.filter.fetch.throttled` | Counter | `1` | `limit` |
 | `drover.filter.fanout.namespaces` | Histogram | `1` | `cluster` |
 | `drover.filter.fanout.capped` | Counter | `1` | `cluster` |
 | `drover.filter.fanout.skipped` | Counter | `1` | `cluster` |
 
 The `cluster` attribute of the two request metrics names a cluster once Steve answered a namespace list for it. Every other request records `unknown`, because the path of a request names any string, also before authentication, and a metric attribute with an unbounded value set is a cardinality fault.
+
+The `limit` attribute of `drover.filter.fetch.throttled` is `caller` for the limit per caller, and `shared` for the shared limit.
 
 ## Shutdown
 

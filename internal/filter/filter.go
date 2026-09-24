@@ -50,6 +50,10 @@ type Config struct {
 	// for a fetch of an allowed set. Zero selects 50. The burst is twice the
 	// rate, and at least 1.
 	FetchRate float64
+	// FetchRatePerCaller is the fetches per second that the rate limit of one
+	// caller credential allows, for a fetch of an allowed set. Zero selects 5.
+	// The burst is twice the rate, and at least 1.
+	FetchRatePerCaller float64
 	// Fanout answers a cluster-wide list of a namespaced kind with one
 	// request per allowed namespace. It is off by default, because it makes
 	// the filter the data path of most reads of a tenant.
@@ -90,6 +94,7 @@ type Service struct {
 	base      http.RoundTripper
 	cache     *cache
 	limiter   *limiter
+	callers   *callerLimiters
 	proxy     *httputil.ReverseProxy
 	handler   http.Handler
 	metrics   *metrics
@@ -160,6 +165,11 @@ func New(cfg Config) (*Service, error) {
 		maxWatches = defaultMaxWatches
 	}
 	fetchBurst := max(2*fetchRate, 1)
+	fetchRatePerCaller := cfg.FetchRatePerCaller
+	if fetchRatePerCaller <= 0 {
+		fetchRatePerCaller = defaultFetchRatePerCaller
+	}
+	fetchBurstPerCaller := max(2*fetchRatePerCaller, 1)
 	fanoutMaxNamespaces := cfg.FanoutMaxNamespaces
 	if fanoutMaxNamespaces <= 0 {
 		fanoutMaxNamespaces = defaultFanoutMaxNamespaces
@@ -197,6 +207,7 @@ func New(cfg Config) (*Service, error) {
 		),
 		cache:    newCache(ttl, maxCacheEntries, now),
 		limiter:  newLimiter(fetchRate, fetchBurst, now),
+		callers:  newCallerLimiters(fetchRatePerCaller, fetchBurstPerCaller, maxCacheEntries, now),
 		metrics:  m,
 		watches:  newWatchRegistry(),
 		clusters: newClusterSet(),
