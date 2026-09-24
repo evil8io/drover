@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.1](https://github.com/evil8io/drover/compare/v0.16.0...v0.16.1) (2026-09-24)
+
+
+### Bug Fixes
+
+* **api-filter:** skip the DELETED event of a lost namespace that the upstream sent ([#81](https://github.com/evil8io/drover/issues/81)) ([52e5e66](https://github.com/evil8io/drover/commit/52e5e66e451b269cc1ba5eb763184c3abc3e03f0))
+
 ## [0.16.0](https://github.com/evil8io/drover/compare/v0.15.0...v0.16.0) (2026-09-24)
 
 
