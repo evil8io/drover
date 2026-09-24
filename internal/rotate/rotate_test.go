@@ -182,6 +182,34 @@ func TestRunPruneKeepsTheNewTokenOnATie(t *testing.T) {
 	h.assertLog(t, `"step":"token_prune"`, `"kept":2`, `"deleted":2`)
 }
 
+func TestRunPruneKeepsTheTokenOfTheSecret(t *testing.T) {
+	t.Parallel()
+	rancher := newFakeRancher(t)
+	mounted := rancher.addToken("token-mounted", testDescription, 30*time.Hour, 48*time.Hour, true)
+	// A token of an earlier run whose Secret patch failed. It is newer than
+	// the token in the Secret.
+	rancher.addToken("token-orphan", testDescription, 0, 48*time.Hour, true)
+
+	kube := newFakeKube(t, map[string]string{testKey: mounted.value})
+	h := newHarness(t, kube, rancher)
+	h.cfg.Keep = 2
+
+	if err := h.run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	value := kube.value(testKey)
+	if value == mounted.value {
+		t.Fatalf("the Secret still has the mounted token")
+	}
+	created, _, _ := strings.Cut(value, ":")
+	want := []string{created, "token-mounted"}
+	slices.Sort(want)
+	assertRoutes(t, rancher.names(), want)
+	h.assertLog(t, `"step":"token_prune"`, `"kept":2`, `"deleted":1`, `"secret_token":"token-mounted"`)
+	h.assertNoSecret(t)
+}
+
 func TestNewRejectsAKeepCountBelowTwo(t *testing.T) {
 	t.Parallel()
 	rancher := newFakeRancher(t)

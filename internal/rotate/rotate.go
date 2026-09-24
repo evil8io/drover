@@ -73,7 +73,9 @@ type Config struct {
 	TTL time.Duration
 	// RenewBefore is the remaining lifetime that starts a rotation.
 	RenewBefore time.Duration
-	// Keep is the number of tokens with this description to keep. The new token counts.
+	// Keep is the number of tokens with this description to keep. The new token
+	// and the token that the run read from the Secret count, and Run never
+	// deletes them.
 	Keep int
 	// Description goes on every token that Run creates. It also selects the
 	// tokens that Run deletes.
@@ -148,7 +150,7 @@ func (r *rotator) check(ctx context.Context) error {
 			return nil
 		}
 	}
-	return r.rotate(ctx)
+	return r.rotate(ctx, tokenName(current))
 }
 
 func newRotator(cfg Config) (*rotator, error) {
@@ -236,7 +238,7 @@ func newRotator(cfg Config) (*rotator, error) {
 	return r, nil
 }
 
-func (r *rotator) rotate(ctx context.Context) error {
+func (r *rotator) rotate(ctx context.Context, secretName string) error {
 	session, err := r.login(ctx)
 	if err != nil {
 		return err
@@ -250,7 +252,7 @@ func (r *rotator) rotate(ctx context.Context) error {
 	if err := r.patchSecret(ctx, created.value); err != nil {
 		return err
 	}
-	return r.prune(ctx, created, session)
+	return r.prune(ctx, created, secretName, session)
 }
 
 // step starts a child span named name, and returns the traced context and a
