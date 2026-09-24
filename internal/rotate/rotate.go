@@ -129,14 +129,22 @@ func (r *rotator) run(ctx context.Context) error {
 	return err
 }
 
-// check reads the token in the Secret, and renews it when the token is not
-// valid. It returns nil when the token in the Secret is still valid.
+// check syncs the password, when configured, and then checks the token. A
+// failed password sync does not stop the token check.
 func (r *rotator) check(ctx context.Context) error {
+	var passwordErr error
 	if r.cfg.PasswordSecret != "" {
-		if err := r.syncPassword(ctx); err != nil {
-			return err
+		if passwordErr = r.syncPassword(ctx); passwordErr != nil {
+			r.logger.ErrorContext(ctx, "the password sync failed, and the run continues with the token",
+				"step", stepPasswordSync, "outcome", outcomeFailed, "error", passwordErr.Error())
 		}
 	}
+	return errors.Join(passwordErr, r.checkToken(ctx))
+}
+
+// checkToken reads the token in the Secret, and renews it when the token is
+// not valid. It returns nil when the token in the Secret is still valid.
+func (r *rotator) checkToken(ctx context.Context) error {
 	current, err := r.secretToken(ctx)
 	if err != nil {
 		return err
