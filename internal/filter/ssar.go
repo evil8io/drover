@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	maxReviewBody   = 1 << 20
+	maxReviewBody   = 64 << 10
 	grantedReason   = "granted by " + serviceName
 	outcomeGrant    = "granted"
 	jsonContentType = "application/json"
@@ -98,6 +98,13 @@ func (s *Service) roundTripReview(req *http.Request, cluster string) (*http.Resp
 	_ = resp.Body.Close()
 
 	if !reviewDenied(answer) {
+		return s.nativeReview(req.Context(), cluster, "", resp, answer)
+	}
+
+	// The API server echoes the spec it evaluated. Its parser matches keys
+	// with case, and this one does not.
+	echoedSpec, err := jsonReviewSpec(answer)
+	if err != nil || !s.filteredVerb(echoedSpec) {
 		return s.nativeReview(req.Context(), cluster, "", resp, answer)
 	}
 

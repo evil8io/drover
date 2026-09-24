@@ -30,6 +30,7 @@ Human doc: `docs/api-filter.md`. Update it with a behaviour change.
 
 - kubectl and client-go send the SelfSubjectAccessReview as `application/vnd.kubernetes.protobuf`. `protobuf.go` decodes it, and the answer goes back as JSON.
 - kubectl sends the namespace of the kubeconfig context in a review for the cluster-scoped `namespaces` resource. Ignore that attribute.
+- Grant on the spec that the API server echoes in its answer, never on the request body alone, because the two parsers differ on key case.
 
 ## Fan-out
 
