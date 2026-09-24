@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.2](https://github.com/evil8io/drover/compare/v0.14.1...v0.14.2) (2026-09-24)
+
+
+### Bug Fixes
+
+* **api-filter:** relay a websocket watch in the framing of the upstream ([#74](https://github.com/evil8io/drover/issues/74)) ([7a1b379](https://github.com/evil8io/drover/commit/7a1b37939671b28af9b08f7aa0637b76b596c4f0))
+
 ## [0.14.1](https://github.com/evil8io/drover/compare/v0.14.0...v0.14.1) (2026-09-24)
 
 
