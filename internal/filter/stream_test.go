@@ -734,10 +734,67 @@ func TestWatchSwapsTheUpstreamOnTheFirstNamespace(t *testing.T) {
 	wantOpenAfterTick(t, h, reader)
 }
 
+// namespaceReads answers the privileged read of one namespace with read, and
+// every other privileged request with watch.
+func namespaceReads(read, watch http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, listPath+"/") {
+			read(w, r)
+			return
+		}
+		watch(w, r)
+	}
+}
+
+// namespaceObject answers the read of a namespace with its object, with the
+// project label project.
+func namespaceObject(project string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, listPath+"/")
+		w.Header().Set("Content-Type", jsonContentType)
+		_, _ = io.WriteString(w, `{"kind":"Namespace","apiVersion":"v1","metadata":{"name":"`+name+
+			`","labels":{"`+projectLabel+`":"`+project+`"}}}`)
+	}
+}
+
+// namespaceNotFound answers the read of a namespace with the 404 Status of
+// the API server.
+func namespaceNotFound(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(r.URL.Path, listPath+"/")
+	w.Header().Set("Content-Type", jsonContentType)
+	w.WriteHeader(http.StatusNotFound)
+	_, _ = io.WriteString(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","message":"namespaces \"`+name+
+		`\" not found","reason":"NotFound","code":404}`)
+}
+
+// wantNamespaceReads checks that the service read the namespace name want
+// times, with the service token, as plain JSON.
+func wantNamespaceReads(t *testing.T, up *upstream, name string, want int) {
+	t.Helper()
+	var reads []recorded
+	for _, request := range up.all() {
+		if request.path == listPath+"/"+name {
+			reads = append(reads, request)
+		}
+	}
+	if len(reads) != want {
+		t.Fatalf("reads of namespace %s = %d, want %d", name, len(reads), want)
+	}
+	for _, read := range reads {
+		if got := read.header.Get("Authorization"); got != serviceAuth {
+			t.Errorf("Authorization of the read = %q, want %q", got, serviceAuth)
+		}
+		if got := read.header.Get("Accept"); got != jsonContentType {
+			t.Errorf("Accept of the read = %q, want %q", got, jsonContentType)
+		}
+	}
+}
+
 // TestWatchSwapsTheUpstreamOnALostNamespace checks a caller that loses the
 // only namespace of a project. The client gets the DELETED event of that
-// namespace first, and then the ADDED event of the swapped upstream, whose
-// selector names the other project only. The stream stays open.
+// namespace first, without a read of that namespace, and then the ADDED event
+// of the swapped upstream, whose selector names the other project only. The
+// stream stays open.
 func TestWatchSwapsTheUpstreamOnALostNamespace(t *testing.T) {
 	t.Parallel()
 	release := make(chan struct{})
@@ -773,36 +830,194 @@ func TestWatchSwapsTheUpstreamOnALostNamespace(t *testing.T) {
 	wantSwappedQuery(t, watches[1], oneProject)
 	wantClosed(t, closed, "the service did not close the first upstream watch")
 	wantLog(t, h, `msg="swapped the upstream of a namespace watch`, "lost=1", "gained=0")
+	wantNamespaceReads(t, h.upstream, "b", 0)
 	wantOpenAfterTick(t, h, reader)
 }
 
-// TestTableWatchEndsOnALostNamespace checks that a watch of a server-side
-// table gets no DELETED event of the service, because a table event needs the
-// columns of the stream. The stream ends after the ERROR event with the Status
-// 410 Expired instead, and kubectl lists again.
+// lostReads are the answers to the read of namespace b, which the caller loses
+// together with its project p-2. sent reports whether the upstream watch with
+// the selector on p-1 and p-2 sent the DELETED event of b itself.
+var lostReads = []struct {
+	name string
+	read http.HandlerFunc
+	sent bool
+}{
+	{"the namespace keeps its project label", namespaceObject("p-2"), false},
+	{"the read answers 500", errorStatus, false},
+	{"the namespace is deleted", namespaceNotFound, true},
+	{"the namespace moves to another project", namespaceObject("p-3"), true},
+}
+
+// TestTableWatchEndsOnALostNamespace checks a watch of a server-side table
+// whose caller loses b, the only namespace of project p-2. That watch takes no
+// event of the service, because a table event needs the columns of the
+// stream. The service reads b once. When b keeps the project label p-2, or
+// when the read fails, the stream ends after the ERROR event with the Status
+// 410 Expired, and kubectl lists again. When b is deleted or moves to another
+// project, the upstream watch sent the DELETED event of b, so the stream
+// swaps its upstream and stays open.
 func TestTableWatchEndsOnALostNamespace(t *testing.T) {
 	t.Parallel()
-	release := make(chan struct{})
-	defer close(release)
+	const (
+		bothProjects = projectLabel + " in (p-1,p-2)"
+		oneProject   = projectLabel + " in (p-1)"
+	)
+	added := namespaceLine(watchAdded, "a", "p-1")
+	for _, test := range lostReads {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			release := make(chan struct{})
+			defer close(release)
+			closed := make(chan struct{})
 
-	namespaces := newNamespaceSet(steveNamespace{name: "a", project: "p-1"}, steveNamespace{name: "b", project: "p-1"})
-	h := newHarnessOpt(t, listUpstreamWithProjects(
-		namespaces.handler(),
-		newProjectSet("p-1").handler(),
-		openWatch(release),
-	), shortTTL)
+			namespaces := newNamespaceSet(steveNamespace{name: "a", project: "p-1"}, steveNamespace{name: "b", project: "p-2"})
+			h := newHarnessOpt(t, listUpstreamWithProjects(
+				namespaces.handler(),
+				newProjectSet("p-1", "p-2").handler(),
+				namespaceReads(test.read, swappedWatches(bothProjects, closed, release, map[string][]string{oneProject: {added}})),
+			), shortTTL)
 
-	header := callerHeader()
-	header.Set("Accept", tableAccept)
-	reader := startWatchWith(t, h, listPath+"?watch=true", header)
-	namespaces.set(steveNamespace{name: "a", project: "p-1"})
-	h.clock.advance(time.Minute)
+			header := callerHeader()
+			header.Set("Accept", tableAccept)
+			reader := startWatchWith(t, h, listPath+"?watch=true", header)
+			namespaces.set(steveNamespace{name: "a", project: "p-1"})
+			h.clock.advance(time.Minute)
 
-	wantExpiredEvent(t, nextEvent(t, reader), "the allowed namespaces of the caller changed")
-	wantCleanEnd(t, reader, "the table watch stayed open after the caller lost a namespace")
-	wantLog(t, h, "ended a namespace watch that takes no event of the service", "cluster=c-1")
-	if got := len(privilegedWatches(h.upstream)); got != 1 {
-		t.Errorf("privileged watches = %d, want 1", got)
+			if !test.sent {
+				wantExpiredEvent(t, nextEvent(t, reader), "the allowed namespaces of the caller changed")
+				wantCleanEnd(t, reader, "the table watch stayed open after the caller lost a namespace")
+				wantLog(t, h, "ended a namespace watch that takes no event of the service", "cluster=c-1")
+				if got := len(privilegedWatches(h.upstream)); got != 1 {
+					t.Errorf("privileged watches = %d, want 1", got)
+				}
+				wantNamespaceReads(t, h.upstream, "b", 1)
+				return
+			}
+			if got := nextEvent(t, reader); got != added {
+				t.Fatalf("event = %q, want the ADDED event %q of the swapped upstream", got, added)
+			}
+			if got := len(privilegedWatches(h.upstream)); got != 2 {
+				t.Errorf("privileged watches = %d, want 2", got)
+			}
+			wantNamespaceReads(t, h.upstream, "b", 1)
+			wantOpenAfterTick(t, h, reader)
+		})
+	}
+}
+
+// TestWatchSwapsToMatchNothingOnADeletedLastNamespace checks a caller whose
+// last namespace b is deleted. The service swaps the upstream to the selector
+// that matches nothing, and the stream stays open. A plain watch gets the
+// DELETED event of the service without a read of b. A table watch reads b,
+// and the read answers 404, because the upstream watch with the project
+// selector sent the DELETED event of b. The table watch then gets no ERROR
+// event.
+func TestWatchSwapsToMatchNothingOnADeletedLastNamespace(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name  string
+		table bool
+	}{
+		{"plain", false},
+		{"table", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			release := make(chan struct{})
+			defer close(release)
+			closed := make(chan struct{})
+
+			namespaces := newNamespaceSet(steveNamespace{name: "b", project: "p-1"})
+			h := newHarnessOpt(t, listUpstreamWithProjects(
+				namespaces.handler(),
+				newProjectSet("p-1").handler(),
+				namespaceReads(namespaceNotFound, swappedWatches(projectLabel+" in (p-1)", closed, release,
+					map[string][]string{matchNothing: {bookmarkLine}})),
+			), shortTTL)
+
+			header := callerHeader()
+			if test.table {
+				header.Set("Accept", tableAccept)
+			}
+			reader := startWatchWith(t, h, listPath+"?watch=true", header)
+			namespaces.set()
+			h.clock.advance(time.Minute)
+
+			if !test.table {
+				if got := nextEvent(t, reader); got != deletedLine("b") {
+					t.Fatalf("event = %q, want the DELETED event %q", got, deletedLine("b"))
+				}
+			}
+			if got := nextEvent(t, reader); got != bookmarkLine {
+				t.Fatalf("event = %q, want the BOOKMARK event %q of the swapped upstream", got, bookmarkLine)
+			}
+			watches := privilegedWatches(h.upstream)
+			if len(watches) != 2 {
+				t.Fatalf("privileged watches = %d, want 2", len(watches))
+			}
+			wantSwappedQuery(t, watches[1], matchNothing)
+			wantClosed(t, closed, "the service did not close the first upstream watch")
+			if test.table {
+				wantLog(t, h, `msg="kept a namespace watch open on a lost namespace`, "namespace=b", "status=404")
+				wantNamespaceReads(t, h.upstream, "b", 1)
+			} else {
+				wantNamespaceReads(t, h.upstream, "b", 0)
+			}
+			wantOpenAfterTick(t, h, reader)
+		})
+	}
+}
+
+// TestWatchKeepsItsUpstreamWhenALostNamespaceMovesOut checks a caller that
+// loses b, while a keeps project p-1 in the allowed set. b moves to project
+// p-3, so the upstream watch sent the DELETED event of b. The selector stays
+// the same, so the upstream stays, and the stream stays open. A plain watch
+// gets the DELETED event of the service without a read of b. A table watch
+// reads b, gets the label p-3, and gets no ERROR event.
+func TestWatchKeepsItsUpstreamWhenALostNamespaceMovesOut(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name  string
+		table bool
+	}{
+		{"plain", false},
+		{"table", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			release := make(chan struct{})
+			defer close(release)
+
+			namespaces := newNamespaceSet(steveNamespace{name: "a", project: "p-1"}, steveNamespace{name: "b", project: "p-1"})
+			h := newHarnessOpt(t, listUpstreamWithProjects(
+				namespaces.handler(),
+				newProjectSet("p-1").handler(),
+				namespaceReads(namespaceObject("p-3"), openWatch(release)),
+			), shortTTL)
+
+			header := callerHeader()
+			if test.table {
+				header.Set("Accept", tableAccept)
+			}
+			reader := startWatchWith(t, h, listPath+"?watch=true", header)
+			namespaces.set(steveNamespace{name: "a", project: "p-1"})
+			h.clock.advance(time.Minute)
+
+			if test.table {
+				wantLog(t, h, `msg="kept a namespace watch open on a lost namespace`, "namespace=b", "status=200")
+			} else if got := nextEvent(t, reader); got != deletedLine("b") {
+				t.Fatalf("event = %q, want the DELETED event %q", got, deletedLine("b"))
+			}
+			wantOpenAfterTick(t, h, reader)
+			reads := 0
+			if test.table {
+				reads = 1
+			}
+			wantNamespaceReads(t, h.upstream, "b", reads)
+			if got := len(privilegedWatches(h.upstream)); got != 1 {
+				t.Errorf("privileged watches = %d, want 1", got)
+			}
+		})
 	}
 }
 
@@ -875,8 +1090,9 @@ func TestWatchWithoutSelectorAddsAGainedNamespace(t *testing.T) {
 }
 
 // TestWatchWithoutSelectorDeletesALostNamespace checks that a watch without a
-// selector gets the DELETED event of a lost namespace, that the upstream watch
-// stays the same, and that the stream stays open.
+// selector gets the DELETED event of a lost namespace without a read of that
+// namespace, that the upstream watch stays the same, and that the stream
+// stays open.
 func TestWatchWithoutSelectorDeletesALostNamespace(t *testing.T) {
 	t.Parallel()
 	release := make(chan struct{})
@@ -895,6 +1111,7 @@ func TestWatchWithoutSelectorDeletesALostNamespace(t *testing.T) {
 	if got := len(privilegedWatches(h.upstream)); got != 1 {
 		t.Errorf("privileged watches = %d, want 1", got)
 	}
+	wantNamespaceReads(t, h.upstream, "b", 0)
 	wantOpenAfterTick(t, h, reader)
 }
 
