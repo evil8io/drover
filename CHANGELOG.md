@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.0](https://github.com/evil8io/drover/compare/v0.15.0...v0.16.0) (2026-09-24)
+
+
+### Features
+
+* **api-filter:** keep a namespace watch open across a change of the allowed set ([#79](https://github.com/evil8io/drover/issues/79)) ([f14bdad](https://github.com/evil8io/drover/commit/f14bdad34a349660c8f9d397bd434f64fa2ea24b))
+
 ## [0.15.0](https://github.com/evil8io/drover/compare/v0.14.2...v0.15.0) (2026-09-24)
 
 
