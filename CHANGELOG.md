@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.0](https://github.com/evil8io/drover/compare/v0.14.2...v0.15.0) (2026-09-24)
+
+
+### Features
+
+* **api-filter:** add a gained namespace to a running merged watch ([#77](https://github.com/evil8io/drover/issues/77)) ([97fa8b8](https://github.com/evil8io/drover/commit/97fa8b8a747869a5c00a4ba41a30c15bd81dae44))
+
 ## [0.14.2](https://github.com/evil8io/drover/compare/v0.14.1...v0.14.2) (2026-09-24)
 
 
