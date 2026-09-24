@@ -240,7 +240,7 @@ func (s *Syncer) streamNamespaces(ctx context.Context, cluster, resourceVersion 
 			resourceVersion = item.Metadata.ResourceVersion
 		}
 		if event.Type == watchAdded || event.Type == watchModified {
-			queue.put(item)
+			queue.put(s.pruneNamespace(item))
 		}
 	}
 }

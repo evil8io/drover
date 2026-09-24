@@ -30,6 +30,20 @@ const (
 	managedAnnotationsKey = "drover-managed-annotations"
 )
 
+// namespaceKeys returns the label keys and the annotation keys of a namespace
+// that the sync reads.
+func namespaceKeys(cfg Config) (labels, annotations []string) {
+	labels = slices.Concat([]string{projectLabel}, cfg.Labels)
+	annotations = slices.Concat([]string{managedLabelsKey, managedAnnotationsKey}, cfg.Annotations)
+	if cfg.NameLabel != "" {
+		labels = append(labels, cfg.NameLabel)
+	}
+	if cfg.NameAnnotation != "" {
+		annotations = append(annotations, cfg.NameAnnotation)
+	}
+	return labels, annotations
+}
+
 // ParseKeys splits a comma-separated list of label or annotation keys. A list
 // without a key returns no key and no error.
 func ParseKeys(list string) ([]string, error) {

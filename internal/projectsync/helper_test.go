@@ -27,17 +27,18 @@ const (
 	betaProject = `{"id":"c-2:p-beta","clusterId":"c-2","name":"Beta",` +
 		`"labels":{"cost-center":"cc-2"},"annotations":{}}`
 
-	// alphaNamespaces has the five namespaces of cluster c-1. alpha-two and
-	// alpha-moved need a patch. alpha-one is in the wanted state already, and
-	// its tier label belongs to the tenant, because the managed annotation does
-	// not name it. alpha-moved owns tier, and the project does not set it.
-	alphaNamespaces = `{"kind":"NamespaceList","items":[
-{"metadata":{"name":"alpha-one","resourceVersion":"11","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1","tier":"gold"},"annotations":{"owner":"alpha@example.com","drover-managed-labels":"cost-center","drover-managed-annotations":"owner"}}},
-{"metadata":{"name":"alpha-two","resourceVersion":"12","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"old","tier":"gold"},"annotations":{}}},
-{"metadata":{"name":"alpha-three","resourceVersion":"13","labels":{"other":"value"},"annotations":{}}},
-{"metadata":{"name":"alpha-orphan","resourceVersion":"14","labels":{"field.cattle.io/projectId":"p-gone"},"annotations":{}}},
-{"metadata":{"name":"alpha-moved","resourceVersion":"15","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1","tier":"gold"},"annotations":{"owner":"alpha@example.com","drover-managed-labels":"cost-center,tier","drover-managed-annotations":"owner"}}}
-]}`
+	// The five namespaces of cluster c-1. alpha-two and alpha-moved need a
+	// patch. alpha-one is in the wanted state already, and its tier label
+	// belongs to the tenant, because the managed annotation does not name it.
+	// alpha-moved owns tier, and the project does not set it.
+	alphaOneItem    = `{"metadata":{"name":"alpha-one","resourceVersion":"11","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1","tier":"gold"},"annotations":{"owner":"alpha@example.com","drover-managed-labels":"cost-center","drover-managed-annotations":"owner"}}}`
+	alphaTwoItem    = `{"metadata":{"name":"alpha-two","resourceVersion":"12","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"old","tier":"gold"},"annotations":{}}}`
+	alphaThreeItem  = `{"metadata":{"name":"alpha-three","resourceVersion":"13","labels":{"other":"value"},"annotations":{}}}`
+	alphaOrphanItem = `{"metadata":{"name":"alpha-orphan","resourceVersion":"14","labels":{"field.cattle.io/projectId":"p-gone"},"annotations":{}}}`
+	alphaMovedItem  = `{"metadata":{"name":"alpha-moved","resourceVersion":"15","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1","tier":"gold"},"annotations":{"owner":"alpha@example.com","drover-managed-labels":"cost-center,tier","drover-managed-annotations":"owner"}}}`
+
+	alphaNamespaces = `{"kind":"NamespaceList","items":[` +
+		alphaOneItem + `,` + alphaTwoItem + `,` + alphaThreeItem + `,` + alphaOrphanItem + `,` + alphaMovedItem + `]}`
 
 	betaNamespaces = `{"kind":"NamespaceList","items":[
 {"metadata":{"name":"beta-one","resourceVersion":"21","labels":{"field.cattle.io/projectId":"p-beta"},"annotations":{}}}
@@ -76,9 +77,16 @@ type fakeRancher struct {
 	patchStatus map[string]int
 	// patchBody is the answer body of a patch that fails, by namespace name.
 	patchBody map[string]string
+	// lists are the pages of the namespace list of a cluster, by the continue
+	// token that selects the page. The empty token selects the first page. A
+	// cluster without an entry gets its fixed list.
+	lists map[string]map[string]string
 
 	mu       sync.Mutex
 	requests []recorded
+	// expired counts the answers with status 410 that are left for a continue
+	// token.
+	expired map[string]int
 }
 
 func newFakeRancher(t *testing.T, options ...func(*fakeRancher)) *fakeRancher {
@@ -118,6 +126,27 @@ func watching(cluster string, frames ...string) func(*fakeRancher) {
 			f.events = make(map[string][]string)
 		}
 		f.events[cluster] = frames
+	}
+}
+
+// listing serves pages as the namespace list of cluster, by continue token.
+func listing(cluster string, pages map[string]string) func(*fakeRancher) {
+	return func(f *fakeRancher) {
+		if f.lists == nil {
+			f.lists = make(map[string]map[string]string)
+		}
+		f.lists[cluster] = pages
+	}
+}
+
+// expiring answers the first times list requests with the continue token next
+// with status 410.
+func expiring(next string, times int) func(*fakeRancher) {
+	return func(f *fakeRancher) {
+		if f.expired == nil {
+			f.expired = make(map[string]int)
+		}
+		f.expired[next] = times
 	}
 }
 
@@ -196,6 +225,21 @@ func (f *fakeRancher) serveNamespaces(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if pages, ok := f.lists[cluster]; ok {
+		next := r.URL.Query().Get("continue")
+		if f.expire(next) {
+			w.WriteHeader(http.StatusGone)
+			_, _ = io.WriteString(w, `{"kind":"Status","reason":"Expired","message":"the continue token is too old"}`)
+			return
+		}
+		page, ok := pages[next]
+		if !ok {
+			http.Error(w, "no page for the continue token", http.StatusBadRequest)
+			return
+		}
+		_, _ = io.WriteString(w, page)
+		return
+	}
 	switch cluster {
 	case "c-1":
 		_, _ = io.WriteString(w, alphaNamespaces)
@@ -204,6 +248,18 @@ func (f *fakeRancher) serveNamespaces(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
+}
+
+// expire reports whether a list request with the continue token next gets
+// status 410, and counts that answer.
+func (f *fakeRancher) expire(next string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.expired[next] == 0 {
+		return false
+	}
+	f.expired[next]--
+	return true
 }
 
 func (f *fakeRancher) all() []recorded {

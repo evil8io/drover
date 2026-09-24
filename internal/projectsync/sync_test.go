@@ -2,14 +2,21 @@ package projectsync
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 const (
@@ -292,11 +299,252 @@ func TestReconcileFollowsThePagination(t *testing.T) {
 	if len(lists) != 2 {
 		t.Fatalf("project list requests = %d, want 2", len(lists))
 	}
+	if got := lists[0].query.Get("limit"); got != "500" {
+		t.Errorf("limit of the first page = %q, want 500", got)
+	}
 	if got := lists[1].query.Get("marker"); got != "2" {
 		t.Errorf("marker of the second page = %q, want 2", got)
 	}
 	if got := patchedPaths(rancher); !slices.Equal(got, []string{alphaMovedPath, alphaTwoPath, betaOnePath}) {
 		t.Errorf("patched paths = %v, want [%s %s %s]", got, alphaMovedPath, alphaTwoPath, betaOnePath)
+	}
+}
+
+// twoPages serves the namespaces of cluster c-1 in two pages. The first page
+// has its metadata after the items.
+func twoPages() func(*fakeRancher) {
+	return listing("c-1", map[string]string{
+		"": `{"kind":"NamespaceList","items":[` + alphaOneItem + `,` + alphaTwoItem +
+			`],"metadata":{"continue":"page-2"}}`,
+		"page-2": `{"kind":"NamespaceList","metadata":{"resourceVersion":"20"},"items":[` +
+			alphaThreeItem + `,` + alphaOrphanItem + `,` + alphaMovedItem + `]}`,
+	})
+}
+
+// continueTokens returns the continue token of every request, in order.
+func continueTokens(requests []recorded) []string {
+	tokens := make([]string, 0, len(requests))
+	for _, request := range requests {
+		tokens = append(tokens, request.query.Get("continue"))
+	}
+	return tokens
+}
+
+func TestNamespaceListKeepsOnlyTheKeysThatTheSyncReads(t *testing.T) {
+	t.Parallel()
+	const (
+		count          = 100
+		nameLabel      = "example.com/project-name"
+		nameAnnotation = "example.com/project-display-name"
+	)
+
+	// Each namespace has about 250 KB of annotations that the sync does not
+	// read, and all of them are on one page.
+	bulk := strings.Repeat("x", 250_000)
+	var page strings.Builder
+	page.WriteString(`{"kind":"NamespaceList","items":[`)
+	for i := range count {
+		if i > 0 {
+			page.WriteString(",")
+		}
+		fmt.Fprintf(&page, `{"metadata":{"name":"bulk-%03d","resourceVersion":"%d",`+
+			`"labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"old","tier":"gold","app":"web",%q:"Alpha"},`+
+			`"annotations":{"owner":"alpha@example.com",%q:"Alpha","note":"outside the allow list","bulk":%q,`+
+			`"drover-managed-labels":"cost-center,%s","drover-managed-annotations":"%s,owner"}}}`,
+			i, 100+i, nameLabel, nameAnnotation, bulk, nameLabel, nameAnnotation)
+	}
+	page.WriteString(`],"metadata":{"resourceVersion":"200"}}`)
+
+	rancher := newFakeRancher(t, listing("c-1", map[string]string{"": page.String()}))
+	syncer, _ := newSyncer(t, rancher, tokenFile(t, serviceToken), func(cfg *Config) {
+		cfg.NameLabel = nameLabel
+		cfg.NameAnnotation = nameAnnotation
+		cfg.Interval = 30 * time.Second
+	})
+	ctx := context.Background()
+
+	items, err := syncer.namespaces(ctx, serviceToken, "c-1")
+	if err != nil {
+		t.Fatalf("list the namespaces of c-1: %v", err)
+	}
+	if len(items) != count {
+		t.Fatalf("namespaces = %d, want %d", len(items), count)
+	}
+	wantLabels := map[string]string{
+		projectLabel:  "p-alpha",
+		"cost-center": "old",
+		"tier":        "gold",
+		nameLabel:     "Alpha",
+	}
+	wantAnnotations := map[string]string{
+		"owner":               "alpha@example.com",
+		nameAnnotation:        "Alpha",
+		managedLabelsKey:      "cost-center," + nameLabel,
+		managedAnnotationsKey: nameAnnotation + ",owner",
+	}
+	for i, item := range items {
+		if want := fmt.Sprintf("bulk-%03d", i); item.Metadata.Name != want {
+			t.Errorf("name of namespace %d = %q, want %q", i, item.Metadata.Name, want)
+		}
+		if want := strconv.Itoa(100 + i); item.Metadata.ResourceVersion != want {
+			t.Errorf("resource version of %s = %q, want %q", item.Metadata.Name, item.Metadata.ResourceVersion, want)
+		}
+		if !maps.Equal(item.Metadata.Labels, wantLabels) {
+			t.Errorf("labels of %s = %v, want %v", item.Metadata.Name, item.Metadata.Labels, wantLabels)
+		}
+		if !maps.Equal(item.Metadata.Annotations, wantAnnotations) {
+			t.Errorf("annotation keys of %s = %v, want %v",
+				item.Metadata.Name, keysOf(item.Metadata.Annotations), keysOf(wantAnnotations))
+		}
+	}
+
+	syncer.reconcile(ctx)
+
+	const wantBody = `{"metadata":{"labels":{"cost-center":"cc-1"}}}`
+	var patches int
+	for _, patch := range rancher.method(http.MethodPatch) {
+		if !strings.HasPrefix(patch.path, alphaListPath+"/bulk-") {
+			continue
+		}
+		patches++
+		if patch.body != wantBody {
+			t.Errorf("patch of %s = %s, want %s", patch.path, patch.body, wantBody)
+		}
+	}
+	if patches != count {
+		t.Errorf("patches of the bulk namespaces = %d, want %d", patches, count)
+	}
+}
+
+func TestReconcileRewritesARecordAboveTheBound(t *testing.T) {
+	t.Parallel()
+	record := "cost-center," + strings.Repeat("x", maxRecordValue)
+	page := `{"kind":"NamespaceList","items":[{"metadata":{"name":"alpha-filled","resourceVersion":"40",` +
+		`"labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1"},` +
+		`"annotations":{"owner":"alpha@example.com","drover-managed-annotations":"owner",` +
+		`"drover-managed-labels":"` + record + `"}}}]}`
+	rancher := newFakeRancher(t, listing("c-1", map[string]string{"": page}))
+	syncer, _ := newSyncer(t, rancher, tokenFile(t, serviceToken))
+	ctx := context.Background()
+
+	items, err := syncer.namespaces(ctx, serviceToken, "c-1")
+	if err != nil {
+		t.Fatalf("list the namespaces of c-1: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("namespaces = %d, want 1", len(items))
+	}
+	if _, ok := items[0].Metadata.Annotations[managedLabelsKey]; ok {
+		t.Errorf("the prune keeps %s above %d bytes", managedLabelsKey, maxRecordValue)
+	}
+	if got := items[0].Metadata.Annotations[managedAnnotationsKey]; got != "owner" {
+		t.Errorf("%s = %q, want owner", managedAnnotationsKey, got)
+	}
+
+	syncer.reconcile(ctx)
+
+	patches := requestsOfPath(rancher, alphaListPath+"/alpha-filled")
+	if len(patches) != 1 {
+		t.Fatalf("patch requests of alpha-filled = %d, want 1", len(patches))
+	}
+	const want = `{"metadata":{"annotations":{"drover-managed-labels":"cost-center"}}}`
+	if got := patches[0].body; got != want {
+		t.Errorf("patch of alpha-filled = %s, want %s", got, want)
+	}
+}
+
+func TestNamespaceListFollowsTheContinueToken(t *testing.T) {
+	t.Parallel()
+	rancher, logs := reconcileOnce(t, twoPages())
+
+	lists := requestsOfPath(rancher, alphaListPath)
+	if got := continueTokens(lists); !slices.Equal(got, []string{"", "page-2"}) {
+		t.Fatalf("continue tokens of the list requests = %q, want [\"\" page-2]", got)
+	}
+	for _, list := range lists {
+		if got := list.query.Get("limit"); got != "500" {
+			t.Errorf("limit = %q, want 500", got)
+		}
+		if got := list.query.Get("labelSelector"); got != projectLabel {
+			t.Errorf("label selector = %q, want %q", got, projectLabel)
+		}
+	}
+	if got := patchedPaths(rancher); !slices.Equal(got, []string{alphaMovedPath, alphaTwoPath, betaOnePath}) {
+		t.Errorf("patched paths = %v, want [%s %s %s]", got, alphaMovedPath, alphaTwoPath, betaOnePath)
+	}
+	if !strings.Contains(logs.String(), "msg=reconcile clusters=2 projects=2 namespaces=6 patched=3 errors=0") {
+		t.Errorf("no summary line with six namespaces:\n%s", logs.String())
+	}
+}
+
+func TestNamespaceListStartsAgainAfterAnExpiredContinueToken(t *testing.T) {
+	t.Parallel()
+	rancher, logs := reconcileOnce(t, twoPages(), expiring("page-2", 1))
+
+	want := []string{"", "page-2", "", "page-2"}
+	if got := continueTokens(requestsOfPath(rancher, alphaListPath)); !slices.Equal(got, want) {
+		t.Fatalf("continue tokens of the list requests = %q, want %q", got, want)
+	}
+	if got := patchedPaths(rancher); !slices.Equal(got, []string{alphaMovedPath, alphaTwoPath, betaOnePath}) {
+		t.Errorf("patched paths = %v, want [%s %s %s]", got, alphaMovedPath, alphaTwoPath, betaOnePath)
+	}
+	// The first page of the expired list does not count again.
+	if !strings.Contains(logs.String(), "msg=reconcile clusters=2 projects=2 namespaces=6 patched=3 errors=0") {
+		t.Errorf("no summary line with six namespaces:\n%s", logs.String())
+	}
+}
+
+func TestNamespaceListFailsAfterASecondExpiredContinueToken(t *testing.T) {
+	t.Parallel()
+	rancher := newFakeRancher(t, twoPages(), expiring("page-2", 2))
+	syncer, _ := newSyncer(t, rancher, tokenFile(t, serviceToken))
+
+	_, err := syncer.namespaces(context.Background(), serviceToken, "c-1")
+	var status statusError
+	if !errors.As(err, &status) || status.status != http.StatusGone {
+		t.Fatalf("error = %v, want status 410", err)
+	}
+	want := []string{"", "page-2", "", "page-2"}
+	if got := continueTokens(requestsOfPath(rancher, alphaListPath)); !slices.Equal(got, want) {
+		t.Errorf("continue tokens of the list requests = %q, want %q", got, want)
+	}
+}
+
+func TestReconcileFailsTheClusterOfAPageAboveTheCap(t *testing.T) {
+	t.Parallel()
+	const pageCap = 4096
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	large := `{"kind":"NamespaceList","items":[{"metadata":{"name":"alpha-large",` +
+		`"labels":{"field.cattle.io/projectId":"p-alpha"},"annotations":{"bulk":"` +
+		strings.Repeat("x", 2*pageCap) + `"}}}]}`
+	rancher := newFakeRancher(t, listing("c-1", map[string]string{"": large}))
+	syncer, logs := newSyncer(t, rancher, tokenFile(t, serviceToken), func(cfg *Config) {
+		cfg.MeterProvider = provider
+	})
+	syncer.pageCap = pageCap
+	syncer.reconcile(context.Background())
+
+	want := `msg="the namespace list request failed" cluster=c-1 ` +
+		`error="decode the namespace list of cluster c-1: the page is larger than 4096 bytes"`
+	if !strings.Contains(logs.String(), want) {
+		t.Errorf("no failure line with the cap:\n%s", logs.String())
+	}
+	if got := patchedPaths(rancher); !slices.Equal(got, []string{betaOnePath}) {
+		t.Errorf("patched paths = %v, want [%s]", got, betaOnePath)
+	}
+	if !strings.Contains(logs.String(), "msg=reconcile clusters=2 projects=2 namespaces=1 patched=1 errors=1") {
+		t.Errorf("no summary line with one error:\n%s", logs.String())
+	}
+
+	var data metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &data); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	errs := findSum(t, data, "drover.sync.errors")
+	if len(errs.DataPoints) != 1 || errs.DataPoints[0].Value != 1 {
+		t.Errorf("drover.sync.errors points = %v, want one point with value 1", errs.DataPoints)
 	}
 }
 
