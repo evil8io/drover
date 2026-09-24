@@ -74,16 +74,17 @@ func (u *upgradedWatch) Close() error {
 // filterWatchUpgrade replaces the body of an upgraded namespace watch, so
 // every watch event gets the filter of a chunked watch. It returns the write
 // side of the filtered stream, or nil when no stream follows. It registers
-// that write side in registry while the goroutine runs, so a drain and a
-// project change can end the stream. It raises drover.filter.watches.open
-// while the stream is open.
+// that write side in registry with slot while the goroutine runs, so a drain
+// and a project change can end the stream. It raises
+// drover.filter.watches.open while the stream is open.
 //
 // It returns an error when the body is not an io.ReadWriteCloser, because
 // httputil.ReverseProxy needs that interface for an upgraded connection, and
 // the stream is privileged, so it must not pass without the filter. The
-// stream ends at once, with a close frame and no event, when the answer names
-// a websocket extension.
-func filterWatchUpgrade(ctx context.Context, resp *http.Response, allow func(name string, labels map[string]string) bool, logger *slog.Logger, registry *watchRegistry, metrics *metrics, cluster string) (*io.PipeWriter, error) {
+// registry then has no stream, and slot stays with the caller. The stream
+// ends at once, with a close frame and no event, when the answer names a
+// websocket extension.
+func filterWatchUpgrade(ctx context.Context, resp *http.Response, allow func(name string, labels map[string]string) bool, logger *slog.Logger, registry *watchRegistry, slot *watchSlot, metrics *metrics, cluster string) (*io.PipeWriter, error) {
 	upstream, ok := resp.Body.(io.ReadWriteCloser)
 	if !ok {
 		return nil, fmt.Errorf("the upgraded watch has a read-only body of type %T", resp.Body)
@@ -95,7 +96,7 @@ func filterWatchUpgrade(ctx context.Context, resp *http.Response, allow func(nam
 		"cluster", cluster, "subprotocol", subprotocol, "extensions", extensions)
 
 	reader, writer := io.Pipe()
-	registry.add(writer, true)
+	registry.add(writer, true, slot)
 	metrics.watchOpened(ctx)
 	resp.Body = &upgradedWatch{PipeReader: reader, upstream: upstream}
 

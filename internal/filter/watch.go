@@ -2,9 +2,12 @@ package filter
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -63,23 +66,95 @@ type watchStream struct {
 	upgraded bool
 	ended    bool
 	done     chan struct{}
+	slot     *watchSlot
 }
 
-// watchRegistry is the set of open watch streams of a Service. A stream joins
-// when it starts, and it leaves when its goroutine ends.
+// watchSlot is one reserved place in the watch limits. It counts from
+// reserve until release, or until its stream leaves the registry.
+type watchSlot struct {
+	caller   string
+	released bool
+}
+
+// watchRegistry is the set of open watch streams of a Service, and the count
+// of the reserved watch slots, in total and per caller. A stream joins when it
+// starts, and it leaves when its goroutine ends.
 type watchRegistry struct {
-	mu      sync.Mutex
-	streams map[*io.PipeWriter]*watchStream
+	maxWatches          int
+	maxWatchesPerCaller int
+
+	mu       sync.Mutex
+	streams  map[*io.PipeWriter]*watchStream
+	reserved int
+	callers  map[string]int
 }
 
-func newWatchRegistry() *watchRegistry {
-	return &watchRegistry{streams: make(map[*io.PipeWriter]*watchStream)}
+func newWatchRegistry(maxWatches, maxWatchesPerCaller int) *watchRegistry {
+	return &watchRegistry{
+		maxWatches:          maxWatches,
+		maxWatchesPerCaller: maxWatchesPerCaller,
+		streams:             make(map[*io.PipeWriter]*watchStream),
+		callers:             make(map[string]int),
+	}
 }
 
-func (r *watchRegistry) add(w *io.PipeWriter, upgraded bool) {
+// watchCaller returns the key of the watch limit of one caller: the SHA-256 of
+// the credential that Rancher reads, so the registry has no credential.
+func watchCaller(header http.Header) string {
+	sum := sha256.Sum256([]byte(credentialKey(header)))
+	return hex.EncodeToString(sum[:])
+}
+
+// reserve takes one watch slot for caller. It returns nil and the limit that
+// refuses the slot, limitShared or limitCaller, when the reserved slots of the
+// service or of the caller are at their limit.
+func (r *watchRegistry) reserve(caller string) (*watchSlot, string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.streams[w] = &watchStream{upgraded: upgraded, done: make(chan struct{})}
+	if r.reserved >= r.maxWatches {
+		return nil, limitShared
+	}
+	if r.callers[caller] >= r.maxWatchesPerCaller {
+		return nil, limitCaller
+	}
+	r.reserved++
+	r.callers[caller]++
+	return &watchSlot{caller: caller}, ""
+}
+
+// release frees slot. A nil slot, and a slot that is free already, change
+// nothing.
+func (r *watchRegistry) release(slot *watchSlot) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.releaseLocked(slot)
+}
+
+func (r *watchRegistry) releaseLocked(slot *watchSlot) {
+	if slot == nil || slot.released {
+		return
+	}
+	slot.released = true
+	r.reserved--
+	r.callers[slot.caller]--
+	if r.callers[slot.caller] <= 0 {
+		delete(r.callers, slot.caller)
+	}
+}
+
+// reservedCount returns the count of reserved slots of the service.
+func (r *watchRegistry) reservedCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.reserved
+}
+
+// add registers the stream of w, and binds slot to it, so remove frees the
+// slot.
+func (r *watchRegistry) add(w *io.PipeWriter, upgraded bool, slot *watchSlot) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.streams[w] = &watchStream{upgraded: upgraded, done: make(chan struct{}), slot: slot}
 }
 
 func (r *watchRegistry) remove(w *io.PipeWriter) {
@@ -88,6 +163,7 @@ func (r *watchRegistry) remove(w *io.PipeWriter) {
 	if stream, ok := r.streams[w]; ok {
 		close(stream.done)
 		delete(r.streams, w)
+		r.releaseLocked(stream.slot)
 	}
 }
 
@@ -162,16 +238,16 @@ func (r *watchRegistry) closeAll() int {
 // filterWatchBody reads a namespace watch stream from upstream, and returns a
 // stream with only the events that allow lets through, plus the write side of
 // that stream. A BOOKMARK, an ERROR, and any event the filter cannot parse
-// always pass. It registers the write side in registry while the goroutine
-// runs, so a drain and a project change can end the stream. The goroutine
+// always pass. It registers the write side in registry with slot while the
+// goroutine runs, so a drain and a project change can end the stream. The goroutine
 // ends, and closes upstream, in two cases: a read of upstream fails, for
 // example because ctx cancels, or a write to the pipe fails because the
 // reader closed it or the registry ended it. It raises
 // drover.filter.watches.open while the stream is open, and counts a dropped
 // event on cluster in drover.filter.events.dropped.
-func filterWatchBody(ctx context.Context, upstream io.ReadCloser, allow func(name string, labels map[string]string) bool, logger *slog.Logger, registry *watchRegistry, metrics *metrics, cluster string) (io.ReadCloser, *io.PipeWriter) {
+func filterWatchBody(ctx context.Context, upstream io.ReadCloser, allow func(name string, labels map[string]string) bool, logger *slog.Logger, registry *watchRegistry, slot *watchSlot, metrics *metrics, cluster string) (io.ReadCloser, *io.PipeWriter) {
 	reader, writer := io.Pipe()
-	registry.add(writer, false)
+	registry.add(writer, false, slot)
 	metrics.watchOpened(ctx)
 
 	go func() {

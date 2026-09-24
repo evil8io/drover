@@ -70,9 +70,9 @@ func TestDrainEndsWatchWithEOF(t *testing.T) {
 	goroutineEnded := make(chan struct{})
 	upstream := closeSignal{ReadCloser: upstreamReader, ch: goroutineEnded}
 
-	registry := newWatchRegistry()
+	registry, slot := newTestRegistry(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reader, _ := filterWatchBody(context.Background(), upstream, allowAll, logger, registry, testMetrics(t), "c-1")
+	reader, _ := filterWatchBody(context.Background(), upstream, allowAll, logger, registry, slot, testMetrics(t), "c-1")
 
 	if got := registry.len(); got != 1 {
 		t.Fatalf("registry length = %d, want 1", got)
@@ -96,5 +96,8 @@ func TestDrainEndsWatchWithEOF(t *testing.T) {
 
 	if got := registry.len(); got != 0 {
 		t.Errorf("registry length after the goroutine ends = %d, want 0", got)
+	}
+	if got := registry.reservedCount(); got != 0 {
+		t.Errorf("reserved slots after the goroutine ends = %d, want 0", got)
 	}
 }

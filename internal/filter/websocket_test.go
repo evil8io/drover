@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
@@ -219,9 +220,9 @@ func newUpgradeHarnessWith(t *testing.T, source io.Reader, allow func(string, ma
 	if extensions != "" {
 		resp.Header.Set(extensionsHeader, extensions)
 	}
-	registry := newWatchRegistry()
+	registry, slot := newTestRegistry(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	if _, err := filterWatchUpgrade(context.Background(), resp, allow, logger, registry, m, "c-1"); err != nil {
+	if _, err := filterWatchUpgrade(context.Background(), resp, allow, logger, registry, slot, m, "c-1"); err != nil {
 		t.Fatalf("filterWatchUpgrade: %v", err)
 	}
 
@@ -444,7 +445,7 @@ func TestUpgradeEndsOnWebsocketExtension(t *testing.T) {
 	}
 	h.wantEnd(t)
 
-	wantRejected(t, reader, 1)
+	wantRejected(t, reader, "", 1)
 }
 
 // TestUpgradeEndsAboveTheBufferBound checks that a stream that never
@@ -529,8 +530,9 @@ func TestDrainEndsUpgradedWatch(t *testing.T) {
 	}
 }
 
-// wantRejected checks the value of drover.filter.watches.rejected.
-func wantRejected(t *testing.T, reader *sdkmetric.ManualReader, want int64) {
+// wantRejected checks the value and the limit attribute of
+// drover.filter.watches.rejected. An empty limit wants no limit attribute.
+func wantRejected(t *testing.T, reader *sdkmetric.ManualReader, limit string, want int64) {
 	t.Helper()
 	var data metricdata.ResourceMetrics
 	if err := reader.Collect(context.Background(), &data); err != nil {
@@ -540,8 +542,16 @@ func wantRejected(t *testing.T, reader *sdkmetric.ManualReader, want int64) {
 	if len(sum.DataPoints) != 1 {
 		t.Fatalf("data points = %d, want 1", len(sum.DataPoints))
 	}
-	if got := sum.DataPoints[0].Value; got != want {
+	point := sum.DataPoints[0]
+	if got := point.Value; got != want {
 		t.Errorf("drover.filter.watches.rejected = %d, want %d", got, want)
+	}
+	got, ok := point.Attributes.Value(attribute.Key("limit"))
+	switch {
+	case limit == "" && ok:
+		t.Errorf("limit attribute = %q, want no limit attribute", got.AsString())
+	case limit != "" && got.AsString() != limit:
+		t.Errorf("limit attribute = %q, want %q", got.AsString(), limit)
 	}
 }
 
@@ -573,7 +583,8 @@ func TestFilterWatchUpgradeRejectsReadOnlyBody(t *testing.T) {
 		Header:     http.Header{},
 		Body:       io.NopCloser(strings.NewReader("")),
 	}
-	writer, err := filterWatchUpgrade(context.Background(), resp, allowNames(), testLogger(), newWatchRegistry(), testMetrics(t), "c-1")
+	registry, slot := newTestRegistry(t)
+	writer, err := filterWatchUpgrade(context.Background(), resp, allowNames(), testLogger(), registry, slot, testMetrics(t), "c-1")
 	if err == nil {
 		t.Fatal("err = nil, want an error for a read-only body")
 	}
@@ -587,8 +598,8 @@ func TestFilterWatchUpgradeRejectsReadOnlyBody(t *testing.T) {
 func TestWatchRegistryEndIsIdempotentForAnUpgradedStream(t *testing.T) {
 	t.Parallel()
 	reader, writer := io.Pipe()
-	registry := newWatchRegistry()
-	registry.add(writer, true)
+	registry, slot := newTestRegistry(t)
+	registry.add(writer, true, slot)
 
 	var frames []wsTestFrame
 	done := make(chan struct{})

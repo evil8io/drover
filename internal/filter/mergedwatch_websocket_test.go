@@ -249,3 +249,43 @@ func TestMergedWatchUpgradeAnswersPingWithPong(t *testing.T) {
 		t.Errorf("frame = %+v, want the pong frame with the payload of the ping", frame)
 	}
 }
+
+// TestMaxWatchesPerCallerCapsAnUpgradedMergedWatch checks that an upgraded
+// merged watch holds a slot of its caller while it runs, and that the end of
+// the stream frees the slot.
+func TestMaxWatchesPerCallerCapsAnUpgradedMergedWatch(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	h := newHarnessOpt(t, collectionUpstream(
+		steveHandler("a"),
+		namespaceWatches(release, map[string][]string{"a": {podEvent("a")}}),
+	), withFanout, func(cfg *Config) { cfg.MaxWatchesPerCaller = 1 })
+
+	resp, reader, conn := dialMergedWatch(t, h, podsPath+"?watch=true", binarySubprotocol)
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("status = %d, want 101", resp.StatusCode)
+	}
+	if got := frameEvent(t, nextFrame(t, reader), opcodeBinary); got != podEvent("a") {
+		t.Fatalf("event = %q, want %q", got, podEvent("a"))
+	}
+
+	capped, _, _ := dialMergedWatch(t, h, podsPath+"?watch=true", binarySubprotocol)
+	body, err := io.ReadAll(capped.Body)
+	if err != nil {
+		t.Fatalf("read the capped answer: %v", err)
+	}
+	wantWatchCapped(t, capped, body, "per-caller limit of 1")
+
+	if _, err := conn.Write(wsMaskedFrame(opcodeClose, [4]byte{1, 2, 3, 4}, []byte{0x03, 0xe8})); err != nil {
+		t.Fatalf("write the close frame: %v", err)
+	}
+	if !waitFor(func() bool { return h.svc.watches.reservedCount() == 0 }) {
+		t.Fatalf("reserved slots after the end of the stream = %d, want 0", h.svc.watches.reservedCount())
+	}
+	again, _, _ := dialMergedWatch(t, h, podsPath+"?watch=true", binarySubprotocol)
+	if again.StatusCode != http.StatusSwitchingProtocols {
+		t.Errorf("status after the end of the stream = %d, want 101", again.StatusCode)
+	}
+}

@@ -7,11 +7,15 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 )
 
 type readResult struct {
@@ -965,5 +969,132 @@ func TestMaxWatchesCapsANamespaceWatch(t *testing.T) {
 	resp3, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
 	if resp3.StatusCode != http.StatusOK {
 		t.Errorf("plain list status = %d, want 200, the cap must not affect a non-watch request", resp3.StatusCode)
+	}
+}
+
+// TestMaxWatchesPerCallerCapsANamespaceWatch checks that a namespace watch of
+// a caller at MaxWatchesPerCaller answers 503 with the per-caller message, and
+// that drover.filter.watches.rejected names the caller limit. A second caller
+// still opens a watch.
+func TestMaxWatchesPerCallerCapsANamespaceWatch(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	metricReader := sdkmetric.NewManualReader()
+	h := newHarnessOpt(t, listUpstream(steveHandler("a"), openWatch(release)),
+		recordingMeter(metricReader), func(cfg *Config) { cfg.MaxWatchesPerCaller = 2 })
+
+	for range 2 {
+		startWatch(t, h)
+	}
+	resp, body := h.do(t, h.request(t, http.MethodGet, listPath+"?watch=true", nil, callerHeader()))
+	wantWatchCapped(t, resp, body, "per-caller limit of 2")
+	wantRejected(t, metricReader, limitCaller, 1)
+
+	if got := watchStatus(t, h, listPath+"?watch=true", otherCallerHeader()); got != http.StatusOK {
+		t.Errorf("watch status of a second caller = %d, want 200", got)
+	}
+}
+
+// TestMaxWatchesHoldsAgainstAParallelBurst checks that a parallel burst of
+// twice MaxWatches namespace watches opens at most MaxWatches privileged
+// watches upstream, while the upstream keeps each of them open, and that
+// every other watch answers 503.
+func TestMaxWatchesHoldsAgainstAParallelBurst(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	const limit = 5
+	metricReader := sdkmetric.NewManualReader()
+	h := newHarnessOpt(t, listUpstream(steveHandler("a"), openWatch(release)),
+		recordingMeter(metricReader), func(cfg *Config) {
+			cfg.MaxWatches = limit
+			cfg.MaxWatchesPerCaller = 2 * limit
+		})
+
+	statuses := make(chan int, 2*limit)
+	var group sync.WaitGroup
+	for range 2 * limit {
+		group.Go(func() {
+			statuses <- watchStatus(t, h, listPath+"?watch=true", callerHeader())
+		})
+	}
+	group.Wait()
+	close(statuses)
+
+	counts := map[int]int{}
+	for status := range statuses {
+		counts[status]++
+	}
+	if counts[http.StatusOK] != limit || counts[http.StatusServiceUnavailable] != limit {
+		t.Errorf("statuses = %v, want %d of 200 and %d of 503", counts, limit, limit)
+	}
+	privileged := 0
+	for _, request := range h.upstream.all() {
+		if request.path == listPath && request.header.Get("Authorization") == serviceAuth {
+			privileged++
+		}
+	}
+	if privileged > limit {
+		t.Errorf("privileged watches upstream = %d, want at most %d", privileged, limit)
+	}
+	wantRejected(t, metricReader, limitShared, limit)
+}
+
+// TestNamespaceWatchReleasesTheSlotOnAFailure checks that a namespace watch
+// that fails after the reserve frees its slot. The caller has one slot, so a
+// leaked slot answers the next watch with 503.
+func TestNamespaceWatchReleasesTheSlotOnAFailure(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		// fail answers the privileged watch while the failure lasts. Nil
+		// means that the token file is absent instead.
+		fail http.HandlerFunc
+		want int
+	}{
+		{"upstream error status", errorStatus, http.StatusInternalServerError},
+		{"closed connection", closeConnection, http.StatusBadGateway},
+		{"no token", nil, http.StatusBadGateway},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			release := make(chan struct{})
+			defer close(release)
+
+			var failing atomic.Bool
+			failing.Store(true)
+			watch := openWatch(release)
+			privileged := func(w http.ResponseWriter, r *http.Request) {
+				if failing.Load() && test.fail != nil {
+					test.fail(w, r)
+					return
+				}
+				watch(w, r)
+			}
+			tokenFile := filepath.Join(t.TempDir(), "token")
+			if test.fail != nil {
+				writeToken(t, tokenFile, "service")
+			}
+			h := newHarnessWithTokenFile(t, listUpstream(steveHandler("a"), privileged), tokenFile, func(cfg *Config) {
+				cfg.MaxWatches = 1
+				cfg.MaxWatchesPerCaller = 1
+			})
+
+			resp, _ := h.do(t, h.request(t, http.MethodGet, listPath+"?watch=true", nil, callerHeader()))
+			if resp.StatusCode != test.want {
+				t.Fatalf("status of the failed watch = %d, want %d", resp.StatusCode, test.want)
+			}
+			if got := h.svc.watches.reservedCount(); got != 0 {
+				t.Errorf("reserved slots after the failure = %d, want 0", got)
+			}
+
+			failing.Store(false)
+			writeToken(t, tokenFile, "service")
+			startWatch(t, h)
+		})
 	}
 }

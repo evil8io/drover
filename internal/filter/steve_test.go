@@ -710,7 +710,8 @@ func TestFetchProjectIDsIsClusterScoped(t *testing.T) {
 
 // TestConfigDefaultsWithNegativeValues checks that New substitutes the
 // defaults for a negative CacheTTL, MaxCacheEntries, FetchRate,
-// FetchRatePerCaller and MaxWatches, the same as it does for zero.
+// FetchRatePerCaller, MaxWatches and MaxWatchesPerCaller, the same as it
+// does for zero.
 func TestConfigDefaultsWithNegativeValues(t *testing.T) {
 	t.Parallel()
 	tokenFile := filepath.Join(t.TempDir(), "token")
@@ -721,13 +722,14 @@ func TestConfigDefaultsWithNegativeValues(t *testing.T) {
 		t.Fatalf("parse upstream URL: %v", err)
 	}
 	svc, err := New(Config{
-		Upstream:           target,
-		TokenFile:          tokenFile,
-		CacheTTL:           -time.Second,
-		MaxCacheEntries:    -1,
-		FetchRate:          -1,
-		FetchRatePerCaller: -1,
-		MaxWatches:         -1,
+		Upstream:            target,
+		TokenFile:           tokenFile,
+		CacheTTL:            -time.Second,
+		MaxCacheEntries:     -1,
+		FetchRate:           -1,
+		FetchRatePerCaller:  -1,
+		MaxWatches:          -1,
+		MaxWatchesPerCaller: -1,
 	})
 	if err != nil {
 		t.Fatalf("new handler: %v", err)
@@ -745,8 +747,11 @@ func TestConfigDefaultsWithNegativeValues(t *testing.T) {
 	if svc.callers.rate != defaultFetchRatePerCaller {
 		t.Errorf("fetch rate per caller = %v, want %v", svc.callers.rate, defaultFetchRatePerCaller)
 	}
-	if svc.maxWatches != defaultMaxWatches {
-		t.Errorf("max watches = %d, want %d", svc.maxWatches, defaultMaxWatches)
+	if svc.watches.maxWatches != defaultMaxWatches {
+		t.Errorf("max watches = %d, want %d", svc.watches.maxWatches, defaultMaxWatches)
+	}
+	if svc.watches.maxWatchesPerCaller != defaultMaxWatchesPerCaller {
+		t.Errorf("max watches per caller = %d, want %d", svc.watches.maxWatchesPerCaller, defaultMaxWatchesPerCaller)
 	}
 }
 

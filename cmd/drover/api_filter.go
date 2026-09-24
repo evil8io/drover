@@ -38,6 +38,7 @@ type config struct {
 	fanoutWorkers      int
 	fanoutWatchMaxNS   int
 	maxWatches         int
+	callerMaxWatches   int
 	logLevel           slog.Level
 	shutdownGrace      time.Duration
 	telemetry          telemetry.Config
@@ -88,6 +89,7 @@ func runAPIFilter(args []string) int {
 		FanoutConcurrency:        cfg.fanoutWorkers,
 		FanoutMaxWatchNamespaces: cfg.fanoutWatchMaxNS,
 		MaxWatches:               cfg.maxWatches,
+		MaxWatchesPerCaller:      cfg.callerMaxWatches,
 
 		Logger: logger,
 	})
@@ -128,6 +130,7 @@ func runAPIFilter(args []string) int {
 		"fanout_concurrency", cfg.fanoutWorkers,
 		"fanout_max_watch_namespaces", cfg.fanoutWatchMaxNS,
 		"max_watches", cfg.maxWatches,
+		"max_watches_per_caller", cfg.callerMaxWatches,
 		"shutdown_grace", cfg.shutdownGrace.String(),
 	)
 
@@ -176,6 +179,7 @@ func parseConfig(args []string, output io.Writer, getenv func(string) string) (c
 	flags.IntVar(&cfg.fanoutWorkers, "fanout-concurrency", 16, "namespaced requests of one fan-out that run at a time")
 	flags.IntVar(&cfg.fanoutWatchMaxNS, "fanout-max-watch-namespaces", 50, "count of allowed namespaces above which a cluster-wide watch answers 403")
 	flags.IntVar(&cfg.maxWatches, "max-watches", 1000, "count of open watch streams above which a new watch answers 503")
+	flags.IntVar(&cfg.callerMaxWatches, "max-watches-per-caller", 100, "count of open watch streams of one caller above which a new watch of that caller answers 503")
 	flags.StringVar(&logLevel, "log-level", "info", "debug, info, warn or error")
 	flags.DurationVar(&cfg.shutdownGrace, "shutdown-grace", 20*time.Second, "grace period for the shutdown after SIGTERM or SIGINT")
 	tf := registerTelemetryFlags(flags, getenv)

@@ -49,7 +49,7 @@ func newMetrics(provider metric.MeterProvider) (*metrics, error) {
 		return nil, err
 	}
 	watchesRejected, err := meter.Int64Counter("drover.filter.watches.rejected",
-		metric.WithDescription("Upgraded namespace watch streams that the filter ends at once, because the websocket connection has an extension."),
+		metric.WithDescription("Watches that the filter refuses: a watch above a watch limit, answered with 503, and an upgraded namespace watch stream that the filter ends at once, because the websocket connection has an extension."),
 		metric.WithUnit("1"))
 	if err != nil {
 		return nil, err
@@ -132,6 +132,15 @@ func (m *metrics) watchClosed(ctx context.Context) {
 // once, for the cluster.
 func (m *metrics) watchRejected(ctx context.Context, cluster string) {
 	m.watchesRejected.Add(ctx, 1, metric.WithAttributes(attribute.String("cluster", cluster)))
+}
+
+// watchCapped records one watch that a watch limit refuses with 503, for the
+// cluster, with limit limitShared or limitCaller.
+func (m *metrics) watchCapped(ctx context.Context, cluster, limit string) {
+	m.watchesRejected.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("cluster", cluster),
+		attribute.String("limit", limit),
+	))
 }
 
 // eventDropped records one dropped watch event, for the cluster.

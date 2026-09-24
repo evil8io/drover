@@ -30,6 +30,10 @@ const (
 	defaultMaxWatches = 1000
 	bodyReadTimeout   = 10 * time.Second
 	serviceName       = "drover"
+
+	// defaultMaxWatchesPerCaller times defaultFanoutMaxWatchNamespaces bounds
+	// the upstream connections of one caller.
+	defaultMaxWatchesPerCaller = 100
 )
 
 // Config configures the handler that New returns.
@@ -73,6 +77,10 @@ type Config struct {
 	// MaxWatches is the count of open watch streams of the service above
 	// which a new watch answers 503. Zero selects 1000.
 	MaxWatches int
+	// MaxWatchesPerCaller is the count of open watch streams of one caller
+	// above which a new watch of that caller answers 503. A caller is one
+	// credential that Rancher reads. Zero selects 100.
+	MaxWatchesPerCaller int
 	// Logger gets one line for each intercepted request. Nil selects slog.Default.
 	Logger *slog.Logger
 	// MeterProvider creates the meter of the filter metrics. Nil selects
@@ -103,7 +111,6 @@ type Service struct {
 	fanoutMaxNamespaces      int
 	fanoutConcurrency        int
 	fanoutMaxWatchNamespaces int
-	maxWatches               int
 
 	draining atomic.Bool
 	watches  *watchRegistry
@@ -164,6 +171,10 @@ func New(cfg Config) (*Service, error) {
 	if maxWatches <= 0 {
 		maxWatches = defaultMaxWatches
 	}
+	maxWatchesPerCaller := cfg.MaxWatchesPerCaller
+	if maxWatchesPerCaller <= 0 {
+		maxWatchesPerCaller = defaultMaxWatchesPerCaller
+	}
 	fetchBurst := max(2*fetchRate, 1)
 	fetchRatePerCaller := cfg.FetchRatePerCaller
 	if fetchRatePerCaller <= 0 {
@@ -209,14 +220,13 @@ func New(cfg Config) (*Service, error) {
 		limiter:  newLimiter(fetchRate, fetchBurst, now),
 		callers:  newCallerLimiters(fetchRatePerCaller, fetchBurstPerCaller, maxCacheEntries, now),
 		metrics:  m,
-		watches:  newWatchRegistry(),
+		watches:  newWatchRegistry(maxWatches, maxWatchesPerCaller),
 		clusters: newClusterSet(),
 
 		fanoutEnabled:            cfg.Fanout,
 		fanoutMaxNamespaces:      fanoutMaxNamespaces,
 		fanoutConcurrency:        fanoutConcurrency,
 		fanoutMaxWatchNamespaces: fanoutMaxWatchNamespaces,
-		maxWatches:               maxWatches,
 	}
 	svc.proxy = &httputil.ReverseProxy{
 		Rewrite:       svc.rewrite,

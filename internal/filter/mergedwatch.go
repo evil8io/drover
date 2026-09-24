@@ -90,10 +90,17 @@ func (s *Service) mergedWatch(req *http.Request, target collectionTarget, set al
 	names := set.names
 	result.count = len(names)
 
-	if s.watches.len() >= s.maxWatches {
+	slot, limit := s.watches.reserve(watchCaller(req.Header))
+	if slot == nil {
 		_ = denied.Body.Close()
-		return s.tooManyWatches(req, start, result)
+		return s.tooManyWatches(req, start, result, limit)
 	}
+	handedOver := false
+	defer func() {
+		if !handedOver {
+			s.watches.release(slot)
+		}
+	}()
 	if len(names) > s.fanoutMaxWatchNamespaces {
 		_ = denied.Body.Close()
 		s.metrics.fanoutCapped(ctx, target.cluster)
@@ -129,7 +136,8 @@ func (s *Service) mergedWatch(req *http.Request, target collectionTarget, set al
 	}
 	_ = denied.Body.Close()
 
-	merge, resp := s.newMerge(req, target)
+	merge, resp := s.newMerge(req, target, slot)
+	handedOver = true
 	merge.watchList = watchListRequested(req.URL.Query())
 	merge.pending = len(streams)
 	for _, stream := range streams {
@@ -242,11 +250,11 @@ func stripUpgrade(header http.Header) {
 	}
 }
 
-// newMerge returns the merge and the answer of the client. An upgrade request
-// gets the protocol switch of RFC 6455, which the merge answers itself,
-// because it has no single upstream connection to relay. Every other request
-// gets a chunked body.
-func (s *Service) newMerge(req *http.Request, target collectionTarget) (*watchMerge, *http.Response) {
+// newMerge returns the merge and the answer of the client. It registers the
+// merge with slot. An upgrade request gets the protocol switch of RFC 6455,
+// which the merge answers itself, because it has no single upstream
+// connection to relay. Every other request gets a chunked body.
+func (s *Service) newMerge(req *http.Request, target collectionTarget, slot *watchSlot) (*watchMerge, *http.Response) {
 	ctx := req.Context()
 	reader, writer := io.Pipe()
 	merge := &watchMerge{
@@ -259,7 +267,7 @@ func (s *Service) newMerge(req *http.Request, target collectionTarget) (*watchMe
 
 	key := req.Header.Get("Sec-Websocket-Key")
 	if !isWebsocketUpgrade(req.Header) || key == "" {
-		s.watches.add(writer, false)
+		s.watches.add(writer, false, slot)
 		s.metrics.watchOpened(ctx)
 		return merge, &http.Response{
 			Status:        "200 OK",
@@ -285,7 +293,7 @@ func (s *Service) newMerge(req *http.Request, target collectionTarget) (*watchMe
 		header.Set("Sec-Websocket-Protocol", subprotocol)
 	}
 
-	s.watches.add(writer, true)
+	s.watches.add(writer, true, slot)
 	s.metrics.watchOpened(ctx)
 	s.logger.DebugContext(ctx, "opened an upgraded merged watch",
 		"cluster", target.cluster, "resource", target.resource, "subprotocol", subprotocol)
