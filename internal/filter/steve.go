@@ -66,11 +66,13 @@ type projectCollection struct {
 	} `json:"data"`
 }
 
-// allowedSet is the cached view of one caller. It has the namespace names the
-// caller may list, and the ids of the projects it may see. extras is the
-// subset of names whose project label is not one of those project ids. user
-// is the Rancher user id of the caller, from a SelfSubjectReview, or empty
-// when the lookup failed.
+// allowedSet is the cached view of one caller. It has the namespace names
+// the caller may list. It also has the ids of the projects that contain at
+// least one of those names. Rancher grants project visibility and namespace
+// access as two separate rights, so a visible project with no allowed
+// namespace is not in this set. extras is the subset of names whose project
+// label is not one of these project ids. user is the Rancher user id of the
+// caller, from a SelfSubjectReview, or empty when the lookup failed.
 type allowedSet struct {
 	names    []string
 	projects []string
@@ -168,10 +170,11 @@ func (s *Service) fetchAllowed(ctx context.Context, cluster, auth, cookie string
 	}
 	s.clusters.add(cluster)
 
-	projects, denied, err := s.fetchProjectIDs(ctx, cluster, auth, cookie)
+	visible, denied, err := s.fetchProjectIDs(ctx, cluster, auth, cookie)
 	if denied != nil || err != nil {
 		return allowedSet{}, denied, err
 	}
+	projects := allowedProjects(names, projectOf, visible)
 
 	user := s.fetchCallerName(ctx, cluster, auth, cookie)
 
@@ -181,6 +184,20 @@ func (s *Service) fetchAllowed(ctx context.Context, cluster, auth, cookie string
 		extras:   extraNames(names, projectOf, projects),
 		user:     user,
 	}, nil, nil
+}
+
+// allowedProjects returns the projects in visible that contain a namespace
+// from names, by the project label in projectOf. The result is sorted with
+// no duplicates.
+func allowedProjects(names []string, projectOf map[string]string, visible []string) []string {
+	set := make(map[string]struct{})
+	for _, name := range names {
+		project := projectOf[name]
+		if project != "" && slices.Contains(visible, project) {
+			set[project] = struct{}{}
+		}
+	}
+	return slices.Sorted(maps.Keys(set))
 }
 
 // extraNames returns the names among names whose project label, from
@@ -282,8 +299,11 @@ func (s *Service) fetchNamespaceNames(ctx context.Context, cluster, auth, cookie
 // fetchProjectIDs reads the projects of the cluster that the caller may see,
 // as the part of the project id after the colon. The project label of a
 // namespace has that part only, and the part is unique inside one cluster,
-// so a project of another cluster must not reach the selector. A non-nil
-// response is the 401 or 403 answer of Rancher, for the caller.
+// so a project of another cluster must not reach the selector. The result is
+// the full visible set. fetchAllowed keeps only the visible projects that
+// contain an allowed namespace, because project visibility alone grants no
+// namespace access. A non-nil response is the 401 or 403 answer of Rancher,
+// for the caller.
 func (s *Service) fetchProjectIDs(ctx context.Context, cluster, auth, cookie string) ([]string, *http.Response, error) {
 	target := *s.upstream
 	target.Path = projectsPath

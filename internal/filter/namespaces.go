@@ -167,7 +167,7 @@ func filterJSONAccept(accept string) string {
 }
 
 // namespaceSelector picks the label selector for the privileged list.
-// A namespace with the project label of a project the caller may see is a
+// A namespace with the project label of a project in set.projects is a
 // namespace the caller may list. The watch path applies that same rule per
 // event. The project selector is therefore equivalent to the name selector
 // when set.extras is empty. Unlike the name selector, it also stays the same
