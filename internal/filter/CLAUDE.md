@@ -12,6 +12,7 @@ Human doc: `docs/api-filter.md`. Update it with a behaviour change.
 ## Allowed set
 
 - Steve (`/k8s/clusters/<id>/v1/namespaces`) returns the RBAC-filtered list in its own shape, without `labelSelector` and without watch. It is the source of the allowed set only.
+- A project enters the allowed set only when it contains an allowed namespace. A custom role can show a project with no namespace right, so project visibility alone grants no namespace access.
 - Key the allowed set on the cluster plus the first `Authorization` value, else the first `R_SESS` cookie as net/http parses it, because Rancher reads exactly that credential. A second header value or cookie must not create a second key, because every key costs a token of the shared fetch limit.
 - Key the fetch limit per caller on the credential alone, without the cluster. One caller with many clusters is one caller, and a key per cluster multiplies its rate by the cluster count.
 - The caller name comes from `POST .../selfsubjectreviews` with the caller credentials, cached in `allowedSet.user`, and it fails open. Put it in a log line and a span only, never in a metric attribute, because the value set is unbounded.

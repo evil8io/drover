@@ -222,6 +222,127 @@ func TestListNameSelectorOnMissingProjectLabel(t *testing.T) {
 	}
 }
 
+// TestListProjectSelectorExcludesVisibleProjectWithoutNamespace checks that
+// the list selector drops a project that /v3/projects shows, when the caller
+// has no namespace of that project. Rancher grants project visibility and
+// namespace access as separate rights, so p-b must not reach the selector.
+func TestListProjectSelectorExcludesVisibleProjectWithoutNamespace(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstreamWithProjects(
+		steveLabeledHandler(steveNamespace{name: "a", project: "p-a"}),
+		projectsHandler("p-a", "p-b"),
+		namespaceListHandler,
+	))
+
+	resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	privileged := h.upstream.privileged(t)
+	want := "field.cattle.io/projectId in (p-a)"
+	if got := privileged.query.Get("labelSelector"); got != want {
+		t.Errorf("labelSelector = %q, want %q", got, want)
+	}
+}
+
+// TestWatchDropsEventOfVisibleProjectWithoutNamespace is
+// TestListProjectSelectorExcludesVisibleProjectWithoutNamespace for a watch.
+// It also checks that the event filter drops an event of p-b, the second
+// gate for a namespace that the upstream selector already excludes.
+func TestWatchDropsEventOfVisibleProjectWithoutNamespace(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstreamWithProjects(
+		steveLabeledHandler(steveNamespace{name: "a", project: "p-a"}),
+		projectsHandler("p-a", "p-b"),
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"type":"ADDED","object":{"metadata":{"name":"z","labels":{"field.cattle.io/projectId":"p-b"}}}}`+"\n")
+		},
+	))
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, listPath+"?watch=true", nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if len(body) != 0 {
+		t.Errorf("body = %q, want no event", body)
+	}
+
+	privileged := h.upstream.privileged(t)
+	want := "field.cattle.io/projectId in (p-a)"
+	if got := privileged.query.Get("labelSelector"); got != want {
+		t.Errorf("labelSelector = %q, want %q", got, want)
+	}
+}
+
+// TestListMatchesNothingWithNoNamespaceAndVisibleProjects checks that a
+// caller with no Steve namespace gets the selector that matches none, even
+// when /v3/projects shows p-a and p-b. A visible project with no allowed
+// namespace grants no access.
+func TestListMatchesNothingWithNoNamespaceAndVisibleProjects(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstreamWithProjects(steveHandler(), projectsHandler("p-a", "p-b"), namespaceListHandler))
+
+	resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	privileged := h.upstream.privileged(t)
+	want := "kubernetes.io/metadata.name,!kubernetes.io/metadata.name"
+	if got := privileged.query.Get("labelSelector"); got != want {
+		t.Errorf("labelSelector = %q, want %q", got, want)
+	}
+}
+
+// TestWatchMatchesNothingWithNoNamespaceAndVisibleProjects is
+// TestListMatchesNothingWithNoNamespaceAndVisibleProjects for a watch. See
+// watchSelector: a caller with no name and no project gets the selector that
+// matches none, and an empty allowedSet.projects keeps that case true.
+func TestWatchMatchesNothingWithNoNamespaceAndVisibleProjects(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstreamWithProjects(steveHandler(), projectsHandler("p-a", "p-b"), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	resp, _ := h.do(t, h.request(t, http.MethodGet, listPath+"?watch=true", nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	privileged := h.upstream.privileged(t)
+	want := "kubernetes.io/metadata.name,!kubernetes.io/metadata.name"
+	if got := privileged.query.Get("labelSelector"); got != want {
+		t.Errorf("labelSelector = %q, want %q", got, want)
+	}
+}
+
+// TestListProjectSelectorIncludesEveryProjectWithNamespace checks the
+// positive case: the selector still names every visible project that holds
+// an allowed namespace of the caller.
+func TestListProjectSelectorIncludesEveryProjectWithNamespace(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstreamWithProjects(
+		steveLabeledHandler(steveNamespace{name: "a", project: "p-a"}, steveNamespace{name: "b", project: "p-b"}),
+		projectsHandler("p-a", "p-b"),
+		namespaceListHandler,
+	))
+
+	resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	privileged := h.upstream.privileged(t)
+	want := "field.cattle.io/projectId in (p-a,p-b)"
+	if got := privileged.query.Get("labelSelector"); got != want {
+		t.Errorf("labelSelector = %q, want %q", got, want)
+	}
+}
+
 func TestListImpersonationPassesThrough(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, listUpstream(steveHandler("a"), namespaceListHandler))

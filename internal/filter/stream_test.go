@@ -216,11 +216,15 @@ func TestWatchDropsDisallowedNamespace(t *testing.T) {
 
 func TestWatchAllowsProjectMember(t *testing.T) {
 	t.Parallel()
-	h := newHarness(t, listUpstreamWithProjects(steveHandler("a"), projectsHandler("p-1"), func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, `{"type":"ADDED","object":{"metadata":{"name":"z","labels":{"field.cattle.io/projectId":"p-1"}}}}`+"\n")
-	}))
+	h := newHarness(t, listUpstreamWithProjects(
+		steveLabeledHandler(steveNamespace{name: "a"}, steveNamespace{name: "b", project: "p-1"}),
+		projectsHandler("p-1"),
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"type":"ADDED","object":{"metadata":{"name":"z","labels":{"field.cattle.io/projectId":"p-1"}}}}`+"\n")
+		},
+	))
 
 	resp, body := h.do(t, h.request(t, http.MethodGet, listPath+"?watch=true", nil, callerHeader()))
 	if resp.StatusCode != http.StatusOK {
@@ -295,11 +299,15 @@ func TestWatchAllowsTableRowWithProjectLabel(t *testing.T) {
 	event := `{"type":"ADDED","object":{"kind":"Table","apiVersion":"meta.k8s.io/v1","metadata":{"resourceVersion":"1"},` +
 		`"rows":[{"cells":["z","Active","1h"],"object":{"kind":"PartialObjectMetadata","apiVersion":"meta.k8s.io/v1",` +
 		`"metadata":{"name":"z","labels":{"field.cattle.io/projectId":"p-1"}}}}]}}` + "\n"
-	h := newHarness(t, listUpstreamWithProjects(steveHandler("a"), projectsHandler("p-1"), func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, event)
-	}))
+	h := newHarness(t, listUpstreamWithProjects(
+		steveLabeledHandler(steveNamespace{name: "a"}, steveNamespace{name: "b", project: "p-1"}),
+		projectsHandler("p-1"),
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, event)
+		},
+	))
 
 	resp, body := h.do(t, h.request(t, http.MethodGet, listPath+"?watch=true", nil, callerHeader()))
 	if resp.StatusCode != http.StatusOK {
@@ -579,21 +587,24 @@ func waitFor(condition func() bool) bool {
 }
 
 // TestWatchEndsOnProjectChange checks that the ticker ends a chunked stream
-// once the caller gets a second project. The selector of the watch holds the
-// first project only, so Rancher sends no event for the second one.
+// once the caller gets an allowed namespace in a second project. The
+// selector of the watch names the first project only, so Rancher sends no
+// event for the namespace of the second project.
 func TestWatchEndsOnProjectChange(t *testing.T) {
 	t.Parallel()
 	release := make(chan struct{})
 	defer close(release)
 
+	namespaces := newNamespaceSet(steveNamespace{name: "a", project: "p-1"})
 	projects := newProjectSet("p-1")
 	h := newHarnessOpt(t, listUpstreamWithProjects(
-		steveLabeledHandler(steveNamespace{name: "a", project: "p-1"}),
+		namespaces.handler(),
 		projects.handler(),
 		openWatch(release),
 	), shortTTL)
 
 	ended := streamEnd(startWatch(t, h))
+	namespaces.set(steveNamespace{name: "a", project: "p-1"}, steveNamespace{name: "c", project: "p-2"})
 	projects.set("p-1", "p-2")
 	h.clock.advance(time.Minute)
 
@@ -674,9 +685,10 @@ func TestUpgradedWatchEndsOnProjectChange(t *testing.T) {
 	defer close(read)
 
 	event := eventLine("a")
+	namespaces := newNamespaceSet(steveNamespace{name: "a", project: "p-1"})
 	projects := newProjectSet("p-1")
 	h := newHarnessOpt(t, listUpstreamWithProjects(
-		steveLabeledHandler(steveNamespace{name: "a", project: "p-1"}),
+		namespaces.handler(),
 		projects.handler(),
 		func(w http.ResponseWriter, r *http.Request) {
 			hijacker, ok := w.(http.Hijacker)
@@ -736,6 +748,7 @@ func TestUpgradedWatchEndsOnProjectChange(t *testing.T) {
 		t.Fatalf("first frame = %q, want the allowed event %q", frame.payload, event)
 	}
 
+	namespaces.set(steveNamespace{name: "a", project: "p-1"}, steveNamespace{name: "c", project: "p-2"})
 	projects.set("p-1", "p-2")
 	h.clock.advance(time.Minute)
 
