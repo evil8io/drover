@@ -15,6 +15,7 @@ const (
 	reasonThrottled     = "TooManyRequests"
 	reasonForbidden     = "Forbidden"
 	reasonUnavailable   = "ServiceUnavailable"
+	reasonExpired       = "Expired"
 )
 
 type statusBody struct {

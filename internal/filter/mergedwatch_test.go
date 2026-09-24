@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"regexp"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -467,9 +468,175 @@ func TestMergedWatchEndsWhenAnUpstreamWatchEnds(t *testing.T) {
 	wantCleanEnd(t, reader, "the merged stream stayed open after an upstream watch ended")
 }
 
-// TestMergedWatchEndsOnAllowedSetChange checks that the ticker ends the
-// stream once the caller may see a namespace that the merge does not cover.
-func TestMergedWatchEndsOnAllowedSetChange(t *testing.T) {
+// modifiedEvent returns the MODIFIED event of the pod of one namespace.
+func modifiedEvent(namespace string) string {
+	return `{"type":"MODIFIED","object":{"metadata":{"name":"pod-` + namespace + `","namespace":"` + namespace + `"}}}` + "\n"
+}
+
+// gainedNamespaceWatches answers the watch of every namespace with the ADDED
+// event of its pod. The watch of namespace b then sends the MODIFIED event of
+// that pod once live closes. Every upstream watch stays open until release
+// closes.
+func gainedNamespaceWatches(release, live <-chan struct{}) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		namespace, _, _ := splitNamespaced(r.URL.Path)
+		w.Header().Set("Content-Type", jsonContentType)
+		w.WriteHeader(http.StatusOK)
+		writeWatchLines(w, []string{podEvent(namespace)})
+		if namespace == "b" {
+			select {
+			case <-live:
+				writeWatchLines(w, []string{modifiedEvent(namespace)})
+			case <-release:
+				return
+			}
+		}
+		<-release
+	}
+}
+
+// namespaceRecords returns the recorded watch requests of one namespace.
+func namespaceRecords(up *upstream, namespace string) []recorded {
+	var records []recorded
+	for _, request := range namespacedRecords(up) {
+		if got, _, _ := splitNamespaced(request.path); got == namespace {
+			records = append(records, request)
+		}
+	}
+	return records
+}
+
+// wantExpiredEvent checks that line is the ERROR event with the Status 410
+// Expired, with a message that contains text.
+func wantExpiredEvent(t *testing.T, line, text string) {
+	t.Helper()
+	var event struct {
+		Type   string     `json:"type"`
+		Object statusBody `json:"object"`
+	}
+	if err := json.Unmarshal([]byte(line), &event); err != nil {
+		t.Fatalf("decode %q: %v", line, err)
+	}
+	status := event.Object
+	if event.Type != "ERROR" || status.Kind != "Status" || status.Status != "Failure" ||
+		status.Code != http.StatusGone || status.Reason != reasonExpired {
+		t.Errorf("event = %q, want an ERROR event with the Status 410 Expired", line)
+	}
+	if !strings.Contains(status.Message, text) {
+		t.Errorf("message = %q, want it to contain %q", status.Message, text)
+	}
+}
+
+// wantLog checks that the log gets a line that contains every text.
+func wantLog(t *testing.T, h *harness, texts ...string) {
+	t.Helper()
+	found := waitFor(func() bool {
+		for _, line := range strings.Split(h.logs.String(), "\n") {
+			if !slices.ContainsFunc(texts, func(text string) bool { return !strings.Contains(line, text) }) {
+				return true
+			}
+		}
+		return false
+	})
+	if !found {
+		t.Errorf("no log line contains %q, log:\n%s", texts, h.logs.String())
+	}
+}
+
+// wantOpenAfterTick checks that the ticker re-reads the allowed set, and that
+// the stream stays open after that.
+func wantOpenAfterTick(t *testing.T, h *harness, reader *bufio.Reader) {
+	t.Helper()
+	before := h.upstream.countPath(stevePath)
+	h.clock.advance(time.Minute)
+	if !waitFor(func() bool { return h.upstream.countPath(stevePath) > before }) {
+		t.Fatal("the ticker did not re-read the allowed set of the caller")
+	}
+	wantNoEvent(t, reader)
+}
+
+// TestMergedWatchAddsAGainedNamespace checks that a namespace that the caller
+// gains joins the running merge. Its upstream watch has no resourceVersion, so
+// the client gets the objects that exist in it as ADDED events, then its live
+// events, and the stream stays open.
+func TestMergedWatchAddsAGainedNamespace(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+	live := make(chan struct{})
+
+	namespaces := newNamespaceSet(steveNamespace{name: "a"})
+	h := newHarnessOpt(t, collectionUpstream(
+		namespaces.handler(), gainedNamespaceWatches(release, live),
+	), withFanout, shortTTL)
+
+	_, reader := startMergedWatch(t, h, podsPath+"?watch=true&resourceVersion=42")
+	if got := nextEvent(t, reader); got != podEvent("a") {
+		t.Fatalf("event = %q, want %q", got, podEvent("a"))
+	}
+
+	namespaces.set(steveNamespace{name: "a"}, steveNamespace{name: "b"})
+	h.clock.advance(time.Minute)
+	if got := nextEvent(t, reader); got != podEvent("b") {
+		t.Fatalf("event = %q, want the ADDED event %q of the gained namespace", got, podEvent("b"))
+	}
+	close(live)
+	if got := nextEvent(t, reader); got != modifiedEvent("b") {
+		t.Fatalf("event = %q, want the live event %q", got, modifiedEvent("b"))
+	}
+
+	records := namespaceRecords(h.upstream, "b")
+	if len(records) != 1 {
+		t.Fatalf("watch requests of namespace b = %d, want 1", len(records))
+	}
+	query := records[0].query
+	if got := query.Get("watch"); got != "true" {
+		t.Errorf("watch = %q, want true", got)
+	}
+	for _, key := range []string{"resourceVersion", "resourceVersionMatch", "sendInitialEvents", "allowWatchBookmarks"} {
+		if query.Has(key) {
+			t.Errorf("query of namespace b = %v, want no %s", query, key)
+		}
+	}
+	if got := namespaceRecords(h.upstream, "a")[0].query.Get("resourceVersion"); got != "42" {
+		t.Errorf("resourceVersion of namespace a = %q, want 42", got)
+	}
+	wantLog(t, h, `msg="added a namespace to a merged watch"`, "cluster=c-1", "resource=pods", "namespace=b")
+	wantOpenAfterTick(t, h, reader)
+}
+
+// TestMergedWatchEndsOnALostNamespace checks that the ticker ends the stream
+// once the caller loses a namespace of the merge, after an ERROR event with
+// the Status 410 Expired. The client then lists again, and it drops the
+// objects of that namespace.
+func TestMergedWatchEndsOnALostNamespace(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	namespaces := newNamespaceSet(steveNamespace{name: "a"}, steveNamespace{name: "b"})
+	h := newHarnessOpt(t, collectionUpstream(
+		namespaces.handler(),
+		namespaceWatches(release, map[string][]string{"a": {podEvent("a")}, "b": {podEvent("b")}}),
+	), withFanout, shortTTL)
+
+	_, reader := startMergedWatch(t, h, podsPath+"?watch=true")
+	want := []string{podEvent("a"), podEvent("b")}
+	if got := mergedEvents(t, reader, 2); !slices.Equal(got, want) {
+		t.Fatalf("events = %q, want %q", got, want)
+	}
+
+	namespaces.set(steveNamespace{name: "a"})
+	h.clock.advance(time.Minute)
+	wantExpiredEvent(t, nextEvent(t, reader), "lost a namespace")
+	wantCleanEnd(t, reader, "the stream stayed open after the caller lost a namespace")
+	wantLog(t, h, "ended a merged watch, because the allowed namespaces of the caller changed")
+}
+
+// TestMergedWatchEndsOnAGainAboveTheCap checks that a gain above the fan-out
+// watch limit ends the stream, after an ERROR event with the Status 410
+// Expired, and that no upstream watch opens for the gained namespace.
+func TestMergedWatchEndsOnAGainAboveTheCap(t *testing.T) {
 	t.Parallel()
 	release := make(chan struct{})
 	defer close(release)
@@ -478,7 +645,7 @@ func TestMergedWatchEndsOnAllowedSetChange(t *testing.T) {
 	h := newHarnessOpt(t, collectionUpstream(
 		namespaces.handler(),
 		namespaceWatches(release, map[string][]string{"a": {podEvent("a")}, "b": {podEvent("b")}}),
-	), withFanout, shortTTL)
+	), withFanout, shortTTL, func(cfg *Config) { cfg.FanoutMaxWatchNamespaces = 1 })
 
 	_, reader := startMergedWatch(t, h, podsPath+"?watch=true")
 	if got := nextEvent(t, reader); got != podEvent("a") {
@@ -487,7 +654,51 @@ func TestMergedWatchEndsOnAllowedSetChange(t *testing.T) {
 
 	namespaces.set(steveNamespace{name: "a"}, steveNamespace{name: "b"})
 	h.clock.advance(time.Minute)
-	wantCleanEnd(t, reader, "the stream stayed open after the allowed set changed")
+	wantExpiredEvent(t, nextEvent(t, reader), "above the fan-out watch limit of 1")
+	wantCleanEnd(t, reader, "the stream stayed open after a gain above the fan-out watch limit")
+	wantLog(t, h, "ended a merged watch, because the allowed namespaces of the caller are above the fan-out watch limit",
+		"count=2", "limit=1")
+	if got := len(namespaceRecords(h.upstream, "b")); got != 0 {
+		t.Errorf("watch requests of namespace b = %d, want 0", got)
+	}
+}
+
+// TestMergedWatchRetriesAGainedNamespace checks that a gained namespace whose
+// watch answers 403 gets a new try on the next tick, and that the stream stays
+// open in between. Rancher creates the role bindings of a new namespace some
+// seconds after the namespace.
+func TestMergedWatchRetriesAGainedNamespace(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	var opensOfB atomic.Int32
+	watches := namespaceWatches(release, map[string][]string{"a": {podEvent("a")}, "b": {podEvent("b")}})
+	namespaces := newNamespaceSet(steveNamespace{name: "a"})
+	h := newHarnessOpt(t, collectionUpstream(namespaces.handler(), func(w http.ResponseWriter, r *http.Request) {
+		if namespace, _, _ := splitNamespaced(r.URL.Path); namespace == "b" && opensOfB.Add(1) == 1 {
+			writeForbidden(w, namespacedForbidden)
+			return
+		}
+		watches(w, r)
+	}), withFanout, shortTTL)
+
+	_, reader := startMergedWatch(t, h, podsPath+"?watch=true")
+	if got := nextEvent(t, reader); got != podEvent("a") {
+		t.Fatalf("event = %q, want %q", got, podEvent("a"))
+	}
+
+	namespaces.set(steveNamespace{name: "a"}, steveNamespace{name: "b"})
+	h.clock.advance(time.Minute)
+	if got := nextEvent(t, reader); got != podEvent("b") {
+		t.Fatalf("event = %q, want the ADDED event %q of the gained namespace", got, podEvent("b"))
+	}
+	if got := opensOfB.Load(); got != 2 {
+		t.Errorf("watch requests of namespace b = %d, want 2", got)
+	}
+	wantLog(t, h, `msg="the namespaced watch returned no stream"`, "namespace=b", "status=403")
+	wantLog(t, h, `msg="added a namespace to a merged watch"`, "namespace=b")
+	wantOpenAfterTick(t, h, reader)
 }
 
 // TestMergedWatchStaysOpenWithTheSameAllowedSet checks that the ticker

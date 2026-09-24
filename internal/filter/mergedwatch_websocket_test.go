@@ -281,3 +281,53 @@ func TestMaxWatchesPerCallerCapsAnUpgradedMergedWatch(t *testing.T) {
 		t.Errorf("status after the end of the stream = %d, want 101", again.StatusCode)
 	}
 }
+
+// TestMergedWatchUpgradeAddsAGainedNamespace checks that a namespace that the
+// caller gains joins a running upgraded merge, with the ADDED event of its
+// existing object and then its live event, each as one text frame, and that
+// the stream stays open.
+func TestMergedWatchUpgradeAddsAGainedNamespace(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+	live := make(chan struct{})
+
+	namespaces := newNamespaceSet(steveNamespace{name: "a"})
+	h := newHarnessOpt(t, collectionUpstream(
+		namespaces.handler(), gainedNamespaceWatches(release, live),
+	), withFanout, shortTTL)
+
+	resp, reader, conn := dialMergedWatch(t, h, podsPath+"?watch=true&resourceVersion=42", binarySubprotocol)
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("status = %d, want 101", resp.StatusCode)
+	}
+	if got := frameEvent(t, nextFrame(t, reader)); got != podEvent("a") {
+		t.Fatalf("event = %q, want %q", got, podEvent("a"))
+	}
+
+	namespaces.set(steveNamespace{name: "a"}, steveNamespace{name: "b"})
+	h.clock.advance(time.Minute)
+	if got := frameEvent(t, nextFrame(t, reader)); got != podEvent("b") {
+		t.Fatalf("event = %q, want the ADDED event %q of the gained namespace", got, podEvent("b"))
+	}
+	close(live)
+	if got := frameEvent(t, nextFrame(t, reader)); got != modifiedEvent("b") {
+		t.Fatalf("event = %q, want the live event %q", got, modifiedEvent("b"))
+	}
+	if records := namespaceRecords(h.upstream, "b"); len(records) != 1 || records[0].query.Has("resourceVersion") {
+		t.Errorf("watch requests of namespace b = %+v, want one without a resourceVersion", records)
+	}
+
+	before := h.upstream.countPath(stevePath)
+	h.clock.advance(time.Minute)
+	if !waitFor(func() bool { return h.upstream.countPath(stevePath) > before }) {
+		t.Fatal("the ticker did not re-read the allowed set of the caller")
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatalf("set the read deadline: %v", err)
+	}
+	var timeout net.Error
+	if _, err := reader.ReadByte(); !errors.As(err, &timeout) || !timeout.Timeout() {
+		t.Errorf("read after the tick = %v, want a timeout of an open stream", err)
+	}
+}
