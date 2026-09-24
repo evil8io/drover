@@ -26,7 +26,7 @@ A CronJob is the normal caller, because most runs find a valid token and exit 0.
 | `--credentials-dir` | (required) | Directory with the files `username` and `password` of the service user. |
 | `--token-secret` | (required) | `namespace/name` of the Secret with the API token. |
 | `--token-key` | `token` | Key of the token inside the Secret. |
-| `--password-secret` | | `namespace/name` of the Secret that Rancher reads for the password of the service user. When set, a run first writes the PBKDF2-SHA3-512 hash of the password into it. |
+| `--password-secret` | | `namespace/name` of the Secret that Rancher reads for the password of the service user. When set, a run first writes the PBKDF2-SHA3-512 hash of the password into it. The password must have 12 characters or more, the minimum of Rancher. |
 | `--ttl` | `48h` | Lifetime of a new token. Rancher reduces a value above `auth-token-max-ttl-minutes`, and a reduced value that is not longer than `--renew-before` makes the run exit 1 after the rotation. |
 | `--renew-before` | `24h` | Remaining lifetime that starts a rotation. The value must be shorter than `--ttl`. |
 | `--keep` | `2` | Number of tokens with the description to keep. The new token and the token that the run read from the Secret count, and the run never deletes them. The value must be 2 or more, because a pod reads a mounted Secret with a delay after the patch. |

@@ -161,6 +161,60 @@ func TestRunContinuesAfterAPasswordSyncFailure(t *testing.T) {
 	h.assertNoSecret(t)
 }
 
+func TestNewRejectsAShortPasswordWithThePasswordSecret(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name           string
+		withPassword   bool
+		password       string
+		wantErrContain string
+		wantErrExclude string
+	}{
+		{
+			name:           "5 characters with the password step",
+			withPassword:   true,
+			password:       "short",
+			wantErrContain: "12 or more",
+		},
+		{
+			name:           "11 multibyte characters with the password step",
+			withPassword:   true,
+			password:       strings.Repeat("é", 11),
+			wantErrContain: "12 or more",
+		},
+		{
+			name:           "5 characters without the password step",
+			withPassword:   false,
+			password:       "short",
+			wantErrContain: "the user or the password is wrong",
+			wantErrExclude: "12 or more",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			kube := newFakeKube(t, nil)
+			rancher := newFakeRancher(t)
+			h := newHarness(t, kube, rancher)
+			if test.withPassword {
+				withPasswordSecret(h)
+			}
+			h.cfg.Password = test.password
+
+			err := h.run()
+			if err == nil || !strings.Contains(err.Error(), test.wantErrContain) {
+				t.Fatalf("Run = %v, and the test expects %q", err, test.wantErrContain)
+			}
+			if test.wantErrExclude != "" && strings.Contains(err.Error(), test.wantErrExclude) {
+				t.Errorf("Run = %v, and the test expects no %q", err, test.wantErrExclude)
+			}
+			if test.withPassword && len(rancher.routes()) != 0 {
+				t.Errorf("the Rancher routes are %v, and the test expects none", rancher.routes())
+			}
+		})
+	}
+}
+
 func TestNewRejectsAPartialPasswordSecret(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
