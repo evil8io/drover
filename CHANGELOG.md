@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.14.1](https://github.com/evil8io/drover/compare/v0.14.0...v0.14.1) (2026-09-24)
+
+
+### Bug Fixes
+
+* **api-filter:** bound the namespaced requests of all fan-outs together ([#73](https://github.com/evil8io/drover/issues/73)) ([24b336a](https://github.com/evil8io/drover/commit/24b336ab195ab256ed8645d2fe803bfed6d4c963))
+* **api-filter:** cap the review body at 64 KiB, and grant on the echoed spec only ([#68](https://github.com/evil8io/drover/issues/68)) ([f34a601](https://github.com/evil8io/drover/commit/f34a601fe3b34385e17ac83eff9928b932a6e0e3))
+* **api-filter:** key the allowed set on the credential that Rancher reads, and limit the fetches per caller ([#67](https://github.com/evil8io/drover/issues/67)) ([0b53803](https://github.com/evil8io/drover/commit/0b538035c9f202f8d4ee4e8689307d62bea14b7b))
+* **api-filter:** reserve a watch slot before the upstream request, per caller and in total ([#69](https://github.com/evil8io/drover/issues/69)) ([7e82e07](https://github.com/evil8io/drover/commit/7e82e0739767ba4d97a879e337836f7bae55d995))
+* **api-filter:** select only the projects that contain an allowed namespace ([#70](https://github.com/evil8io/drover/issues/70)) ([bd8040e](https://github.com/evil8io/drover/commit/bd8040e952ea75b232c7b041c744f5a91f55e8e9))
+* **project-sync:** page the namespace list, and keep only the keys that the sync reads ([#72](https://github.com/evil8io/drover/issues/72)) ([292e2b3](https://github.com/evil8io/drover/commit/292e2b38926c5fe0f1028554fd16514d4df1f595))
+
 ## [0.14.0](https://github.com/evil8io/drover/compare/v0.13.0...v0.14.0) (2026-09-21)
 
 
