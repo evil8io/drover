@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -21,7 +22,12 @@ const (
 	mergePatchType = "application/merge-patch+json"
 	maxPages       = 100
 	maxBody        = 32 << 20
+	pageSize       = 500
+	maxRecordValue = 4096
 )
+
+// errListExpired marks a namespace list whose continue token is too old.
+var errListExpired = errors.New("the continue token of the namespace list is too old")
 
 // project is the part of a Rancher project that the service reads.
 type project struct {
@@ -32,11 +38,10 @@ type project struct {
 	Annotations map[string]string `json:"annotations"`
 }
 
-type projectList struct {
-	Data       []project `json:"data"`
-	Pagination struct {
-		Next string `json:"next"`
-	} `json:"pagination"`
+// pagination is the part of the pagination of a Rancher collection that the
+// service reads.
+type pagination struct {
+	Next string `json:"next"`
 }
 
 // namespace is the part of a Kubernetes namespace that the service reads.
@@ -49,8 +54,53 @@ type namespace struct {
 	} `json:"metadata"`
 }
 
-type namespaceList struct {
-	Items []namespace `json:"items"`
+// listMeta is the part of the metadata of a Kubernetes list that the service
+// reads.
+type listMeta struct {
+	Continue string `json:"continue"`
+}
+
+// pruneNamespace returns the name, the resource version, and the keys that the
+// sync reads of item.
+func (s *Syncer) pruneNamespace(item namespace) namespace {
+	var out namespace
+	out.Metadata.Name = item.Metadata.Name
+	out.Metadata.ResourceVersion = item.Metadata.ResourceVersion
+	out.Metadata.Labels = pick(item.Metadata.Labels, s.readLabels)
+	out.Metadata.Annotations = pick(item.Metadata.Annotations, s.readAnnotations)
+	// A tenant can fill a record up to the annotation limit of the API server,
+	// and a record that the service writes is a short key list.
+	for _, key := range []string{managedLabelsKey, managedAnnotationsKey} {
+		if len(out.Metadata.Annotations[key]) > maxRecordValue {
+			delete(out.Metadata.Annotations, key)
+		}
+	}
+	return out
+}
+
+// pruneProject returns item with only the labels and the annotations that the
+// sync copies.
+func (s *Syncer) pruneProject(item project) project {
+	item.Labels = pick(item.Labels, s.labels)
+	item.Annotations = pick(item.Annotations, s.annotations)
+	return item
+}
+
+// pick returns a new map with the entries of values at keys. It returns nil
+// when values has none of the keys.
+func pick(values map[string]string, keys []string) map[string]string {
+	var out map[string]string
+	for _, key := range keys {
+		value, ok := values[key]
+		if !ok {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]string, len(keys))
+		}
+		out[key] = value
+	}
+	return out
 }
 
 // watchEvent is one event of a namespace watch stream. The object is a
@@ -132,28 +182,20 @@ func skippable(err error) bool {
 
 // projects returns every project that the service user sees, over all pages.
 func (s *Syncer) projects(ctx context.Context, token string) ([]project, error) {
-	target := s.target(projectsPath, nil)
+	target := s.target(projectsPath, url.Values{"limit": []string{strconv.Itoa(pageSize)}})
 
 	var projects []project
 	for page := 0; page < maxPages; page++ {
-		status, body, err := s.do(ctx, http.MethodGet, target, token, "", nil)
+		items, next, err := s.projectPage(ctx, token, target)
 		if err != nil {
 			return nil, err
 		}
-		if status != http.StatusOK {
-			return nil, newStatusError(http.MethodGet, projectsPath, status, body)
-		}
+		projects = append(projects, items...)
 
-		var list projectList
-		if err := json.Unmarshal(body, &list); err != nil {
-			return nil, fmt.Errorf("decode the project list: %w", err)
-		}
-		projects = append(projects, list.Data...)
-
-		if list.Pagination.Next == "" {
+		if next == "" {
 			return projects, nil
 		}
-		target, err = s.nextTarget(list.Pagination.Next)
+		target, err = s.nextTarget(next)
 		if err != nil {
 			return nil, err
 		}
@@ -161,24 +203,167 @@ func (s *Syncer) projects(ctx context.Context, token string) ([]project, error) 
 	return nil, fmt.Errorf("the project list has more than %d pages", maxPages)
 }
 
-// namespaces returns the namespaces of a cluster that have the project label.
-func (s *Syncer) namespaces(ctx context.Context, token, cluster string) ([]namespace, error) {
-	path := namespacesPath(cluster)
-	query := url.Values{"labelSelector": []string{projectLabel}}
-
-	status, body, err := s.do(ctx, http.MethodGet, s.target(path, query), token, "", nil)
+// projectPage reads one page of the project list. It returns the projects and
+// the link to the next page.
+func (s *Syncer) projectPage(ctx context.Context, token, target string) ([]project, string, error) {
+	resp, err := s.getList(ctx, projectsPath, target, token)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	if status != http.StatusOK {
-		return nil, newStatusError(http.MethodGet, path, status, body)
+	defer func() { _ = resp.Body.Close() }()
+
+	var (
+		items []project
+		next  pagination
+	)
+	if err := decodePage(resp.Body, s.pageCap, "pagination", &next, "data", collect(&items, s.pruneProject)); err != nil {
+		return nil, "", fmt.Errorf("decode the project list: %w", err)
+	}
+	return items, next.Next, nil
+}
+
+// namespaces returns the namespaces of a cluster that have the project label.
+// An expired continue token starts the list again from the first page, once.
+func (s *Syncer) namespaces(ctx context.Context, token, cluster string) ([]namespace, error) {
+	items, err := s.listNamespaces(ctx, token, cluster)
+	if errors.Is(err, errListExpired) {
+		items, err = s.listNamespaces(ctx, token, cluster)
+	}
+	return items, err
+}
+
+// listNamespaces reads the namespace list of a cluster, over all pages.
+func (s *Syncer) listNamespaces(ctx context.Context, token, cluster string) ([]namespace, error) {
+	var (
+		items []namespace
+		next  string
+	)
+	for page := 0; page < maxPages; page++ {
+		batch, more, err := s.namespacePage(ctx, token, cluster, next)
+		if err != nil {
+			var status statusError
+			if next != "" && errors.As(err, &status) && status.status == http.StatusGone {
+				return nil, fmt.Errorf("%w: %w", errListExpired, err)
+			}
+			return nil, err
+		}
+		items = append(items, batch...)
+
+		if more == "" {
+			return items, nil
+		}
+		next = more
+	}
+	return nil, fmt.Errorf("the namespace list of cluster %s has more than %d pages", cluster, maxPages)
+}
+
+// namespacePage reads the page of the namespace list of a cluster that the
+// continue token next selects. It returns the namespaces and the continue
+// token of the next page.
+func (s *Syncer) namespacePage(ctx context.Context, token, cluster, next string) ([]namespace, string, error) {
+	path := namespacesPath(cluster)
+	query := url.Values{
+		"labelSelector": []string{projectLabel},
+		"limit":         []string{strconv.Itoa(pageSize)},
+	}
+	if next != "" {
+		query.Set("continue", next)
 	}
 
-	var list namespaceList
-	if err := json.Unmarshal(body, &list); err != nil {
-		return nil, fmt.Errorf("decode the namespace list of cluster %s: %w", cluster, err)
+	resp, err := s.getList(ctx, path, s.target(path, query), token)
+	if err != nil {
+		return nil, "", err
 	}
-	return list.Items, nil
+	defer func() { _ = resp.Body.Close() }()
+
+	var (
+		items []namespace
+		meta  listMeta
+	)
+	if err := decodePage(resp.Body, s.pageCap, "metadata", &meta, "items", collect(&items, s.pruneNamespace)); err != nil {
+		return nil, "", fmt.Errorf("decode the namespace list of cluster %s: %w", cluster, err)
+	}
+	return items, meta.Continue, nil
+}
+
+// decodePage decodes one page of a list from body as a stream. It passes the
+// decoder to item once per element of the array at itemsKey, decodes the
+// value at metaKey into meta, and skips every other key. The keys can come in
+// any order. A body larger than limit bytes returns an error that names the
+// limit.
+func decodePage(body io.Reader, limit int64, metaKey string, meta any, itemsKey string, item func(*json.Decoder) error) error {
+	limited := &io.LimitedReader{R: body, N: limit + 1}
+	err := walkPage(json.NewDecoder(limited), metaKey, meta, itemsKey, item)
+	if err != nil && limited.N == 0 {
+		return fmt.Errorf("the page is larger than %d bytes", limit)
+	}
+	return err
+}
+
+func walkPage(dec *json.Decoder, metaKey string, meta any, itemsKey string, item func(*json.Decoder) error) error {
+	if err := expectDelim(dec, '{'); err != nil {
+		return err
+	}
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		switch key {
+		case metaKey:
+			err = dec.Decode(meta)
+		case itemsKey:
+			err = walkItems(dec, item)
+		default:
+			err = dec.Decode(new(json.RawMessage))
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return expectDelim(dec, '}')
+}
+
+// walkItems passes the decoder to item once per element of the array that
+// comes next. A null array has no element.
+func walkItems(dec *json.Decoder, item func(*json.Decoder) error) error {
+	token, err := dec.Token()
+	if err != nil || token == nil {
+		return err
+	}
+	if token != json.Delim('[') {
+		return fmt.Errorf("the item list is %v, not an array", token)
+	}
+	for dec.More() {
+		if err := item(dec); err != nil {
+			return err
+		}
+	}
+	return expectDelim(dec, ']')
+}
+
+func expectDelim(dec *json.Decoder, want json.Delim) error {
+	token, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if token != want {
+		return fmt.Errorf("the list has %v where %v is expected", token, want)
+	}
+	return nil
+}
+
+// collect returns an item function for decodePage. It decodes one item, and
+// appends the part of it that prune returns to items.
+func collect[T any](items *[]T, prune func(T) T) func(*json.Decoder) error {
+	return func(dec *json.Decoder) error {
+		var item T
+		if err := dec.Decode(&item); err != nil {
+			return err
+		}
+		*items = append(*items, prune(item))
+		return nil
+	}
 }
 
 // patchNamespace sends the patch of one namespace as a JSON merge patch.
@@ -199,9 +384,45 @@ func (s *Syncer) patchNamespace(ctx context.Context, token, cluster, name string
 	return nil
 }
 
-// openStream sends a GET that returns a long-lived body. Only ctx ends the
-// request, because a watch stream outlives the request timeout of the service.
-// The caller closes the body.
+// getList sends a GET for one page of a list. On status 200 it returns the
+// response with the body open, and the request timeout lasts until the caller
+// closes the body. Another status returns a statusError.
+func (s *Syncer) getList(ctx context.Context, path, target, token string) (*http.Response, error) {
+	ctx, cancel := context.WithTimeout(ctx, s.timeout)
+	resp, err := s.openStream(ctx, target, token)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusOK {
+		resp.Body = cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
+		return resp, nil
+	}
+
+	defer cancel()
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	if err != nil {
+		return nil, fmt.Errorf("read the answer of GET %s: %w", path, err)
+	}
+	return nil, newStatusError(http.MethodGet, path, resp.StatusCode, body)
+}
+
+// cancelOnClose is a response body that ends the context of its request on
+// Close.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b cancelOnClose) Close() error {
+	defer b.cancel()
+	return b.ReadCloser.Close()
+}
+
+// openStream sends a GET and returns the response with the body open. Only
+// ctx ends the request, so that a watch stream can outlive the request timeout
+// of the service. The caller closes the body.
 func (s *Syncer) openStream(ctx context.Context, target, token string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {

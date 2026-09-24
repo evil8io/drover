@@ -89,6 +89,13 @@ type Syncer struct {
 	metrics        *metrics
 	tracer         trace.Tracer
 
+	// readLabels and readAnnotations are the namespace keys that the sync
+	// reads. A decoded namespace keeps only these keys.
+	readLabels      []string
+	readAnnotations []string
+	// pageCap is the byte limit of one list page.
+	pageCap int64
+
 	// tokenMissing keeps the last state of the token file, so that the service
 	// logs one warning per state change.
 	tokenMissing bool
@@ -174,21 +181,26 @@ func New(cfg Config) (*Syncer, error) {
 		tracerProvider = otel.GetTracerProvider()
 	}
 
+	readLabels, readAnnotations := namespaceKeys(cfg)
+
 	return &Syncer{
-		rancher:        &rancher,
-		tokenFile:      cfg.TokenFile,
-		labels:         slices.Clone(cfg.Labels),
-		annotations:    slices.Clone(cfg.Annotations),
-		nameLabel:      cfg.NameLabel,
-		nameAnnotation: cfg.NameAnnotation,
-		interval:       interval,
-		timeout:        min(interval, maxTimeout),
-		patchRate:      patchRate,
-		userAgent:      "drover/" + version,
-		logger:         logger,
-		client:         &http.Client{Transport: rancherclient.WrapTransport(transport, meterProvider)},
-		metrics:        m,
-		tracer:         tracerProvider.Tracer(tracerName),
+		rancher:         &rancher,
+		tokenFile:       cfg.TokenFile,
+		labels:          slices.Clone(cfg.Labels),
+		annotations:     slices.Clone(cfg.Annotations),
+		nameLabel:       cfg.NameLabel,
+		nameAnnotation:  cfg.NameAnnotation,
+		readLabels:      readLabels,
+		readAnnotations: readAnnotations,
+		pageCap:         maxBody,
+		interval:        interval,
+		timeout:         min(interval, maxTimeout),
+		patchRate:       patchRate,
+		userAgent:       "drover/" + version,
+		logger:          logger,
+		client:          &http.Client{Transport: rancherclient.WrapTransport(transport, meterProvider)},
+		metrics:         m,
+		tracer:          tracerProvider.Tracer(tracerName),
 	}, nil
 }
 
