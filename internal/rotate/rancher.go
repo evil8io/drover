@@ -79,6 +79,16 @@ type createdToken struct {
 	name  string
 }
 
+// tokenName returns the name part of a token value. It returns an empty string
+// for a malformed value.
+func tokenName(value string) string {
+	name, _, found := strings.Cut(value, ":")
+	if !found {
+		return ""
+	}
+	return name
+}
+
 // tokenIsValid reports whether the token in the Secret lasts past the renew
 // window. A token that Rancher rejects is not valid.
 func (r *rotator) tokenIsValid(ctx context.Context, token string) (_ bool, err error) {
@@ -86,8 +96,8 @@ func (r *rotator) tokenIsValid(ctx context.Context, token string) (_ bool, err e
 	var outcome string
 	defer func() { end(outcome, err) }()
 
-	name, _, found := strings.Cut(token, ":")
-	if !found || name == "" {
+	name := tokenName(token)
+	if name == "" {
 		outcome = r.logRotate(ctx, "malformed")
 		return false, nil
 	}
@@ -221,9 +231,10 @@ func (r *rotator) createToken(ctx context.Context, s session) (_ createdToken, e
 	return createdToken{value: item.Token, name: name}, nil
 }
 
-// prune deletes the tokens of the service user that this command created before,
-// except the newest Keep tokens. It also deletes a login token of an earlier run.
-func (r *rotator) prune(ctx context.Context, created createdToken, s session) (err error) {
+// prune deletes the tokens of the service user that this command created before.
+// It keeps the new token, the token named secretName, and the newest other
+// tokens up to Keep in total. It also deletes a login token of an earlier run.
+func (r *rotator) prune(ctx context.Context, created createdToken, secretName string, s session) (err error) {
 	ctx, end := r.step(ctx, stepTokenPrune)
 	outcome := outcomeOK
 	defer func() { end(outcome, err) }()
@@ -243,10 +254,25 @@ func (r *rotator) prune(ctx context.Context, created createdToken, s session) (e
 	}
 
 	mine, sessions := r.selectTokens(collection.Data, s)
-	// The new token stays, whatever its position in the list. A tie on the
-	// creation time, or an unparsed time, must never delete it.
-	mine = slices.DeleteFunc(mine, func(item tokenItem) bool { return item.itemName() == created.name })
-	keep := min(len(mine), r.cfg.Keep-1)
+	// The new token and the token of the Secret stay, whatever their position
+	// in the list. A tie on the creation time, or an unparsed time, must never
+	// delete the new token. A pod reads the token of the Secret until the
+	// kubelet updates the mounted Secret.
+	protected := 1
+	secretKept := ""
+	mine = slices.DeleteFunc(mine, func(item tokenItem) bool {
+		name := item.itemName()
+		switch {
+		case name == created.name:
+			return true
+		case secretName != "" && name == secretName:
+			protected++
+			secretKept = name
+			return true
+		}
+		return false
+	})
+	keep := min(len(mine), max(0, r.cfg.Keep-protected))
 	var errs []error
 	deleted := 0
 	for _, item := range slices.Concat(mine[keep:], sessions) {
@@ -262,8 +288,8 @@ func (r *rotator) prune(ctx context.Context, created createdToken, s session) (e
 		outcome, level = outcomeFailed, slog.LevelWarn
 	}
 	r.logger.Log(ctx, level, "deleted the old tokens", "step", stepTokenPrune, "outcome", outcome,
-		"new_token", created.name, "found", len(mine)+1, "kept", keep+1,
-		"sessions", len(sessions), "deleted", deleted, "failed", len(errs))
+		"new_token", created.name, "secret_token", secretKept, "found", len(mine)+protected,
+		"kept", keep+protected, "sessions", len(sessions), "deleted", deleted, "failed", len(errs))
 	return errors.Join(errs...)
 }
 
