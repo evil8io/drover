@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -57,28 +58,43 @@ var closeFrame = []byte{0x80 | opcodeClose, 0x02, 0x03, 0xe8}
 
 // upgradedWatch is the body of a namespace watch that Rancher answers with a
 // protocol switch. Read returns the events of the upstream that pass the
-// filter. Write passes the bytes of the caller to the upstream unchanged.
+// filter. Write passes the bytes of the caller to the current upstream
+// unchanged.
 type upgradedWatch struct {
 	*io.PipeReader
-	upstream io.ReadWriteCloser
+	upstream *upstreamHolder[io.ReadWriteCloser]
 }
 
+// Write sends p again to the new upstream when a swap closed the upstream
+// during the write, because the reverse proxy ends the connection of the
+// client on a failed write.
 func (u *upgradedWatch) Write(p []byte) (int, error) {
-	return u.upstream.Write(p)
+	for {
+		upstream, generation := u.upstream.current()
+		n, err := upstream.Write(p)
+		if err == nil {
+			return n, nil
+		}
+		if _, now := u.upstream.current(); now == generation {
+			return n, err
+		}
+	}
 }
 
-// Close ends the read side, and closes the upstream connection.
+// Close ends the read side, and closes the current upstream connection.
 func (u *upgradedWatch) Close() error {
 	_ = u.PipeReader.Close()
-	return u.upstream.Close()
+	u.upstream.finish()
+	return nil
 }
 
 // filterWatchUpgrade replaces the body of an upgraded namespace watch, so
-// every watch event gets the filter of a chunked watch. It returns the write
-// side of the filtered stream, or nil when no stream follows. It registers
-// that write side in registry with slot while the goroutine runs, so a drain
-// and a project change can end the stream. It raises
-// drover.filter.watches.open while the stream is open.
+// every watch event gets the filter of a chunked watch. It returns the relay
+// of the filtered stream, or nil when no stream follows. It registers the
+// write side of the relay in registry with slot while the goroutine runs, so
+// a drain and the tracker of the allowed set can end the stream. A read of the
+// upstream that fails after a swap of the relay goes on with the frames of the
+// new upstream. It raises drover.filter.watches.open while the stream is open.
 //
 // It returns an error when the body is not an io.ReadWriteCloser, because
 // httputil.ReverseProxy needs that interface for an upgraded connection, and
@@ -86,7 +102,7 @@ func (u *upgradedWatch) Close() error {
 // registry then has no stream, and slot stays with the caller. The stream
 // ends at once, with a close frame and no event, when the answer names a
 // websocket extension.
-func filterWatchUpgrade(ctx context.Context, resp *http.Response, allow func(name string, labels map[string]string) bool, logger *slog.Logger, registry *watchRegistry, slot *watchSlot, metrics *metrics, cluster string) (*io.PipeWriter, error) {
+func filterWatchUpgrade(ctx context.Context, resp *http.Response, allow func(name string, labels map[string]string) bool, logger *slog.Logger, registry *watchRegistry, slot *watchSlot, metrics *metrics, cluster string) (*watchRelay, error) {
 	upstream, ok := resp.Body.(io.ReadWriteCloser)
 	if !ok {
 		return nil, fmt.Errorf("the upgraded watch has a read-only body of type %T", resp.Body)
@@ -100,12 +116,13 @@ func filterWatchUpgrade(ctx context.Context, resp *http.Response, allow func(nam
 	reader, writer := io.Pipe()
 	registry.add(writer, true, slot)
 	metrics.watchOpened(ctx)
-	resp.Body = &upgradedWatch{PipeReader: reader, upstream: upstream}
+	relay := &watchRelay{writer: writer, upgraded: newUpstreamHolder(upstream)}
+	resp.Body = &upgradedWatch{PipeReader: reader, upstream: relay.upgraded}
 
 	end := func() {
 		registry.remove(writer)
 		metrics.watchClosed(ctx)
-		_ = upstream.Close()
+		relay.upgraded.finish()
 	}
 
 	if extensions != "" {
@@ -122,7 +139,7 @@ func filterWatchUpgrade(ctx context.Context, resp *http.Response, allow func(nam
 	filter := &frameFilter{
 		ctx:     ctx,
 		src:     bufio.NewReader(upstream),
-		dst:     writer,
+		dst:     relay,
 		base64:  subprotocol == base64Subprotocol,
 		allow:   allow,
 		logger:  logger,
@@ -132,17 +149,36 @@ func filterWatchUpgrade(ctx context.Context, resp *http.Response, allow func(nam
 
 	go func() {
 		defer end()
-		err := filter.run()
-		if filter.upstreamEnded(err) {
-			_ = writer.CloseWithError(err)
+		_, generation := relay.upgraded.current()
+		for {
+			err := filter.run()
+			if err != nil && filter.writeErr == nil {
+				if next, swapped, ok := relay.upgraded.next(generation); ok {
+					generation = swapped
+					filter.restart(next)
+					continue
+				}
+			}
+			if filter.upstreamEnded(err) {
+				_ = writer.CloseWithError(err)
+				return
+			}
+			logger.WarnContext(ctx, "ended an upgraded namespace watch, because the upstream stream failed",
+				"cluster", cluster, "error", err.Error())
+			registry.end(writer)
 			return
 		}
-		logger.WarnContext(ctx, "ended an upgraded namespace watch, because the upstream stream failed",
-			"cluster", cluster, "error", err.Error())
-		registry.end(writer)
 	}()
 
-	return writer, nil
+	return relay, nil
+}
+
+// websocketKey returns a new Sec-WebSocket-Key value, the base64 text of 16
+// random bytes, as RFC 6455 defines it.
+func websocketKey() string {
+	key := make([]byte, 16)
+	_, _ = rand.Read(key)
+	return base64.StdEncoding.EncodeToString(key)
 }
 
 // frameFilter reads the RFC 6455 frames of a namespace watch, and writes the
@@ -173,6 +209,18 @@ type frameFilter struct {
 	messageOpcode byte
 	opcode        byte
 	encoded       bool
+
+	// writeErr is the error of a failed write to dst. The stream then ends,
+	// also after a swap of the upstream.
+	writeErr error
+}
+
+// restart makes the filter read the frames of src, the upstream that a swap
+// put in place. It drops the bytes of an incomplete message and of an
+// incomplete event, because the new upstream does not continue them.
+func (f *frameFilter) restart(src io.Reader) {
+	f.src = bufio.NewReader(src)
+	f.message, f.messageOpcode, f.buffer = nil, opcodeContinuation, nil
 }
 
 // run reads frames until the upstream ends, the write side fails, or the
@@ -358,6 +406,9 @@ func (f *frameFilter) write(p []byte) error {
 		return nil
 	}
 	_, err := f.dst.Write(p)
+	if err != nil {
+		f.writeErr = err
+	}
 	return err
 }
 

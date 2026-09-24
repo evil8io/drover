@@ -1,11 +1,15 @@
 package filter
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -79,13 +83,7 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 		return s.statusError(req, start, result, err), nil
 	}
 
-	privileged := req.Clone(req.Context())
-	privileged.Header.Set("Authorization", "Bearer "+token)
-	privileged.Header.Del("Cookie")
-	privileged.Header.Del("Accept-Encoding")
-	// The filter reads no compressed payload. Rancher then negotiates no
-	// extension, and the client gets that same answer.
-	privileged.Header.Del(extensionsHeader)
+	privileged := privilegedRequest(req, token)
 
 	selected := false
 	var callerSelector, watchLabelSelector string
@@ -117,10 +115,10 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 		allow := func(name string, labels map[string]string) bool {
 			return s.allowedNamespace(req.Context(), cluster, req.Header, name, labels)
 		}
-		var writer *io.PipeWriter
+		var relay *watchRelay
 		switch filtered.StatusCode {
 		case http.StatusOK:
-			filtered.Body, writer = filterWatchBody(req.Context(), filtered.Body, allow, s.logger, s.watches, slot, s.metrics, cluster)
+			filtered.Body, relay = filterWatchBody(req.Context(), filtered.Body, allow, s.logger, s.watches, slot, s.metrics, cluster)
 			handedOver = true
 			// A dropped event changes the byte count, so the length of upstream
 			// no longer applies, and the filter writes plain JSON.
@@ -128,15 +126,15 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 			filtered.Header.Del("Content-Length")
 			filtered.Header.Del("Content-Encoding")
 		case http.StatusSwitchingProtocols:
-			writer, err = filterWatchUpgrade(req.Context(), filtered, allow, s.logger, s.watches, slot, s.metrics, cluster)
+			relay, err = filterWatchUpgrade(req.Context(), filtered, allow, s.logger, s.watches, slot, s.metrics, cluster)
 			if err != nil {
 				_ = filtered.Body.Close()
 				return s.statusError(req, start, result, err), nil
 			}
 			handedOver = true
 		}
-		if selected && writer != nil {
-			go s.endOnSelectorChange(req.Context(), cluster, req.Header, callerSelector, watchLabelSelector, writer)
+		if relay != nil {
+			go s.trackNamespaceWatch(req.Context(), newNamespaceWatch(req, cluster, set, callerSelector, watchLabelSelector, selected, relay))
 		}
 	}
 	result.outcome, result.status, result.count = outcomeFiltered, filtered.StatusCode, len(set.names)
@@ -180,12 +178,11 @@ func namespaceSelector(caller string, set allowedSet) string {
 }
 
 // watchSelector picks the label selector for the privileged watch, and
-// reports whether the watch gets one. The selector of a watch does not change
-// while the stream runs, so a name selector hides a namespace that Rancher
-// puts in a project of the caller later. A project selector has no such gap, because a
-// new namespace of a project matches by itself. A caller with a namespace
-// outside its own projects gets no selector, because only the event filter
-// separates that case.
+// reports whether the watch gets one. A project selector matches a new
+// namespace of a project by itself, so the stream needs no swap of its
+// upstream for it. A name selector needs a swap for every new namespace. A
+// caller with a namespace outside its own projects gets no selector, because
+// only the event filter separates that case.
 func watchSelector(caller string, set allowedSet) (string, bool) {
 	switch {
 	case len(set.names) == 0 && len(set.projects) == 0:
@@ -197,16 +194,64 @@ func watchSelector(caller string, set allowedSet) (string, bool) {
 	}
 }
 
-// endOnSelectorChange ends the watch stream of writer once the selector that
-// the allowed set of the caller gives differs from selector. A watch with a
-// selector gets no event outside that selector, so the event filter cannot
-// show a namespace that Rancher grants later. The client re-lists and
-// re-watches after the end of the stream, and the new watch gets the selector
-// of the new allowed set. The re-read of the allowed set goes through the
-// cache of a plain list, so it adds no request beyond the one fetch per cache
-// TTL.
-func (s *Service) endOnSelectorChange(ctx context.Context, cluster string, header http.Header, caller, selector string, writer *io.PipeWriter) {
-	done := s.watches.done(writer)
+// namespaceWatch is the state of one namespace watch that
+// trackNamespaceWatch keeps. selector and selected are the case of the current
+// upstream watch, as watchSelector gives it. names is the allowed set that the
+// stream of the client follows.
+type namespaceWatch struct {
+	req     *http.Request
+	cluster string
+	relay   *watchRelay
+	caller  string
+
+	selector string
+	selected bool
+	names    []string
+
+	// synthesize is false for a stream that takes no event of the service.
+	// An Accept with an as parameter asks for another form of the object,
+	// for example a table that needs the columns of the stream. The service
+	// also does not apply a label or a field selector of the caller to its
+	// own events.
+	synthesize bool
+}
+
+func newNamespaceWatch(req *http.Request, cluster string, set allowedSet, caller, selector string, selected bool, relay *watchRelay) *namespaceWatch {
+	return &namespaceWatch{
+		req:      req.Clone(req.Context()),
+		cluster:  cluster,
+		relay:    relay,
+		caller:   caller,
+		selector: selector,
+		selected: selected,
+		names:    slices.Clone(set.names),
+		synthesize: !transformsObject(filterJSONAccept(req.Header.Get("Accept"))) &&
+			caller == "" && req.URL.Query().Get("fieldSelector") == "",
+	}
+}
+
+// transformsObject reports whether an entry of accept asks for another form
+// of the object with an as parameter, for example as=Table for a server-side
+// table.
+func transformsObject(accept string) bool {
+	for _, entry := range strings.Split(accept, ",") {
+		params := strings.Split(entry, ";")
+		for _, param := range params[1:] {
+			key, _, _ := strings.Cut(param, "=")
+			if strings.EqualFold(strings.TrimSpace(key), "as") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// trackNamespaceWatch keeps the stream of w open across a change of the
+// allowed set of the caller. It re-reads the allowed set once per cache TTL,
+// through the cache of a plain list, so it adds no request beyond the one
+// fetch per cache TTL.
+func (s *Service) trackNamespaceWatch(ctx context.Context, w *namespaceWatch) {
+	done := s.watches.done(w.relay.writer)
 	ticker := time.NewTicker(s.cache.ttl)
 	defer ticker.Stop()
 
@@ -219,20 +264,229 @@ func (s *Service) endOnSelectorChange(ctx context.Context, cluster string, heade
 		case <-ticker.C:
 		}
 
-		set, denied, err := s.allowed(ctx, cluster, header)
+		set, denied, err := s.allowed(ctx, w.cluster, w.req.Header)
 		if denied != nil {
 			_ = denied.Body.Close()
 		}
 		if denied != nil || err != nil {
 			continue
 		}
-		if current, ok := watchSelector(caller, set); ok && current == selector {
-			continue
+		if !s.followAllowedSet(ctx, w, set) {
+			return
 		}
-		s.logger.InfoContext(ctx, "ended a namespace watch, because the selector of the caller changed", "cluster", cluster)
-		s.watches.end(writer)
-		return
 	}
+}
+
+// followAllowedSet brings the stream of w to set, and reports false once the
+// stream ends. A name that the caller loses gets a DELETED event first. A
+// watch with a selector then swaps its upstream when the selector changes. A
+// watch without a selector keeps its upstream for its whole life, and a name
+// that the caller gains gets an ADDED event with the object that
+// readNamespace returns. A stream that takes no event of the service ends
+// instead, when a change needs such an event.
+func (s *Service) followAllowedSet(ctx context.Context, w *namespaceWatch, set allowedSet) bool {
+	lost := subtract(w.names, set.names)
+	gained := subtract(set.names, w.names)
+	selector, selected := watchSelector(w.caller, set)
+	if len(lost) == 0 && len(gained) == 0 && (!w.selected || (selected && selector == w.selector)) {
+		return true
+	}
+
+	if !w.synthesize && (len(lost) > 0 || (!w.selected && len(gained) > 0)) {
+		s.expireNamespaceWatch(ctx, w, "ended a namespace watch that takes no event of the service, because the allowed namespaces of the caller changed")
+		return false
+	}
+	for _, name := range lost {
+		if !s.emitNamespaceEvent(ctx, w, watchDeleted, name, deletedNamespace(name)) {
+			return false
+		}
+	}
+	w.names = subtract(w.names, lost)
+
+	if !w.selected {
+		for _, name := range gained {
+			object, ok := s.readNamespace(ctx, w, name)
+			if !ok {
+				continue
+			}
+			if !s.emitNamespaceEvent(ctx, w, watchAdded, name, object) {
+				return false
+			}
+			w.names = append(w.names, name)
+		}
+		return true
+	}
+
+	if !selected {
+		s.expireNamespaceWatch(ctx, w, "ended a namespace watch, because the allowed namespaces of the caller need a watch without a selector")
+		return false
+	}
+	if selector != w.selector {
+		if err := s.swapNamespaceWatch(ctx, w, selector); err != nil {
+			if errors.Is(err, errStreamEnded) || ctx.Err() != nil {
+				return false
+			}
+			s.expireNamespaceWatch(ctx, w, "ended a namespace watch, because the swap of its upstream failed", "error", err.Error())
+			return false
+		}
+		s.logger.InfoContext(ctx, "swapped the upstream of a namespace watch, because the allowed namespaces of the caller changed",
+			"cluster", w.cluster, "lost", len(lost), "gained", len(gained))
+		w.selector = selector
+	}
+	w.names = slices.Clone(set.names)
+	return true
+}
+
+// swapNamespaceWatch opens a privileged watch with selector and without a
+// resourceVersion, and puts it in place of the upstream of w. The API server
+// starts such a watch with an ADDED event for each namespace under the
+// selector, so the namespaces that the caller gains reach the client. A client
+// takes the ADDED event of a namespace that it has already as an update.
+//
+// The swap takes one token of the fetch limit of the caller, and it fails
+// without one. The caller decides when its allowed set changes, and every
+// swap replays the namespaces under the selector for each open stream of that
+// caller.
+func (s *Service) swapNamespaceWatch(ctx context.Context, w *namespaceWatch, selector string) error {
+	if err := s.callers.get(callerHash(w.req.Header)).wait(ctx, 0); err != nil {
+		return err
+	}
+	token, err := rancherclient.ReadToken(s.tokenFile)
+	if err != nil {
+		return err
+	}
+
+	out := privilegedRequest(w.req, token)
+	out.Header.Set("Accept", filterJSONAccept(w.req.Header.Get("Accept")))
+	query := out.URL.Query()
+	query.Set("labelSelector", selector)
+	for _, key := range []string{"resourceVersion", "resourceVersionMatch", "sendInitialEvents"} {
+		query.Del(key)
+	}
+	out.URL.RawQuery = query.Encode()
+
+	want := http.StatusOK
+	if w.relay.upgraded != nil {
+		want = http.StatusSwitchingProtocols
+		out.Header.Set("Sec-WebSocket-Key", websocketKey())
+	}
+	resp, err := s.base.RoundTrip(out)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != want {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBody))
+		_ = resp.Body.Close()
+		return fmt.Errorf("the new upstream watch returned %s", resp.Status)
+	}
+	if extensions := resp.Header.Get(extensionsHeader); w.relay.upgraded != nil && extensions != "" {
+		_ = resp.Body.Close()
+		return fmt.Errorf("the new upstream watch names the websocket extension %q", extensions)
+	}
+	return w.relay.swap(resp)
+}
+
+// readNamespace reads the namespace name with the service token, in the media
+// type of the watch. Steve lists that name for the caller, so the caller may
+// read it. It reports false for an answer that is not 200 with one JSON
+// object. The tracker then tries the name again at the next re-read.
+func (s *Service) readNamespace(ctx context.Context, w *namespaceWatch, name string) (json.RawMessage, bool) {
+	token, err := rancherclient.ReadToken(s.tokenFile)
+	if err != nil {
+		s.logger.DebugContext(ctx, "read a gained namespace", "cluster", w.cluster, "namespace", name, "reason", err.Error())
+		return nil, false
+	}
+	target := *s.upstream
+	target.Path = "/k8s/clusters/" + w.cluster + "/api/v1/namespaces/" + name
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	if err != nil {
+		s.logger.DebugContext(ctx, "read a gained namespace", "cluster", w.cluster, "namespace", name, "reason", err.Error())
+		return nil, false
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", filterJSONAccept(w.req.Header.Get("Accept")))
+
+	resp, err := s.base.RoundTrip(req)
+	if err != nil {
+		s.logger.DebugContext(ctx, "read a gained namespace", "cluster", w.cluster, "namespace", name, "reason", err.Error())
+		return nil, false
+	}
+	body, tooLarge, err := readLimited(resp.Body, maxDrainBody)
+	_ = resp.Body.Close()
+	var reason string
+	var object bytes.Buffer
+	switch {
+	case err != nil:
+		reason = err.Error()
+	case resp.StatusCode != http.StatusOK:
+		reason = "status " + resp.Status
+	case tooLarge:
+		reason = "the response is larger than the limit"
+	case !startsWithObject(body) || json.Compact(&object, body) != nil:
+		reason = "the response is not one JSON object"
+	default:
+		return object.Bytes(), true
+	}
+	s.logger.DebugContext(ctx, "read a gained namespace", "cluster", w.cluster, "namespace", name, "reason", reason)
+	return nil, false
+}
+
+// emitNamespaceEvent writes the watch event of type with object to the stream
+// of w, and reports false once the stream ends.
+func (s *Service) emitNamespaceEvent(ctx context.Context, w *namespaceWatch, eventType, name string, object json.RawMessage) bool {
+	event := json.RawMessage(`{"type":"` + eventType + `","object":` + string(object) + `}`)
+	if err := w.relay.emit(event); err != nil {
+		return false
+	}
+	s.logger.DebugContext(ctx, "wrote a watch event of the service", "cluster", w.cluster, "type", eventType, "namespace", name)
+	return true
+}
+
+// expireNamespaceWatch ends the stream of w after an ERROR event with the
+// Status 410 Expired. A client takes that event as the end of its
+// resourceVersion window, and it lists again before it watches.
+func (s *Service) expireNamespaceWatch(ctx context.Context, w *namespaceWatch, message string, attrs ...any) {
+	_ = w.relay.emit(expiredEvent(serviceName + ": the allowed namespaces of the caller changed"))
+	s.logger.InfoContext(ctx, message, append([]any{"cluster", w.cluster}, attrs...)...)
+	s.watches.end(w.relay.writer)
+}
+
+// deletedNamespace returns the object of the DELETED event of a namespace
+// that the caller loses: its kind and its name only. The client listed that
+// name before, so the event tells it nothing new.
+func deletedNamespace(name string) json.RawMessage {
+	quoted, _ := json.Marshal(name)
+	return json.RawMessage(`{"kind":"Namespace","apiVersion":"v1","metadata":{"name":` + string(quoted) + `}}`)
+}
+
+// subtract returns the names of from that names does not have, in the order
+// of from.
+func subtract(from, names []string) []string {
+	have := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		have[name] = struct{}{}
+	}
+	var out []string
+	for _, name := range from {
+		if _, ok := have[name]; !ok {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// privilegedRequest returns a copy of the request of the caller for the
+// service token: with that token in Authorization, and without the cookie and
+// the Accept-Encoding of the caller.
+func privilegedRequest(req *http.Request, token string) *http.Request {
+	privileged := req.Clone(req.Context())
+	privileged.Header.Set("Authorization", "Bearer "+token)
+	privileged.Header.Del("Cookie")
+	privileged.Header.Del("Accept-Encoding")
+	// The filter reads no compressed payload. Rancher then negotiates no
+	// extension, and the client gets that same answer.
+	privileged.Header.Del(extensionsHeader)
+	return privileged
 }
 
 // mergeSelector appends the name requirement to the selector of the caller. An
