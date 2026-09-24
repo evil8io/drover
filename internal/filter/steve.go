@@ -29,6 +29,8 @@ const (
 	defaultFetchRatePerCaller = 5
 	fetchWaitCap              = 5 * time.Second
 
+	// limitShared and limitCaller name the limit that refuses a fetch or a
+	// watch slot: the limit of the service, or the limit of one caller.
 	limitShared  = "shared"
 	limitCaller  = "caller"
 	noCredential = "none"

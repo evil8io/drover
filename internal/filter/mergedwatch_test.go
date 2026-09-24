@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -590,6 +591,81 @@ func TestMergedWatchIsCappedByMaxWatches(t *testing.T) {
 	resp, _ := h.do(t, h.request(t, http.MethodGet, podsPath+"?watch=true", nil, callerHeader()))
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", resp.StatusCode)
+	}
+}
+
+// TestMaxWatchesPerCallerCapsAMergedWatch checks that a merged watch of a
+// caller at MaxWatchesPerCaller answers 503 with the per-caller message, and
+// that drover.filter.watches.rejected names the caller limit. A second caller
+// still opens a merged watch.
+func TestMaxWatchesPerCallerCapsAMergedWatch(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	metricReader := sdkmetric.NewManualReader()
+	h := newHarnessOpt(t, collectionUpstream(
+		steveHandler("a"),
+		namespaceWatches(release, map[string][]string{"a": {podEvent("a")}}),
+	), withFanout, recordingMeter(metricReader), func(cfg *Config) { cfg.MaxWatchesPerCaller = 1 })
+
+	startMergedWatch(t, h, podsPath+"?watch=true")
+	resp, body := h.do(t, h.request(t, http.MethodGet, podsPath+"?watch=true", nil, callerHeader()))
+	wantWatchCapped(t, resp, body, "per-caller limit of 1")
+	wantRejected(t, metricReader, limitCaller, 1)
+
+	if got := watchStatus(t, h, podsPath+"?watch=true", otherCallerHeader()); got != http.StatusOK {
+		t.Errorf("merged watch status of a second caller = %d, want 200", got)
+	}
+}
+
+// TestMergedWatchReleasesTheSlotOnAFailure checks that a merged watch whose
+// upstream watches all fail after the reserve frees its slot, and that the
+// caller keeps the native answer. The caller has one slot, so a leaked slot
+// answers the next watch with 503.
+func TestMergedWatchReleasesTheSlotOnAFailure(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		fail http.HandlerFunc
+	}{
+		{"upstream error status", errorStatus},
+		{"closed connection", closeConnection},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			release := make(chan struct{})
+			defer close(release)
+
+			var failing atomic.Bool
+			failing.Store(true)
+			watches := namespaceWatches(release, map[string][]string{"a": {podEvent("a")}})
+			h := newHarnessOpt(t, collectionUpstream(steveHandler("a"), func(w http.ResponseWriter, r *http.Request) {
+				if failing.Load() {
+					test.fail(w, r)
+					return
+				}
+				watches(w, r)
+			}), withFanout, func(cfg *Config) {
+				cfg.MaxWatches = 1
+				cfg.MaxWatchesPerCaller = 1
+			})
+
+			resp, body := h.do(t, h.request(t, http.MethodGet, podsPath+"?watch=true", nil, callerHeader()))
+			if resp.StatusCode != http.StatusForbidden || string(body) != nativeForbidden {
+				t.Fatalf("failed merged watch = %d %q, want the native answer", resp.StatusCode, body)
+			}
+			if got := h.svc.watches.reservedCount(); got != 0 {
+				t.Errorf("reserved slots after the failure = %d, want 0", got)
+			}
+
+			failing.Store(false)
+			_, reader := startMergedWatch(t, h, podsPath+"?watch=true")
+			if got := nextEvent(t, reader); got != podEvent("a") {
+				t.Errorf("event = %q, want %q", got, podEvent("a"))
+			}
+		})
 	}
 }
 

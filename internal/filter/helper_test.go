@@ -3,6 +3,7 @@ package filter
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,6 +20,7 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric/noop"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -35,6 +37,19 @@ func testMetrics(t *testing.T) *metrics {
 		t.Fatalf("new metrics: %v", err)
 	}
 	return m
+}
+
+// newTestRegistry returns a watch registry with the default limits, and one
+// slot that it reserved for the caller, for a test that registers a stream
+// without a Service.
+func newTestRegistry(t *testing.T) (*watchRegistry, *watchSlot) {
+	t.Helper()
+	registry := newWatchRegistry(defaultMaxWatches, defaultMaxWatchesPerCaller)
+	slot, limit := registry.reserve(watchCaller(callerHeader()))
+	if slot == nil {
+		t.Fatalf("reserve a watch slot: the %s limit refused it", limit)
+	}
+	return registry, slot
 }
 
 const (
@@ -329,6 +344,72 @@ func (h *harness) doDirect(t *testing.T, req *http.Request) (*http.Response, []b
 // callerHeader returns the headers of a project member.
 func callerHeader() http.Header {
 	return http.Header{"Authorization": []string{callerToken}}
+}
+
+// otherCallerHeader returns the headers of a second project member, with a
+// credential of its own.
+func otherCallerHeader() http.Header {
+	return http.Header{"Authorization": []string{"Bearer other"}}
+}
+
+// recordingMeter returns a Config override that records the filter metrics
+// on reader.
+func recordingMeter(reader *sdkmetric.ManualReader) func(*Config) {
+	return func(cfg *Config) {
+		cfg.MeterProvider = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	}
+}
+
+// watchStatus opens a watch through the proxy, and returns the status of the
+// answer. The body stays open until the test ends, so a stream of the answer
+// keeps its watch slot. A goroutine can call it, because it reports a failed
+// request with t.Errorf.
+func watchStatus(t *testing.T, h *harness, target string, header http.Header) int {
+	t.Helper()
+	resp, err := h.proxy.Client().Do(h.request(t, http.MethodGet, target, nil, header))
+	if err != nil {
+		t.Errorf("do request: %v", err)
+		return 0
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	return resp.StatusCode
+}
+
+// wantWatchCapped checks that a watch limit answered 503, with a message that
+// contains text.
+func wantWatchCapped(t *testing.T, resp *http.Response, body []byte, text string) {
+	t.Helper()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	var status statusBody
+	if err := json.Unmarshal(body, &status); err != nil {
+		t.Fatalf("parse the response %q: %v", body, err)
+	}
+	if status.Reason != reasonUnavailable {
+		t.Errorf("reason = %q, want %q", status.Reason, reasonUnavailable)
+	}
+	if !strings.Contains(status.Message, text) {
+		t.Errorf("message = %q, want it to contain %q", status.Message, text)
+	}
+}
+
+// errorStatus answers 500.
+func errorStatus(w http.ResponseWriter, _ *http.Request) {
+	http.Error(w, "upstream failure", http.StatusInternalServerError)
+}
+
+// closeConnection closes the connection of the request with no answer.
+func closeConnection(w http.ResponseWriter, _ *http.Request) {
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		return
+	}
+	conn, _, err := hijacker.Hijack()
+	if err != nil {
+		return
+	}
+	_ = conn.Close()
 }
 
 // listUpstream routes the five requests of the list flow. The native attempt

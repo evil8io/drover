@@ -109,6 +109,7 @@ With these routes, the service becomes the data path for most reads of a tenant.
 | `--fanout-concurrency` | `16` | Namespaced requests of one fan-out that run at a time. It also bounds the memory of one fan-out. |
 | `--fanout-max-watch-namespaces` | `50` | Count of allowed namespaces above which a cluster-wide watch answers 403. |
 | `--max-watches` | `1000` | Count of open watch streams above which a new watch answers 503. |
+| `--max-watches-per-caller` | `100` | Count of open watch streams of one caller above which a new watch of that caller answers 503. A caller is one credential that Rancher reads. |
 | `--log-level` | `info` | One of `debug`, `info`, `warn`, or `error`. |
 | `--shutdown-grace` | `20s` | Grace period for the shutdown after SIGTERM or SIGINT. |
 | `--otlp-endpoint` | `$OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint, `host:port` or a URL. Empty turns telemetry off. |
@@ -117,6 +118,8 @@ With these routes, the service becomes the data path for most reads of a tenant.
 | `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | `service.name` resource attribute. |
 
 `--upstream-insecure-skip-verify` is for an upstream inside the cluster whose certificate comes from a private CA that the deployment does not copy. A network policy must then limit the path to Rancher.
+
+`--max-watches` and `--max-watches-per-caller` count each watch from before its upstream request until its stream ends. A burst of parallel watches then cannot pass a limit. With the per-caller limit, one caller cannot take every stream of the service. A merged watch has one upstream connection per allowed namespace. One caller then has at most `--max-watches-per-caller` times `--fanout-max-watch-namespaces` upstream watch connections, 5,000 with the defaults.
 
 The upstream is the Rancher Service inside the cluster, for example `http://rancher.cattle-system.svc`. The public hostname is not a valid upstream, because the route sends the filtered paths back to the service.
 
@@ -133,7 +136,7 @@ The service starts with no token file and returns a 502 Status on a filtered req
 | Namespace cap | A caller with more than 20,000 allowed namespace names gets an error, not a list. |
 | Fan-out cap | A cluster-wide list gets a 403 error, with no fan-out, when the caller has more than `--fanout-max-namespaces` allowed namespaces. |
 | Watch cap | A cluster-wide watch gets a 403 error, with no merge, when the caller has more than `--fanout-max-watch-namespaces` allowed namespaces. |
-| Stream cap | A namespace watch or a cluster-wide watch gets a 503 error when the service has `--max-watches` open watch streams. The client retries. |
+| Stream cap | A namespace watch or a cluster-wide watch gets a 503 error when the service has `--max-watches` open watch streams, or when the caller has `--max-watches-per-caller` open watch streams. The client retries. |
 | Merged watch end | A merged cluster-wide watch ends when one upstream watch ends, and when the allowed set of the caller changes. The client re-lists and re-watches. |
 | Merged watch bookmark | A merged cluster-wide watch sends no `BOOKMARK` event, also when the client asks for one. A watch-list gets the one `BOOKMARK` that ends its initial events. |
 | Empty answer | A cluster-wide list of a namespaced kind gets an empty collection, not Forbidden, when the caller may see no object of that kind. |
@@ -173,12 +176,14 @@ With `--otlp-endpoint` set, the service also exports these metrics:
 | `drover.filter.requests` | Counter | `1` | `path`, `outcome`, `cluster`, `watch` |
 | `drover.filter.request.duration` | Histogram | `s` | `path`, `outcome`, `cluster`, `watch` |
 | `drover.filter.watches.open` | UpDownCounter | `1` | |
-| `drover.filter.watches.rejected` | Counter | `1` | `cluster` |
+| `drover.filter.watches.rejected` | Counter | `1` | `cluster`, `limit` |
 | `drover.filter.events.dropped` | Counter | `1` | `cluster` |
 | `drover.filter.fetch.throttled` | Counter | `1` | `limit` |
 | `drover.filter.fanout.namespaces` | Histogram | `1` | `cluster` |
 | `drover.filter.fanout.capped` | Counter | `1` | `cluster` |
 | `drover.filter.fanout.skipped` | Counter | `1` | `cluster` |
+
+`drover.filter.watches.rejected` counts a watch that a watch limit refuses with a 503 error. Its `limit` attribute is `shared` for `--max-watches`, and `caller` for `--max-watches-per-caller`. The metric also counts an upgraded stream that the service ends for a websocket extension, without a `limit` attribute.
 
 The `cluster` attribute of the two request metrics names a cluster once Steve answered a namespace list for it. Every other request records `unknown`, because the path of a request names any string, also before authentication, and a metric attribute with an unbounded value set is a cardinality fault.
 
