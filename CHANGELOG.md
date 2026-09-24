@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.16.2](https://github.com/evil8io/drover/compare/v0.16.1...v0.16.2) (2026-09-24)
+
+
+### Bug Fixes
+
+* **rotate-token:** fail the run when the granted ttl is inside the renew window ([#89](https://github.com/evil8io/drover/issues/89)) ([f2f6023](https://github.com/evil8io/drover/commit/f2f60230a7e7fead4f7fd0589a7e415f460d30ee))
+* **rotate-token:** keep the token of the Secret at the prune ([#86](https://github.com/evil8io/drover/issues/86)) ([47f5fd5](https://github.com/evil8io/drover/commit/47f5fd5586a10d746e42813fe74a1329f3b02eb9))
+* **rotate-token:** reject a password shorter than 12 characters ([#91](https://github.com/evil8io/drover/issues/91)) ([36ed93a](https://github.com/evil8io/drover/commit/36ed93adf7b342a350a5234a8178efc21fa10fde))
+* **rotate-token:** require https for the Rancher URL, and stop at a redirect ([#90](https://github.com/evil8io/drover/issues/90)) ([2905232](https://github.com/evil8io/drover/commit/2905232a1a93311ec0c4ecc86cb8e619ff36194e))
+* **rotate-token:** run the token steps after a failed password step ([#88](https://github.com/evil8io/drover/issues/88)) ([ec4055f](https://github.com/evil8io/drover/commit/ec4055f4f5053371993f34751e4edd4992c63247))
+
 ## [0.16.1](https://github.com/evil8io/drover/compare/v0.16.0...v0.16.1) (2026-09-24)
 
 
