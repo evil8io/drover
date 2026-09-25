@@ -2,6 +2,7 @@ package projectsync
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -55,6 +56,8 @@ type recorded struct {
 	query  url.Values
 	header http.Header
 	body   string
+	// at is the time that the request arrived.
+	at time.Time
 }
 
 // fakeRancher answers the project list and the namespace list of two clusters.
@@ -81,12 +84,27 @@ type fakeRancher struct {
 	// token that selects the page. The empty token selects the first page. A
 	// cluster without an entry gets its fixed list.
 	lists map[string]map[string]string
+	// projectStreams are the answers of the project watch, one per request,
+	// in order. A request after the last answer gets status 200, and its
+	// stream stays open until the request ends.
+	projectStreams []streamAnswer
 
 	mu       sync.Mutex
 	requests []recorded
 	// expired counts the answers with status 410 that are left for a continue
 	// token.
 	expired map[string]int
+	// projectWatches counts the project watch requests.
+	projectWatches int
+}
+
+// streamAnswer is one answer of a watch request. A status other than 0
+// answers with that status and body. Otherwise the answer writes frames, then
+// it ends the stream.
+type streamAnswer struct {
+	status int
+	body   string
+	frames []string
 }
 
 func newFakeRancher(t *testing.T, options ...func(*fakeRancher)) *fakeRancher {
@@ -126,6 +144,21 @@ func watching(cluster string, frames ...string) func(*fakeRancher) {
 			f.events = make(map[string][]string)
 		}
 		f.events[cluster] = frames
+	}
+}
+
+// watchingProjects serves frames as the next project watch stream.
+func watchingProjects(frames ...string) func(*fakeRancher) {
+	return func(f *fakeRancher) {
+		f.projectStreams = append(f.projectStreams, streamAnswer{frames: frames})
+	}
+}
+
+// failProjectWatch answers the next project watch request with status and
+// body.
+func failProjectWatch(status int, body string) func(*fakeRancher) {
+	return func(f *fakeRancher) {
+		f.projectStreams = append(f.projectStreams, streamAnswer{status: status, body: body})
 	}
 }
 
@@ -171,6 +204,7 @@ func (f *fakeRancher) serve(w http.ResponseWriter, r *http.Request) {
 		query:  r.URL.Query(),
 		header: r.Header.Clone(),
 		body:   string(body),
+		at:     time.Now(),
 	})
 	f.mu.Unlock()
 
@@ -178,6 +212,8 @@ func (f *fakeRancher) serve(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == projectsPath:
 		f.serveProjects(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == projectsWatchPath && r.URL.Query().Get("watch") == "true":
+		f.serveProjectWatch(w, r)
 	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/api/v1/namespaces"):
 		f.serveNamespaces(w, r)
 	case r.Method == http.MethodPatch:
@@ -197,6 +233,31 @@ func (f *fakeRancher) serveProjects(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = io.WriteString(w, `{"type":"collection","data":[`+betaProject+`],"pagination":{}}`)
+}
+
+func (f *fakeRancher) serveProjectWatch(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	n := f.projectWatches
+	f.projectWatches++
+	f.mu.Unlock()
+
+	if n >= len(f.projectStreams) {
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+		return
+	}
+	answer := f.projectStreams[n]
+	if answer.status != 0 {
+		w.WriteHeader(answer.status)
+		_, _ = io.WriteString(w, answer.body)
+		return
+	}
+	for _, frame := range answer.frames {
+		_, _ = io.WriteString(w, frame)
+	}
 }
 
 func (f *fakeRancher) servePatch(w http.ResponseWriter, r *http.Request) {
@@ -225,6 +286,7 @@ func (f *fakeRancher) serveNamespaces(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	selector := r.URL.Query().Get("labelSelector")
 	if pages, ok := f.lists[cluster]; ok {
 		next := r.URL.Query().Get("continue")
 		if f.expire(next) {
@@ -237,17 +299,47 @@ func (f *fakeRancher) serveNamespaces(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "no page for the continue token", http.StatusBadRequest)
 			return
 		}
-		_, _ = io.WriteString(w, page)
+		_, _ = io.WriteString(w, selectNamespaces(page, selector))
 		return
 	}
 	switch cluster {
 	case "c-1":
-		_, _ = io.WriteString(w, alphaNamespaces)
+		_, _ = io.WriteString(w, selectNamespaces(alphaNamespaces, selector))
 	case "c-2":
-		_, _ = io.WriteString(w, betaNamespaces)
+		_, _ = io.WriteString(w, selectNamespaces(betaNamespaces, selector))
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
+}
+
+// selectNamespaces returns page with only the namespaces that a selector of
+// the form key=value selects. Another selector returns page as it is.
+func selectNamespaces(page, selector string) string {
+	key, value, ok := strings.Cut(selector, "=")
+	if !ok {
+		return page
+	}
+	var list struct {
+		Kind     string            `json:"kind"`
+		Metadata json.RawMessage   `json:"metadata,omitempty"`
+		Items    []json.RawMessage `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(page), &list); err != nil {
+		return page
+	}
+	kept := make([]json.RawMessage, 0, len(list.Items))
+	for _, raw := range list.Items {
+		var item namespace
+		if json.Unmarshal(raw, &item) == nil && item.Metadata.Labels[key] == value {
+			kept = append(kept, raw)
+		}
+	}
+	list.Items = kept
+	body, err := json.Marshal(list)
+	if err != nil {
+		return page
+	}
+	return string(body)
 }
 
 // expire reports whether a list request with the continue token next gets

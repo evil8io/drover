@@ -222,24 +222,25 @@ func (s *Syncer) projectPage(ctx context.Context, token, target string) ([]proje
 	return items, next.Next, nil
 }
 
-// namespaces returns the namespaces of a cluster that have the project label.
-// An expired continue token starts the list again from the first page, once.
-func (s *Syncer) namespaces(ctx context.Context, token, cluster string) ([]namespace, error) {
-	items, err := s.listNamespaces(ctx, token, cluster)
+// namespaces returns the namespaces of a cluster that the label selector
+// selects. An expired continue token starts the list again from the first
+// page, once.
+func (s *Syncer) namespaces(ctx context.Context, token, cluster, selector string) ([]namespace, error) {
+	items, err := s.listNamespaces(ctx, token, cluster, selector)
 	if errors.Is(err, errListExpired) {
-		items, err = s.listNamespaces(ctx, token, cluster)
+		items, err = s.listNamespaces(ctx, token, cluster, selector)
 	}
 	return items, err
 }
 
 // listNamespaces reads the namespace list of a cluster, over all pages.
-func (s *Syncer) listNamespaces(ctx context.Context, token, cluster string) ([]namespace, error) {
+func (s *Syncer) listNamespaces(ctx context.Context, token, cluster, selector string) ([]namespace, error) {
 	var (
 		items []namespace
 		next  string
 	)
 	for page := 0; page < maxPages; page++ {
-		batch, more, err := s.namespacePage(ctx, token, cluster, next)
+		batch, more, err := s.namespacePage(ctx, token, cluster, selector, next)
 		if err != nil {
 			var status statusError
 			if next != "" && errors.As(err, &status) && status.status == http.StatusGone {
@@ -260,10 +261,10 @@ func (s *Syncer) listNamespaces(ctx context.Context, token, cluster string) ([]n
 // namespacePage reads the page of the namespace list of a cluster that the
 // continue token next selects. It returns the namespaces and the continue
 // token of the next page.
-func (s *Syncer) namespacePage(ctx context.Context, token, cluster, next string) ([]namespace, string, error) {
+func (s *Syncer) namespacePage(ctx context.Context, token, cluster, selector, next string) ([]namespace, string, error) {
 	path := namespacesPath(cluster)
 	query := url.Values{
-		"labelSelector": []string{projectLabel},
+		"labelSelector": []string{selector},
 		"limit":         []string{strconv.Itoa(pageSize)},
 	}
 	if next != "" {

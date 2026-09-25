@@ -57,8 +57,9 @@ type Config struct {
 	NameAnnotation string
 	// Interval is the time between two runs. Zero selects 60 s.
 	Interval time.Duration
-	// PatchRate is the namespace patches per second that the watch of one
-	// cluster sends. Zero selects 10. The burst is the rate, and at least 1.
+	// PatchRate bounds the namespace patches and the project namespace lists
+	// per second that the watches of one cluster send, together. Zero selects
+	// 10. The burst is the rate, and at least 1.
 	PatchRate float64
 	// Logger gets one line per namespace, and one summary line per run. Nil selects slog.Default.
 	Logger *slog.Logger
@@ -100,11 +101,12 @@ type Syncer struct {
 	// logs one warning per state change.
 	tokenMissing bool
 
-	// watches has the namespace watch of every cluster. Run creates it, and a
-	// direct call of reconcile leaves it nil.
+	// watches has the namespace watch of every cluster, and the project watch.
+	// Run creates it, and a direct call of reconcile leaves it nil.
 	watches *watchSet
 
-	// mu guards clusters, which the reconcile run writes and a watcher reads.
+	// mu guards clusters, which the reconcile run and the project watch write,
+	// and a watcher reads.
 	mu       sync.RWMutex
 	clusters map[string]map[string]project
 }
@@ -215,8 +217,9 @@ func (s *Syncer) Handler() http.Handler {
 }
 
 // Run reconciles once, then at every interval. It also keeps one namespace
-// watch per cluster open, so that a new namespace gets its keys at once. It
-// returns when ctx is done.
+// watch per cluster open, so that a new namespace gets its keys at once, and
+// one project watch, so that a project change reaches its namespaces at once.
+// It returns when ctx is done.
 func (s *Syncer) Run(ctx context.Context) {
 	s.watches = s.newWatchSet()
 	defer s.watches.stop()
@@ -287,6 +290,7 @@ func (s *Syncer) reconcile(ctx context.Context) {
 	names := slices.Sorted(maps.Keys(clusters))
 	// A watcher outlives the run, so it gets the base context, not the span.
 	s.watches.update(base, names)
+	s.watches.startProjects(base)
 	s.watches.resetNames()
 
 	var (
@@ -323,11 +327,53 @@ func (s *Syncer) setClusters(clusters map[string]map[string]project) {
 }
 
 // projectsOf returns the projects of a cluster, by project name, from the last
-// reconcile run.
+// reconcile run and the project watch.
 func (s *Syncer) projectsOf(cluster string) map[string]project {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.clusters[cluster]
+}
+
+// setProject stores item under its project name in the snapshot of cluster.
+// It returns false when the snapshot has no such cluster. A worker and the
+// reconcile run read the maps without the lock, so setProject replaces them
+// and never writes into the old ones.
+func (s *Syncer) setProject(cluster, name string, item project) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	projects, ok := s.clusters[cluster]
+	if !ok {
+		return false
+	}
+	next := maps.Clone(projects)
+	next[name] = item
+	s.clusters = withCluster(s.clusters, cluster, next)
+	return true
+}
+
+// deleteProject removes a project name from the snapshot of cluster, as
+// setProject does. It returns false when the snapshot has no such cluster.
+func (s *Syncer) deleteProject(cluster, name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	projects, ok := s.clusters[cluster]
+	if !ok {
+		return false
+	}
+	if _, ok := projects[name]; !ok {
+		return true
+	}
+	next := maps.Clone(projects)
+	delete(next, name)
+	s.clusters = withCluster(s.clusters, cluster, next)
+	return true
+}
+
+// withCluster returns a copy of clusters with projects at cluster.
+func withCluster(clusters map[string]map[string]project, cluster string, projects map[string]project) map[string]map[string]project {
+	next := maps.Clone(clusters)
+	next[cluster] = projects
+	return next
 }
 
 // finishReconcile logs the summary line of run, sets the span status when the
@@ -364,15 +410,10 @@ func (s *Syncer) byCluster(ctx context.Context, projects []project) map[string]m
 }
 
 func (s *Syncer) syncCluster(ctx context.Context, token, cluster string, projects map[string]project, run *counters) {
-	items, err := s.namespaces(ctx, token, cluster)
+	items, err := s.namespaces(ctx, token, cluster, projectLabel)
 	if err != nil {
 		run.errors++
-		var status statusError
-		if errors.As(err, &status) && status.status == http.StatusForbidden {
-			s.logFailure(ctx, slog.LevelWarn, "the service user has no binding on the cluster", err, "cluster", cluster)
-			return
-		}
-		s.logFailure(ctx, slog.LevelWarn, "the namespace list request failed", err, "cluster", cluster)
+		s.logListFailure(ctx, err, cluster)
 		return
 	}
 	run.namespaces += len(items)
@@ -630,6 +671,17 @@ func (s *Syncer) logSummary(ctx context.Context, run counters) {
 	s.logger.InfoContext(ctx, "reconcile",
 		"clusters", run.clusters, "projects", run.projects, "namespaces", run.namespaces,
 		"patched", run.patched, "errors", run.errors)
+}
+
+// logListFailure writes the line of a failed namespace list of cluster. A 403
+// means that the service user has no binding on the cluster.
+func (s *Syncer) logListFailure(ctx context.Context, err error, cluster string, attrs ...any) {
+	message := "the namespace list request failed"
+	var status statusError
+	if errors.As(err, &status) && status.status == http.StatusForbidden {
+		message = "the service user has no binding on the cluster"
+	}
+	s.logFailure(ctx, slog.LevelWarn, message, err, append([]any{"cluster", cluster}, attrs...)...)
 }
 
 // logFailure writes one line for a failure. A canceled context is a shutdown,
