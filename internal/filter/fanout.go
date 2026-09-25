@@ -69,14 +69,15 @@ func (s *Service) roundTripCollection(req *http.Request, target collectionTarget
 	}
 
 	set, callerDenied, err := s.allowed(req.Context(), target.cluster, req.Header)
-	if callerDenied != nil || err != nil {
+	if err != nil {
 		_ = denied.Body.Close()
-		if err != nil {
-			return s.statusError(req, start, result, err), nil
-		}
-		result.outcome, result.status = outcomeDenied, callerDenied.StatusCode
+		return s.statusError(req, start, result, err), nil
+	}
+	if callerDenied != nil {
+		answer := denialResponse(denied, callerDenied)
+		result.outcome, result.status = outcomeDenied, answer.StatusCode
 		s.logList(req.Context(), start, result)
-		return callerDenied, nil
+		return answer, nil
 	}
 	result.user = set.user
 

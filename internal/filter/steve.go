@@ -72,12 +72,16 @@ type projectCollection struct {
 // access as two separate rights, so a visible project with no allowed
 // namespace is not in this set. extras is the subset of names whose project
 // label is not one of these project ids. user is the Rancher user id of the
-// caller, from a SelfSubjectReview, or empty when the lookup failed.
+// caller, from a SelfSubjectReview, or the subject of a ServiceAccount token,
+// or empty when the lookup failed. denied marks the set of a ServiceAccount
+// caller whose rules name no namespace. The cache keeps it for one TTL, so a
+// caller that Kubernetes denies costs one review per TTL, not one per request.
 type allowedSet struct {
 	names    []string
 	projects []string
 	extras   []string
 	user     string
+	denied   bool
 }
 
 // allowedNamespace reports whether the caller may see the namespace: its name
@@ -99,15 +103,16 @@ func (s *Service) allowedNamespace(ctx context.Context, cluster string, header h
 }
 
 // allowed returns the cached allowed set of the caller. A non-nil response is
-// the 401 or 403 answer of Steve or of the project list, or the 429 answer of
-// a fetch rate limit, for the caller.
+// the 401 or 403 answer of Steve, of the project list, or of the rules review,
+// a 403 for a ServiceAccount caller whose rules name no namespace, or the 429
+// answer of a fetch rate limit, for the caller.
 func (s *Service) allowed(ctx context.Context, cluster string, header http.Header) (allowedSet, *http.Response, error) {
 	auth := header.Get("Authorization")
 	cookie := strings.Join(header.Values("Cookie"), "; ")
 	caller := callerHash(header)
 	key := cluster + "\n" + caller
 
-	return s.cache.do(ctx, key, func() (allowedSet, *http.Response, error) {
+	set, resp, err := s.cache.do(ctx, key, func() (allowedSet, *http.Response, error) {
 		// The caller limit runs first, so a throttled caller takes no shared token.
 		if throttled, err := s.waitFetch(ctx, s.callers.get(caller), limitCaller); throttled != nil || err != nil {
 			return allowedSet{}, throttled, err
@@ -117,6 +122,23 @@ func (s *Service) allowed(ctx context.Context, cluster string, header http.Heade
 		}
 		return s.fetchAllowed(ctx, cluster, auth, cookie)
 	})
+	if err == nil && resp == nil && set.denied {
+		return allowedSet{}, statusResponse(nil, http.StatusForbidden, reasonForbidden, serviceName+": the rules of the caller name no namespace"), nil
+	}
+	return set, resp, err
+}
+
+// denialResponse picks the answer of a list whose allowed-set fetch answered
+// fetch: the buffered native 403 of the list when fetch is a 401 or a 403,
+// because a client that gets a 401 for a valid token authenticates again, and
+// the native answer has the message of the API server. Every other fetch
+// answer, for example a 429, goes to the caller as is.
+func denialResponse(native, fetch *http.Response) *http.Response {
+	if fetch.StatusCode != http.StatusUnauthorized && fetch.StatusCode != http.StatusForbidden {
+		return fetch
+	}
+	_ = fetch.Body.Close()
+	return native
 }
 
 // waitFetch takes one token of l, for the fetch rate limit named limit. It
@@ -159,10 +181,16 @@ func credentialKey(header http.Header) string {
 }
 
 // fetchAllowed reads the namespace names and the project ids of the caller,
-// over Steve and the Rancher project API.
+// over Steve and the Rancher project API. A ServiceAccount caller takes the
+// RBAC leg instead, because the Steve cluster proxy runs before the
+// ServiceAccount authenticator in the Rancher handler chain and answers 401.
 func (s *Service) fetchAllowed(ctx context.Context, cluster, auth, cookie string) (allowedSet, *http.Response, error) {
 	ctx, cancel := context.WithTimeout(ctx, steveTimeout)
 	defer cancel()
+
+	if subject, namespace, ok := serviceAccountSubject(auth); ok {
+		return s.fetchRules(ctx, cluster, auth, subject, namespace)
+	}
 
 	names, projectOf, denied, err := s.fetchNamespaceNames(ctx, cluster, auth, cookie)
 	if denied != nil || err != nil {

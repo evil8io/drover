@@ -496,6 +496,76 @@ func TestReviewStaysDeniedOnSteveForbidden(t *testing.T) {
 	}
 }
 
+// reviewUpstreamWithRules routes the rules review to rulesReviewHandler(rules),
+// and every other request to reviewUpstream(answer).
+func reviewUpstreamWithRules(answer string, rules ...resourceRule) http.HandlerFunc {
+	review := reviewUpstream(answer)
+	rulesReview := rulesReviewHandler(rules...)
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case rulesReviewTestPath:
+			rulesReview(w, r)
+		default:
+			review(w, r)
+		}
+	}
+}
+
+func TestReviewGrantsServiceAccountNamespaceList(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, reviewUpstreamWithRules(deniedAnswer, namespaceRule("prod")))
+
+	request := fmt.Sprintf(reviewTemplate, `"verb":"list","resource":"namespaces"`)
+	resp, body := h.postReview(t, []byte(request), serviceAccountHeader())
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var object map[string]any
+	if err := json.Unmarshal(body, &object); err != nil {
+		t.Fatalf("parse the response %q: %v", body, err)
+	}
+	status, ok := object["status"].(map[string]any)
+	if !ok {
+		t.Fatalf("the response has no status object: %q", body)
+	}
+	if status["allowed"] != true {
+		t.Errorf("allowed = %v, want true", status["allowed"])
+	}
+	if status["reason"] != grantedReason {
+		t.Errorf("reason = %v, want %q", status["reason"], grantedReason)
+	}
+	if !strings.Contains(h.logs.String(), "outcome=granted") {
+		t.Errorf("logs have no outcome=granted line: %s", h.logs.String())
+	}
+	if !strings.Contains(h.logs.String(), "user="+serviceAccountSubjectValue) {
+		t.Errorf("logs have no user=%s line: %s", serviceAccountSubjectValue, h.logs.String())
+	}
+	if got := h.upstream.countPath(rulesReviewTestPath); got != 1 {
+		t.Errorf("rules review requests = %d, want 1", got)
+	}
+	if got := h.upstream.countPath(stevePath); got != 0 {
+		t.Errorf("allowed set requests = %d, want 0", got)
+	}
+}
+
+func TestReviewStaysDeniedForServiceAccountWithoutNames(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, reviewUpstreamWithRules(deniedAnswer, namespaceRule()))
+
+	request := fmt.Sprintf(reviewTemplate, `"verb":"list","resource":"namespaces"`)
+	resp, body := h.postReview(t, []byte(request), serviceAccountHeader())
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if string(body) != deniedAnswer {
+		t.Errorf("body = %q, want the answer of the upstream", body)
+	}
+	if got := h.upstream.countPath(rulesReviewTestPath); got != 1 {
+		t.Errorf("rules review requests = %d, want 1", got)
+	}
+}
+
 func TestReviewBodyLimit(t *testing.T) {
 	t.Parallel()
 

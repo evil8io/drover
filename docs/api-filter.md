@@ -12,7 +12,7 @@ The service handles two request patterns from a Rancher kubeconfig. It passes ev
 
 1. The service sends the request to Rancher with the caller's own credentials.
 2. A status other than 403 goes back to the client unchanged.
-3. On a 403 error, the service requests the caller's allowed namespaces from Steve, the Rancher API server in the cluster agent.
+3. On a 403 error, the service reads the allowed namespaces of the caller. A caller with a Rancher token or a session cookie gets them from Steve, the Rancher API server in the cluster agent. A caller with a ServiceAccount token gets them from its RBAC rules, as the paragraphs after this list describe.
 4. A plain list gets a new request with a service token, no cookie, and a label selector. The selector matches `field.cattle.io/projectId` on the projects of the caller that contain an allowed namespace, when every allowed namespace has that label. It matches the allowed namespace names in every other case. That case includes the selector that matches no namespace, when the caller may see none.
 5. A watch (`?watch=true`) gets a new request with a service token, no cookie, and the caller's own query. The watch gets a project selector, or no selector at all. A project selector matches a new namespace of a project by itself. A name selector needs a new upstream watch for each new namespace. The selector of the caller merges into it, as it does on a list. Three cases apply:
    - A caller with no namespace and no project gets the selector that matches no namespace.
@@ -25,6 +25,12 @@ The service handles two request patterns from a Rancher kubeconfig. It passes ev
 A request is a watch when its `watch` parameter is present with a value other than `0` or `false`, as the API server reads it. A watch request streams over chunked HTTP, or over a websocket connection after a protocol switch. A namespace that Rancher grants after the start of the watch becomes visible in one of three ways. A project selector matches a new namespace at once, when the project of the caller already contains an allowed namespace. A watch with no selector gets the event too, when the cached allowed set has the namespace at the time of the event. In the other cases the service changes the stream itself, as the next paragraphs describe.
 
 The cache of an allowed set has one entry per credential that Rancher reads: the first `Authorization` value, or the first `R_SESS` cookie when that value is empty or absent. A second value, a second `R_SESS` cookie, and another cookie are not part of the key.
+
+A 401 or 403 error from the fetch of the allowed set, from Steve, from the project list, or from the rules review, gives the caller the native 403 error of its own request, with its message. A client that gets a 401 error for a valid token authenticates again, and the native answer names the missing permission. A 429 error of a fetch rate limit goes to the caller as is.
+
+A ServiceAccount token is a bearer JWT whose subject starts with `system:serviceaccount:`. Rancher accepts such a token on `/k8s/clusters/<id>/` when the `ClusterProxyConfig` object of the cluster has `enabled: true`, in Rancher 2.9.0 and later. Rancher verifies the token against the cluster and keeps the identity of the caller, so the RBAC of that cluster decides. Such a caller is not a Rancher user. It has no project, and Steve answers it with a 401 error. The service therefore reads its allowed namespaces from a `SelfSubjectRulesReview` with the credentials of the caller, in the namespace of the ServiceAccount. The built-in `system:basic-user` role lets every authenticated caller create that review. The allowed set is the union of the `resourceNames` of the rules that grant `get` on `namespaces` in the core group. A wildcard in the verbs, the groups, or the resources matches too. The set has no project, so a list gets a name selector, and a watch gets no selector and the event filter alone.
+
+A rule that grants `get` on `namespaces` without names separates no tenant, and a caller with no such rule has no allowed namespace. In both cases the caller gets the native 403 error of its own request, with its message, and not an empty list. The service keeps that answer for one cache TTL, so such a caller costs one review per TTL. The review runs in the namespace of the ServiceAccount, because no tenant binds a role there. A RoleBinding in that namespace to a broad role, for example `view`, shows a `get` on `namespaces` without names, and the caller then gets the 403 error. `kubectl auth can-i --list -n <namespace of the ServiceAccount>` shows the rules that the service reads.
 
 The stream of a namespace watch stays open when the allowed set of the caller changes. Headlamp opens no new watch after a clean end of a stream, so an end stops the updates of its view until a reload. A timer re-reads the allowed set of the caller once per cache TTL, from the cache of a plain list, so it adds no request. It compares the new names with the names of the stream, and it builds the selector again from the new set:
 
@@ -105,6 +111,7 @@ With `--fanout` on, the service also answers a cluster-wide watch, for example `
    | `Exact` | POST | `/k8s/clusters/<id>/apis/authorization.k8s.io/v1/selfsubjectaccessreviews` | the service |
 
    A Gateway picks the rule by the specificity of the match, not by the order of the rules. An `Exact` match wins over a `PathPrefix` match, and a longer prefix wins over a shorter one. The namespaces prefix is therefore the rule of every namespaced read, and it keeps `exec`, `attach`, `portforward`, and a log stream on Rancher, off the service. Give the Rancher rule the same unlimited request timeout as the service rule, because those streams stay open for minutes.
+5. For a ServiceAccount caller, JWT authentication on the cluster: a `ClusterProxyConfig` object with `enabled: true`, in Rancher 2.9.0 and later. A ClusterRoleBinding of the caller names its namespaces in the `resourceNames` of a rule with `get` on `namespaces`.
 
 With these routes, the service becomes the data path for most reads of a tenant. The tenant then depends on the availability and the latency of the service for those reads.
 
@@ -161,6 +168,8 @@ The service starts with no token file and returns a 502 Status on a filtered req
 | Merged watch bookmark | A merged cluster-wide watch sends no `BOOKMARK` event, also when the client asks for one. A watch-list gets the one `BOOKMARK` that ends its initial events. |
 | Empty answer | A cluster-wide list of a namespaced kind gets an empty collection, not Forbidden, when the caller may see no object of that kind. |
 | Self-check | `kubectl auth can-i list namespaces` returns yes when the caller has at least one allowed namespace, while RBAC returns no. With `--fanout` on, the same applies to `list` and `watch` on any named resource, cluster-wide, also a cluster-scoped one, whose list then keeps its 403 error. |
+| ServiceAccount caller | A caller with a ServiceAccount token gets the namespaces that its RBAC rules name in the `resourceNames` of a `get` on `namespaces`. A rule without names, or no such rule, gives the native 403 error, not an empty list. |
+| Denied fetch | A 401 or 403 error from the fetch of the allowed set gives the native 403 error of the request, with its message, in place of the answer of Steve or of the rules review. |
 | Fetch rate | A fetch of an allowed set past `--fetch-rate` waits up to 5 s for a free token, then gets a 429 Status. The limit per caller, `--fetch-rate-per-caller`, applies first with the same wait and the same 429 Status, for one credential across all clusters. A fetch that it throttles takes no token of the shared limit. |
 | Trust level | The service is a privileged component. It uses the service token for the filtered namespace list and for the watch stream. |
 | Project scope | A project selector has the projects of the requested cluster only. The project part of a Rancher project id is unique inside one cluster, and the namespace label has that part alone. |
@@ -173,7 +182,7 @@ A namespace list log line and a collection log line have these fields: `cluster`
 
 A review log line has these fields: `cluster`, `outcome` (`passthrough`, `native`, or `granted`), and `status`.
 
-Both log lines have the field `user`, the caller's Rancher user id from a SelfSubjectReview, only when the service resolves it. No metric attribute has the name, because a user name has an unbounded value set and that shape is a cardinality fault.
+Both log lines have the field `user`, the caller's Rancher user id from a SelfSubjectReview, only when the service resolves it. For a ServiceAccount caller, `user` is the subject of the token, for example `system:serviceaccount:<namespace>:<name>`, which the API server verified with the rules review. No metric attribute has the name, because a user name has an unbounded value set and that shape is a cardinality fault.
 
 The service never logs a token, a cookie, a header value, or a request body. It logs a namespace name at the `debug` level, and at the `info` level only when a merged watch adds a namespace, or when it ends because an upstream watch ended.
 
@@ -181,13 +190,15 @@ The service writes an `info` line with `cluster`, `lost`, and `gained` when it g
 
 The service writes a `warn` line when the privileged list request gets a 403 error. The cause is a namespace list permission that the service user does not have.
 
+The service writes a `debug` line with `cluster` and `bounded` when the rules of a ServiceAccount caller name no namespace. `bounded` is false when a rule grants `get` on `namespaces` without names. It writes a `debug` line with `cluster` and `reason` when the rules review reports itself incomplete, for example because an authorizer other than RBAC runs in the cluster.
+
 The service writes a `warn` line with `cluster` and `error` when an error of the upstream stream ends an upgraded namespace watch. Examples are a message that is neither JSON nor base64 text, and a reset of the upstream connection.
 
 A log line has `trace_id` and `span_id` when the request has a span.
 
 ## Telemetry
 
-The service continues an incoming `traceparent` on every request. It starts a span when the header is absent. A request span has a child span for the Steve call, the project list, the privileged list, and the privileged watch.
+The service continues an incoming `traceparent` on every request. It starts a span when the header is absent. A request span has a child span for the Steve call, the project list, the rules review, the privileged list, and the privileged watch.
 
 A span of the service is named after the method and a path template, for example `GET /k8s/clusters/{cluster}/api/v1/pods`, and the server span carries that template as `http.route`. A collector that rebuilds a span name from the semantic conventions reads that attribute and gives the span the method alone without it, so the two names agree. The cluster id, a namespace name and an object name each become a placeholder, because their value set is unbounded. The api group, the version and the resource name stay, because they say what the request asks for and the api surface of a cluster is bounded. Search a trace on `resource.service.name`, which `--service-name` sets, not on the span name.
 

@@ -359,7 +359,7 @@ func TestListImpersonationPassesThrough(t *testing.T) {
 	}
 }
 
-func TestListSteveDeniesCaller(t *testing.T) {
+func TestListSteveDeniesCallerGetsNative403(t *testing.T) {
 	t.Parallel()
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
@@ -371,11 +371,11 @@ func TestListSteveDeniesCaller(t *testing.T) {
 			}, namespaceListHandler))
 
 			resp, body := h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
-			if resp.StatusCode != status {
-				t.Errorf("status = %d, want %d", resp.StatusCode, status)
+			if resp.StatusCode != http.StatusForbidden {
+				t.Errorf("status = %d, want 403", resp.StatusCode)
 			}
-			if want := `{"type":"error","code":"Unauthorized"}`; string(body) != want {
-				t.Errorf("body = %q, want %q", body, want)
+			if want := "forbidden\n"; string(body) != want {
+				t.Errorf("body = %q, want the native answer %q", body, want)
 			}
 
 			requests := h.upstream.all()

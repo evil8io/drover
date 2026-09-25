@@ -49,15 +49,18 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 		s.logList(req.Context(), start, result)
 		return resp, nil
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBody))
-	_ = resp.Body.Close()
+	native, err := bufferBody(resp)
+	if err != nil {
+		return s.statusError(req, start, result, err), nil
+	}
 
 	set, denied, err := s.allowed(req.Context(), cluster, req.Header)
 	switch {
 	case denied != nil:
-		result.outcome, result.status = outcomeDenied, denied.StatusCode
+		answer := denialResponse(native, denied)
+		result.outcome, result.status = outcomeDenied, answer.StatusCode
 		s.logList(req.Context(), start, result)
-		return denied, nil
+		return answer, nil
 	case err != nil:
 		return s.statusError(req, start, result, err), nil
 	}

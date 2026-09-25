@@ -3,6 +3,7 @@ package filter
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -57,8 +58,11 @@ const (
 	stevePath             = "/k8s/clusters/c-1/v1/namespaces"
 	reviewPath            = "/k8s/clusters/c-1/apis/authorization.k8s.io/v1/selfsubjectaccessreviews"
 	selfSubjectReviewPath = "/k8s/clusters/c-1/apis/authentication.k8s.io/v1/selfsubjectreviews"
+	rulesReviewTestPath   = "/k8s/clusters/c-1" + rulesReviewPath
 	callerToken           = "Bearer caller"
 	serviceAuth           = "Bearer service"
+
+	serviceAccountSubjectValue = "system:serviceaccount:tenant-system:ci"
 
 	// callerUsername is the identity that selfSubjectReviewHandler answers by
 	// default, for a test that does not care about a specific user id.
@@ -541,4 +545,52 @@ func namespaceListHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Source", "privileged")
 	_, _ = io.WriteString(w, `{"kind":"NamespaceList","items":[]}`)
+}
+
+// fakeJWT returns a token of three base64url segments with payload as the
+// claims. The signature is not valid, because the filter does not verify it.
+func fakeJWT(payload string) string {
+	segment := base64.RawURLEncoding.EncodeToString
+	return segment([]byte(`{"alg":"RS256"}`)) + "." + segment([]byte(payload)) + "." + segment([]byte("signature"))
+}
+
+// serviceAccountToken is the Authorization value of a ServiceAccount caller.
+var serviceAccountToken = "Bearer " + fakeJWT(`{"sub":"`+serviceAccountSubjectValue+`"}`)
+
+// serviceAccountHeader returns the headers of a ServiceAccount caller.
+func serviceAccountHeader() http.Header {
+	return http.Header{"Authorization": []string{serviceAccountToken}}
+}
+
+// rulesReviewHandler answers a SelfSubjectRulesReview with the given rules.
+func rulesReviewHandler(rules ...resourceRule) http.HandlerFunc {
+	body, _ := json.Marshal(map[string]any{
+		"apiVersion": "authorization.k8s.io/v1",
+		"kind":       "SelfSubjectRulesReview",
+		"status": map[string]any{
+			"resourceRules":    rules,
+			"nonResourceRules": []any{},
+			"incomplete":       false,
+		},
+	})
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", jsonContentType)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write(body)
+	}
+}
+
+// rulesUpstream routes the requests of the list flow of a ServiceAccount
+// caller. The native attempt gets the 403 answer nativeForbidden.
+func rulesUpstream(rules, privileged http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == rulesReviewTestPath:
+			rules(w, r)
+		case r.Header.Get("Authorization") == serviceAuth:
+			privileged(w, r)
+		default:
+			writeForbidden(w, nativeForbidden)
+		}
+	}
 }

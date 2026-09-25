@@ -76,6 +76,22 @@ func collectionUpstream(steve, namespaced http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// rulesCollectionUpstream is collectionUpstream for a ServiceAccount caller,
+// whose allowed set comes from the rules review.
+func rulesCollectionUpstream(rules, namespaced http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		_, _, isNamespaced := splitNamespaced(r.URL.Path)
+		switch {
+		case r.URL.Path == rulesReviewTestPath:
+			rules(w, r)
+		case isNamespaced:
+			namespaced(w, r)
+		default:
+			writeForbidden(w, nativeForbidden)
+		}
+	}
+}
+
 // namespaceLists answers a namespaced collection with the body that bodies
 // holds for the namespace. A namespace without a body answers 403, which is
 // what a namespace gives where the caller may not list.
@@ -510,6 +526,62 @@ func TestCollectionNamespacedRequestKeepsCallerCredentials(t *testing.T) {
 		if got := request.header.Get("Accept"); got != jsonContentType {
 			t.Errorf("%s Accept = %q, want %q", request.path, got, jsonContentType)
 		}
+	}
+}
+
+func TestCollectionFanoutServiceAccount(t *testing.T) {
+	t.Parallel()
+	h := newHarnessOpt(t, rulesCollectionUpstream(
+		rulesReviewHandler(namespaceRule("b", "a")),
+		namespaceLists(map[string]string{
+			"a": collectionJSON("PodList", "v1", "a", "pod-a", "5"),
+			"b": collectionJSON("PodList", "v1", "b", "pod-b", "12"),
+		}),
+	), withFanout)
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, podsPath, nil, serviceAccountHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %q", resp.StatusCode, body)
+	}
+	if got, want := parseList(t, body).names(), []string{"pod-a", "pod-b"}; !slices.Equal(got, want) {
+		t.Errorf("items = %v, want %v", got, want)
+	}
+
+	want := []string{
+		"/k8s/clusters/c-1/api/v1/namespaces/a/pods",
+		"/k8s/clusters/c-1/api/v1/namespaces/b/pods",
+	}
+	if got := namespacedPaths(h.upstream); !slices.Equal(got, want) {
+		t.Errorf("namespaced paths = %v, want %v", got, want)
+	}
+	for _, request := range namespacedRecords(h.upstream) {
+		if got := request.header.Get("Authorization"); got != serviceAccountToken {
+			t.Errorf("%s Authorization = %q, want the token of the caller", request.path, got)
+		}
+	}
+	if got := h.upstream.countPath(stevePath); got != 0 {
+		t.Errorf("allowed set requests = %d, want 0", got)
+	}
+}
+
+func TestCollectionFanoutServiceAccountDeniedGetsNative403(t *testing.T) {
+	t.Parallel()
+	h := newHarnessOpt(t, rulesCollectionUpstream(
+		rulesReviewHandler(namespaceRule()),
+		namespaceLists(map[string]string{
+			"a": collectionJSON("PodList", "v1", "a", "pod-a", "5"),
+		}),
+	), withFanout)
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, podsPath, nil, serviceAccountHeader()))
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", resp.StatusCode)
+	}
+	if string(body) != nativeForbidden {
+		t.Errorf("body = %q, want the native answer", body)
+	}
+	if got := len(namespacedRecords(h.upstream)); got != 0 {
+		t.Errorf("namespaced requests = %d, want 0", got)
 	}
 }
 
