@@ -54,28 +54,28 @@ func watchOnce(t *testing.T, syncer *Syncer, cluster string) (string, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	watch := newClusterWatch()
+	watch := newClusterWatch(syncer.patchRate)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		syncer.patchWorker(ctx, cluster, watch)
 	}()
 
-	version, err := syncer.streamNamespaces(ctx, cluster, "", watch.queue)
-	waitForQueue(t, watch.queue)
+	version, err := syncer.streamNamespaces(ctx, cluster, "", watch.patches)
+	waitForQueue(t, watch.patches)
 	cancel()
 	<-done
 	return version, err
 }
 
-// waitForQueue waits until the queue has no namespace that waits, and no
-// namespace in a patch.
-func waitForQueue(t *testing.T, queue *patchQueue) {
+// waitForQueue waits until the queue has no item that waits, and no item that
+// a worker handles.
+func waitForQueue[T any](t *testing.T, q *queue[T]) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
-	for !queue.idle() {
+	for !q.idle() {
 		if time.Now().After(deadline) {
-			t.Fatal("the patch queue has work after 10 s")
+			t.Fatal("the queue has work after 10 s")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -304,7 +304,7 @@ func TestWatchSkipsANamespaceOfAnUnknownProject(t *testing.T) {
 	}
 }
 
-func TestRunOpensOneWatchPerCluster(t *testing.T) {
+func TestRunOpensTheProjectWatchOnceAndOneNamespaceWatchPerCluster(t *testing.T) {
 	t.Parallel()
 	rancher := newFakeRancher(t, watching("c-1", bookmarkEvent), watching("c-2", bookmarkEvent))
 	syncer, _ := newSyncer(t, rancher, tokenFile(t, serviceToken))
@@ -317,7 +317,7 @@ func TestRunOpensOneWatchPerCluster(t *testing.T) {
 	}()
 
 	deadline := time.Now().Add(5 * time.Second)
-	for len(watchClusters(rancher)) < 2 && time.Now().Before(deadline) {
+	for (len(watchClusters(rancher)) < 2 || len(projectWatchRequests(rancher)) == 0) && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	cancel()
@@ -326,13 +326,19 @@ func TestRunOpensOneWatchPerCluster(t *testing.T) {
 	if got := watchClusters(rancher); !slices.Equal(got, []string{"c-1", "c-2"}) {
 		t.Errorf("watched clusters = %v, want [c-1 c-2]", got)
 	}
+	if got := len(projectWatchRequests(rancher)); got != 1 {
+		t.Errorf("project watch requests = %d, want 1", got)
+	}
 }
 
-// watchClusters returns the clusters that a watch request named, sorted and
-// without a repeat.
+// watchClusters returns the clusters that a namespace watch request named,
+// sorted and without a repeat.
 func watchClusters(rancher *fakeRancher) []string {
 	seen := make(map[string]struct{})
 	for _, request := range watchRequests(rancher) {
+		if !strings.HasSuffix(request.path, "/api/v1/namespaces") {
+			continue
+		}
 		cluster := strings.Split(strings.TrimPrefix(request.path, "/k8s/clusters/"), "/")[0]
 		seen[cluster] = struct{}{}
 	}
@@ -342,6 +348,17 @@ func watchClusters(rancher *fakeRancher) []string {
 	}
 	slices.Sort(clusters)
 	return clusters
+}
+
+// projectWatchRequests returns the project watch requests, in order.
+func projectWatchRequests(rancher *fakeRancher) []recorded {
+	var out []recorded
+	for _, request := range watchRequests(rancher) {
+		if request.path == projectsWatchPath {
+			out = append(out, request)
+		}
+	}
+	return out
 }
 
 func TestDesiredTakesTheNameKeyOnlyFromTheNamePath(t *testing.T) {

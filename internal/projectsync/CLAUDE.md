@@ -13,3 +13,10 @@ Human doc: `docs/project-sync.md`. Update it with a behaviour change.
 - A patch that answers 404, 409, or a 403 whose message names the terminating state is skipped and counts no error. The next reconcile repeats the work.
 - The first run after an upgrade that adds a record key patches every namespace once. Expect one patch per namespace in the metrics after such a release.
 - A deployment tool that reads back every label of a namespace shows the keys of the sync as drift. Name a new key in `docs/project-sync.md`, so a deployer can ignore it.
+- The project watch reads `GET /k8s/clusters/local/apis/management.cattle.io/v3/projects?watch=true`, verified against Rancher 2.14.5. Grant the cluster-wide `list` and `watch` on `projects` with a `ClusterRoleTemplateBinding` on the `local` cluster. A per-cluster binding does not give this permission.
+- Start the project watch in the reconcile run, after the first snapshot. Before that, the watch has no snapshot to compare against, and a missing token file would give a warning per attempt.
+- Expect a restart without a resource version to replay every Project as an `ADDED` event. Each replay is an in-memory compare, so a restart costs no request.
+- Never let the project watch start a reconcile run. A cluster member can create Projects, so a trigger there would let that member start runs at will.
+- Take a token from the cluster limiter before the lister lists a project. A project owner can edit its Project in a loop, so an unlimited lister would repeat the list rapidly.
+- Replace the snapshot maps of a cluster on every change. Never mutate them in place, because a worker and the reconcile run read them without a lock.
+- A reconcile run that reads the project list before a Project change can overwrite that change in the snapshot, and patch the old values back. This is a known, accepted gap: the window lasts one list request, and the next event or run closes it.

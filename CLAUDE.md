@@ -38,6 +38,7 @@ Verified against Rancher 2.14.5. Each component file has the facts of its own AP
 - The CA of that serving certificate is the Secret `tls-rancher`, key `tls.crt`, in the Rancher namespace. `tls-rancher-internal-ca` is a different CA and does not verify it.
 - Rancher grants a project member `get` on the namespaces of its projects and no `list`. The api-filter exists for that gap.
 - A binding that grants `list` on `namespaces` to `system:cattle:authenticated` makes the native list succeed, and the filter then never filters, because the filter acts on a 403 only. Look for such a binding first when a tenant sees every namespace.
+- The cluster-wide `list` and `watch` on `projects` of `management.cattle.io`, in the `local` cluster, needs a `ClusterRoleTemplateBinding` on the `local` cluster. The GlobalRole of the service user gives only the per-cluster RoleBindings, never this cluster-wide grant.
 
 ## Releases
 

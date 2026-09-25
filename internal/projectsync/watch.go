@@ -38,27 +38,48 @@ const (
 // version, because the server no longer has the history from that version.
 var errWatchExpired = errors.New("the watch resource version is too old")
 
-// watchSet has one namespace watch per cluster. Every reconcile run gives it
-// the current cluster set, and the set starts and stops the watchers.
+// watchSet has one namespace watch per cluster, and the project watch. Every
+// reconcile run gives it the current cluster set, and the set starts and stops
+// the watchers.
 type watchSet struct {
 	syncer *Syncer
 	wg     sync.WaitGroup
 
 	mu       sync.Mutex
 	watchers map[string]*clusterWatch
+	// stopProjects ends the project watch. It is nil until startProjects.
+	stopProjects context.CancelFunc
 }
 
-// clusterWatch is the state of the namespace watch of one cluster. The stream
-// puts a namespace into queue, and the worker of the cluster takes it from
-// there. A value on reset tells that worker to clear its name cache.
+// clusterWatch is the state of the watches of one cluster. The namespace
+// stream and the lister put a namespace into patches, and the worker of the
+// cluster takes it from there. The project watch puts a project name into
+// projects, and the lister takes it from there. A value on reset tells the
+// worker to clear its name cache. The worker and the lister share limiter.
 type clusterWatch struct {
-	cancel context.CancelFunc
-	queue  *patchQueue
-	reset  chan struct{}
+	cancel   context.CancelFunc
+	patches  *queue[patchItem]
+	projects *queue[string]
+	reset    chan struct{}
+	limiter  *limiter
 }
 
-func newClusterWatch() *clusterWatch {
-	return &clusterWatch{queue: newPatchQueue(), reset: make(chan struct{}, 1)}
+func newClusterWatch(rate float64) *clusterWatch {
+	return &clusterWatch{
+		patches:  newQueue(func(item patchItem) string { return item.target.Metadata.Name }),
+		projects: newQueue(func(name string) string { return name }),
+		reset:    make(chan struct{}, 1),
+		limiter:  newLimiter(rate, max(rate, 1)),
+	}
+}
+
+// resetNames tells the worker to clear its name cache. A signal that waits
+// already covers this one.
+func (c *clusterWatch) resetNames() {
+	select {
+	case c.reset <- struct{}{}:
+	default:
+	}
 }
 
 func (s *Syncer) newWatchSet() *watchSet {
@@ -90,19 +111,53 @@ func (w *watchSet) update(ctx context.Context, clusters []string) {
 			continue
 		}
 		watchCtx, cancel := context.WithCancel(ctx)
-		watch := newClusterWatch()
+		watch := newClusterWatch(w.syncer.patchRate)
 		watch.cancel = cancel
 		w.watchers[cluster] = watch
-		w.wg.Add(2)
+		w.wg.Add(3)
 		go func() {
 			defer w.wg.Done()
-			w.syncer.watchCluster(watchCtx, cluster, watch.queue)
+			w.syncer.watchCluster(watchCtx, cluster, watch.patches)
 		}()
 		go func() {
 			defer w.wg.Done()
 			w.syncer.patchWorker(watchCtx, cluster, watch)
 		}()
+		go func() {
+			defer w.wg.Done()
+			w.syncer.projectLister(watchCtx, cluster, watch)
+		}()
 	}
+}
+
+// startProjects starts the project watch, once per set. It lives until ctx
+// ends or stop.
+func (w *watchSet) startProjects(ctx context.Context) {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stopProjects != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	w.stopProjects = cancel
+	w.wg.Add(1)
+	go func() {
+		defer w.wg.Done()
+		w.syncer.watchProjects(ctx, w)
+	}()
+}
+
+// get returns the watch of a cluster, or nil when the set has none.
+func (w *watchSet) get(cluster string) *clusterWatch {
+	if w == nil {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.watchers[cluster]
 }
 
 // resetNames tells every worker to clear its name cache. A reconcile run calls
@@ -115,14 +170,12 @@ func (w *watchSet) resetNames() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for _, watch := range w.watchers {
-		select {
-		case watch.reset <- struct{}{}:
-		default:
-		}
+		watch.resetNames()
 	}
 }
 
-// stop ends every watcher and every worker, and it waits for the goroutines.
+// stop ends every watcher, every worker, and the project watch, and it waits
+// for the goroutines.
 func (w *watchSet) stop() {
 	if w == nil {
 		return
@@ -132,21 +185,33 @@ func (w *watchSet) stop() {
 		watch.cancel()
 		delete(w.watchers, cluster)
 	}
+	if w.stopProjects != nil {
+		w.stopProjects()
+	}
 	w.mu.Unlock()
 	w.wg.Wait()
 }
 
-// watchCluster keeps one namespace watch of a cluster open. A stream that ends
-// starts again, after a backoff that grows with each failure. The reconcile
-// run covers the namespaces that the gap misses.
-func (s *Syncer) watchCluster(ctx context.Context, cluster string, queue *patchQueue) {
+// watchCluster keeps one namespace watch of a cluster open.
+func (s *Syncer) watchCluster(ctx context.Context, cluster string, patches *queue[patchItem]) {
+	s.keepWatching(ctx, kindNamespace, cluster, func(ctx context.Context, resourceVersion string) (string, error) {
+		return s.streamNamespaces(ctx, cluster, resourceVersion, patches)
+	})
+}
+
+// keepWatching keeps one watch open. open reads one stream from a resource
+// version, and returns the resource version to start the next stream from. A
+// stream that ends starts again, after a backoff that grows with each failure.
+// The reconcile run covers the events that the gap misses. kind and cluster
+// name the watch in the logs.
+func (s *Syncer) keepWatching(ctx context.Context, kind, cluster string, open func(ctx context.Context, resourceVersion string) (string, error)) {
 	var (
 		resourceVersion string
 		backoff         = minWatchBackoff
 	)
 	for ctx.Err() == nil {
 		start := time.Now()
-		next, err := s.streamNamespaces(ctx, cluster, resourceVersion, queue)
+		next, err := open(ctx, resourceVersion)
 		if ctx.Err() != nil {
 			return
 		}
@@ -156,10 +221,10 @@ func (s *Syncer) watchCluster(ctx context.Context, cluster string, queue *patchQ
 		case err == nil:
 		case errors.Is(err, errWatchExpired):
 			resourceVersion = ""
-			s.logger.DebugContext(ctx, "the namespace watch needs the full list again",
+			s.logger.DebugContext(ctx, "the "+kind+" watch needs the full list again",
 				"cluster", cluster, "error", err.Error())
 		default:
-			s.logFailure(ctx, slog.LevelWarn, "the namespace watch failed", err, "cluster", cluster)
+			s.logFailure(ctx, slog.LevelWarn, "the "+kind+" watch failed", err, "cluster", cluster)
 		}
 
 		long := time.Since(start) >= watchBackoffReset
@@ -177,21 +242,41 @@ func (s *Syncer) watchCluster(ctx context.Context, cluster string, queue *patchQ
 }
 
 // streamNamespaces reads one namespace watch stream until it ends. It puts the
-// namespace of an ADDED event and of a MODIFIED event into queue. It returns
-// the last resource version that it saw, so that the next stream starts after
-// it. A stream that the server ends at its timeout returns no error.
-func (s *Syncer) streamNamespaces(ctx context.Context, cluster, resourceVersion string, queue *patchQueue) (string, error) {
+// namespace of an ADDED event and of a MODIFIED event into patches.
+func (s *Syncer) streamNamespaces(ctx context.Context, cluster, resourceVersion string, patches *queue[patchItem]) (string, error) {
+	return s.readWatch(ctx, kindNamespace, cluster, namespacesPath(cluster), projectLabel, resourceVersion,
+		func(event watchEvent) (string, error) {
+			item, err := event.namespace()
+			if err != nil {
+				return "", err
+			}
+			if event.Type == watchAdded || event.Type == watchModified {
+				patches.put(patchItem{target: s.pruneNamespace(item), origin: originWatch})
+			}
+			return item.Metadata.ResourceVersion, nil
+		})
+}
+
+// readWatch reads one watch stream at path until it ends. It reads the token
+// file per stream, because a rotation replaces the token. A non-empty selector
+// is the label selector of the watch. handle takes every event but ERROR, and
+// returns the resource version of its object, or an error when the event has
+// no object of the kind. readWatch returns the last resource version that it
+// saw, so that the next stream starts after it. A stream that the server ends
+// at its timeout returns no error.
+func (s *Syncer) readWatch(ctx context.Context, kind, cluster, path, selector, resourceVersion string, handle func(watchEvent) (string, error)) (string, error) {
 	token, err := rancherclient.ReadToken(s.tokenFile)
 	if err != nil {
 		return resourceVersion, err
 	}
 
-	path := namespacesPath(cluster)
 	query := url.Values{
 		"watch":               []string{"true"},
-		"labelSelector":       []string{projectLabel},
 		"allowWatchBookmarks": []string{"true"},
 		"timeoutSeconds":      []string{strconv.Itoa(int(watchTimeout.Seconds()))},
+	}
+	if selector != "" {
+		query.Set("labelSelector", selector)
 	}
 	if resourceVersion != "" {
 		query.Set("resourceVersion", resourceVersion)
@@ -212,9 +297,9 @@ func (s *Syncer) streamNamespaces(ctx context.Context, cluster, resourceVersion 
 		return resourceVersion, status
 	}
 
-	s.metrics.watchOpened(ctx, cluster)
-	defer s.metrics.watchClosed(ctx, cluster)
-	s.logger.InfoContext(ctx, "the namespace watch is open", "cluster", cluster)
+	s.metrics.watchOpened(ctx, cluster, kind)
+	defer s.metrics.watchClosed(ctx, cluster, kind)
+	s.logger.InfoContext(ctx, "the "+kind+" watch is open", "cluster", cluster)
 
 	decoder := json.NewDecoder(resp.Body)
 	for {
@@ -223,37 +308,33 @@ func (s *Syncer) streamNamespaces(ctx context.Context, cluster, resourceVersion 
 			if errors.Is(err, io.EOF) {
 				return resourceVersion, nil
 			}
-			return resourceVersion, fmt.Errorf("read the namespace watch of cluster %s: %w", cluster, err)
+			return resourceVersion, fmt.Errorf("read the %s watch of cluster %s: %w", kind, cluster, err)
 		}
-		s.metrics.watchEvent(ctx, cluster, event.Type)
+		s.metrics.watchEvent(ctx, cluster, kind, event.Type)
 
 		if event.Type == watchError {
 			return "", fmt.Errorf("%w: %s", errWatchExpired, event.status())
 		}
-		item, err := event.namespace()
+		next, err := handle(event)
 		if err != nil {
-			s.logger.WarnContext(ctx, "the namespace watch event has no namespace",
+			s.logger.WarnContext(ctx, "the "+kind+" watch event has no "+kind,
 				"cluster", cluster, "type", event.Type, "error", err.Error())
 			continue
 		}
-		if item.Metadata.ResourceVersion != "" {
-			resourceVersion = item.Metadata.ResourceVersion
-		}
-		if event.Type == watchAdded || event.Type == watchModified {
-			queue.put(s.pruneNamespace(item))
+		if next != "" {
+			resourceVersion = next
 		}
 	}
 }
 
 // patchWorker patches the namespaces of one cluster queue, one at a time. Its
 // name cache lasts as long as the worker, so a project whose display name has
-// no valid label value gives one warning per worker. The limiter bounds the
-// patches per second of the cluster.
+// no valid label value gives one warning per worker. The limiter of the
+// cluster bounds the patches per second.
 func (s *Syncer) patchWorker(ctx context.Context, cluster string, watch *clusterWatch) {
 	names := make(map[string]string)
-	patches := newLimiter(s.patchRate, max(s.patchRate, 1))
 	for {
-		target, ok := watch.queue.next(ctx)
+		item, ok := watch.patches.next(ctx)
 		if !ok {
 			return
 		}
@@ -262,10 +343,10 @@ func (s *Syncer) patchWorker(ctx context.Context, cluster string, watch *cluster
 			clear(names)
 		default:
 		}
-		if patches.wait(ctx) {
-			s.applyPending(ctx, cluster, target, names)
+		if watch.limiter.wait(ctx) {
+			s.applyPending(ctx, cluster, item, names)
 		}
-		watch.queue.done()
+		watch.patches.done()
 		if ctx.Err() != nil {
 			return
 		}
@@ -278,7 +359,8 @@ func (s *Syncer) patchWorker(ctx context.Context, cluster string, watch *cluster
 // the token while the stream stays open. names is the name cache of the
 // worker. A patch that fails is a warning, and the next reconcile run repeats
 // the work.
-func (s *Syncer) applyPending(ctx context.Context, cluster string, target namespace, names map[string]string) {
+func (s *Syncer) applyPending(ctx context.Context, cluster string, item patchItem, names map[string]string) {
+	target := item.target
 	name := target.Metadata.Name
 	projectName := target.Metadata.Labels[projectLabel]
 	source, ok := s.projectsOf(cluster)[projectName]
@@ -295,40 +377,48 @@ func (s *Syncer) applyPending(ctx context.Context, cluster string, target namesp
 		return
 	}
 
-	if _, err := s.applyNamespace(ctx, token, cluster, source, target, names, originWatch); err != nil {
+	if _, err := s.applyNamespace(ctx, token, cluster, source, target, names, item.origin); err != nil {
 		s.logFailure(ctx, slog.LevelWarn, "the namespace patch failed", err,
 			"cluster", cluster, "namespace", name, "project", projectName)
 	}
 }
 
-// patchQueue has the namespaces of one cluster that wait for a patch, by
-// namespace name. A second event of a namespace replaces the first one, so a
-// storm of events on one namespace gives one patch.
-type patchQueue struct {
+// patchItem is a namespace that waits for a patch. origin names the path that
+// found it.
+type patchItem struct {
+	target namespace
+	origin string
+}
+
+// queue has the items of one cluster that wait for a worker, by the key that
+// key returns. A second item of a key replaces the first one, so a storm of
+// events on one key gives one run of the worker.
+type queue[T any] struct {
+	key func(T) string
 	// signal has one slot, and a put fills it. The worker waits on it while
 	// the queue is empty.
 	signal chan struct{}
 
 	mu      sync.Mutex
-	pending map[string]namespace
+	pending map[string]T
 	order   []string
 	active  bool
 }
 
-func newPatchQueue() *patchQueue {
-	return &patchQueue{signal: make(chan struct{}, 1), pending: make(map[string]namespace)}
+func newQueue[T any](key func(T) string) *queue[T] {
+	return &queue[T]{key: key, signal: make(chan struct{}, 1), pending: make(map[string]T)}
 }
 
-// put stores target under its namespace name. A name that waits already keeps
-// its place in the order, and gets the new object.
-func (q *patchQueue) put(target namespace) {
-	name := target.Metadata.Name
+// put stores item under its key. A key that waits already keeps its place in
+// the order, and gets the new item.
+func (q *queue[T]) put(item T) {
+	key := q.key(item)
 
 	q.mu.Lock()
-	if _, ok := q.pending[name]; !ok {
-		q.order = append(q.order, name)
+	if _, ok := q.pending[key]; !ok {
+		q.order = append(q.order, key)
 	}
-	q.pending[name] = target
+	q.pending[key] = item
 	q.mu.Unlock()
 
 	select {
@@ -337,47 +427,49 @@ func (q *patchQueue) put(target namespace) {
 	}
 }
 
-// next returns the namespace that waits longest, and true. It blocks while the
+// next returns the item that waits longest, and true. It blocks while the
 // queue is empty, and it returns false when ctx ends. The queue counts that
-// namespace as active until done.
-func (q *patchQueue) next(ctx context.Context) (namespace, bool) {
+// item as active until done.
+func (q *queue[T]) next(ctx context.Context) (T, bool) {
 	for {
 		q.mu.Lock()
 		if len(q.order) > 0 {
-			name := q.order[0]
+			key := q.order[0]
 			q.order = q.order[1:]
-			target := q.pending[name]
-			delete(q.pending, name)
+			item := q.pending[key]
+			delete(q.pending, key)
 			q.active = true
 			q.mu.Unlock()
-			return target, true
+			return item, true
 		}
 		q.mu.Unlock()
 
 		select {
 		case <-ctx.Done():
-			return namespace{}, false
+			var zero T
+			return zero, false
 		case <-q.signal:
 		}
 	}
 }
 
-// done ends the active state of the namespace that next returned.
-func (q *patchQueue) done() {
+// done ends the active state of the item that next returned.
+func (q *queue[T]) done() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.active = false
 }
 
-// idle reports whether the queue has no namespace that waits, and no namespace
-// in a patch.
-func (q *patchQueue) idle() bool {
+// idle reports whether the queue has no item that waits, and no item that a
+// worker handles.
+func (q *queue[T]) idle() bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return len(q.order) == 0 && !q.active
 }
 
-// limiter is a token bucket that bounds the patches per second of one cluster.
+// limiter is a token bucket that bounds the requests per second of the
+// workers of one cluster.
 // It is hand-written, because the module has no external rate package.
 type limiter struct {
 	rate  float64 // tokens added per second

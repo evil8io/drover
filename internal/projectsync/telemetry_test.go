@@ -120,8 +120,9 @@ func findSum(t *testing.T, data metricdata.ResourceMetrics, name string) metricd
 }
 
 // TestWatchRecordsTheEventAndTheOpenStream checks that one namespace watch
-// stream records drover.sync.events with the type attribute, and that
-// drover.sync.watches.open returns to zero once the stream ends.
+// stream records drover.sync.events with the type attribute and the kind
+// namespace, and that drover.sync.watches.open returns to zero once the
+// stream ends.
 func TestWatchRecordsTheEventAndTheOpenStream(t *testing.T) {
 	t.Parallel()
 	reader := sdkmetric.NewManualReader()
@@ -147,6 +148,9 @@ func TestWatchRecordsTheEventAndTheOpenStream(t *testing.T) {
 	for _, point := range events.DataPoints {
 		value, _ := point.Attributes.Value(attribute.Key("type"))
 		types[value.AsString()] = point.Value
+		if kind, _ := point.Attributes.Value(attribute.Key("kind")); kind.AsString() != kindNamespace {
+			t.Errorf("kind of the %s point = %q, want %q", value.AsString(), kind.AsString(), kindNamespace)
+		}
 	}
 	if types[watchAdded] != 1 || types[watchModified] != 1 {
 		t.Errorf("event points = %v, want one ADDED and one MODIFIED", types)
@@ -155,6 +159,8 @@ func TestWatchRecordsTheEventAndTheOpenStream(t *testing.T) {
 	open := findSum(t, data, "drover.sync.watches.open")
 	if len(open.DataPoints) != 1 || open.DataPoints[0].Value != 0 {
 		t.Errorf("drover.sync.watches.open points = %v, want one point with value 0", open.DataPoints)
+	} else if kind, _ := open.DataPoints[0].Attributes.Value(attribute.Key("kind")); kind.AsString() != kindNamespace {
+		t.Errorf("kind of the open point = %q, want %q", kind.AsString(), kindNamespace)
 	}
 
 	patched := findSum(t, data, "drover.sync.namespaces.patched")
@@ -166,5 +172,60 @@ func TestWatchRecordsTheEventAndTheOpenStream(t *testing.T) {
 	}
 	if fromTheWatch != 1 {
 		t.Errorf("namespaces patched from the watch = %d, want 1", fromTheWatch)
+	}
+}
+
+// TestProjectWatchRecordsTheChangeAndTheKind checks that one project change
+// records drover.sync.projects.changed with the cluster of the project, and
+// that the stream records drover.sync.events and drover.sync.watches.open
+// with the Rancher cluster and the kind project.
+func TestProjectWatchRecordsTheChangeAndTheKind(t *testing.T) {
+	t.Parallel()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	frame := alphaFrame(t, watchModified, func(object *projectObject) {
+		object.Metadata.Labels["cost-center"] = "cc-9"
+	})
+	p := newProjectTest(t, []func(*fakeRancher){watchingProjects(frame)}, func(cfg *Config) {
+		cfg.MeterProvider = provider
+	})
+
+	if _, err := p.stream(t, ""); err != nil {
+		t.Fatalf("stream the project watch: %v", err)
+	}
+
+	var data metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &data); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+
+	changed := findSum(t, data, "drover.sync.projects.changed")
+	if len(changed.DataPoints) != 1 || changed.DataPoints[0].Value != 1 {
+		t.Fatalf("drover.sync.projects.changed points = %v, want one point with value 1", changed.DataPoints)
+	}
+	if cluster, _ := changed.DataPoints[0].Attributes.Value(attribute.Key("cluster")); cluster.AsString() != "c-1" {
+		t.Errorf("cluster of the change = %q, want c-1", cluster.AsString())
+	}
+
+	want := attribute.NewSet(
+		attribute.String("cluster", rancherCluster),
+		attribute.String("kind", kindProject),
+		attribute.String("type", watchModified))
+	var events int64
+	for _, point := range findSum(t, data, "drover.sync.events").DataPoints {
+		if point.Attributes.Equals(&want) {
+			events = point.Value
+		}
+	}
+	if events != 1 {
+		t.Errorf("project MODIFIED events = %d, want 1", events)
+	}
+
+	wantOpen := attribute.NewSet(
+		attribute.String("cluster", rancherCluster),
+		attribute.String("kind", kindProject))
+	open := findSum(t, data, "drover.sync.watches.open")
+	if len(open.DataPoints) != 1 || !open.DataPoints[0].Attributes.Equals(&wantOpen) || open.DataPoints[0].Value != 0 {
+		t.Errorf("drover.sync.watches.open points = %v, want one project point with value 0", open.DataPoints)
 	}
 }

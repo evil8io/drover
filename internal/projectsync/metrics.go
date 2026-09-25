@@ -19,9 +19,16 @@ const (
 	outcomeOK    = "ok"
 	outcomeError = "error"
 
-	// originReconcile and originWatch name the path that patched a namespace.
+	// originReconcile, originWatch, and originProject name the path that
+	// patched a namespace. originProject is a namespace that the lister found
+	// after a project change.
 	originReconcile = "reconcile"
 	originWatch     = "watch"
+	originProject   = "project"
+
+	// kindNamespace and kindProject name the objects of a watch.
+	kindNamespace = "namespace"
+	kindProject   = "project"
 )
 
 // metrics has the instruments that record the outcome of a reconcile run.
@@ -32,6 +39,7 @@ type metrics struct {
 	duration   metric.Float64Histogram
 	events     metric.Int64Counter
 	watches    metric.Int64UpDownCounter
+	changed    metric.Int64Counter
 }
 
 // newMetrics creates the instruments of the syncer, on the meter that
@@ -64,13 +72,19 @@ func newMetrics(provider metric.MeterProvider) (*metrics, error) {
 		return nil, err
 	}
 	events, err := meter.Int64Counter("drover.sync.events",
-		metric.WithDescription("Namespace watch events that the syncer reads."),
+		metric.WithDescription("Watch events that the syncer reads."),
 		metric.WithUnit("1"))
 	if err != nil {
 		return nil, err
 	}
 	watches, err := meter.Int64UpDownCounter("drover.sync.watches.open",
-		metric.WithDescription("Namespace watch streams that are open."),
+		metric.WithDescription("Watch streams that are open."),
+		metric.WithUnit("1"))
+	if err != nil {
+		return nil, err
+	}
+	changed, err := meter.Int64Counter("drover.sync.projects.changed",
+		metric.WithDescription("Project changes that the project watch applies."),
 		metric.WithUnit("1"))
 	if err != nil {
 		return nil, err
@@ -83,6 +97,7 @@ func newMetrics(provider metric.MeterProvider) (*metrics, error) {
 		duration:   duration,
 		events:     events,
 		watches:    watches,
+		changed:    changed,
 	}, nil
 }
 
@@ -94,25 +109,38 @@ func (m *metrics) reconcileDone(ctx context.Context, outcome string, duration ti
 }
 
 // namespacePatched records one namespace that the syncer patches. origin is
-// the path that found the namespace, the reconcile run or the watch.
+// the path that found the namespace.
 func (m *metrics) namespacePatched(ctx context.Context, origin string) {
 	m.patched.Add(ctx, 1, metric.WithAttributes(attribute.String("origin", origin)))
 }
 
-// watchEvent records one event of the namespace watch of a cluster.
-func (m *metrics) watchEvent(ctx context.Context, cluster, eventType string) {
+// watchEvent records one event of a watch. cluster is the cluster of the
+// stream, and kind names its objects.
+func (m *metrics) watchEvent(ctx context.Context, cluster, kind, eventType string) {
 	m.events.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("cluster", cluster),
+		attribute.String("kind", kind),
 		attribute.String("type", eventType)))
 }
 
-// watchOpened and watchClosed track the open watch streams per cluster.
-func (m *metrics) watchOpened(ctx context.Context, cluster string) {
-	m.watches.Add(ctx, 1, metric.WithAttributes(attribute.String("cluster", cluster)))
+// watchOpened and watchClosed track the open watch streams per cluster and
+// kind.
+func (m *metrics) watchOpened(ctx context.Context, cluster, kind string) {
+	m.watches.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("cluster", cluster),
+		attribute.String("kind", kind)))
 }
 
-func (m *metrics) watchClosed(ctx context.Context, cluster string) {
-	m.watches.Add(ctx, -1, metric.WithAttributes(attribute.String("cluster", cluster)))
+func (m *metrics) watchClosed(ctx context.Context, cluster, kind string) {
+	m.watches.Add(ctx, -1, metric.WithAttributes(
+		attribute.String("cluster", cluster),
+		attribute.String("kind", kind)))
+}
+
+// projectChanged records one project change that the project watch applies.
+// cluster is the cluster of the project.
+func (m *metrics) projectChanged(ctx context.Context, cluster string) {
+	m.changed.Add(ctx, 1, metric.WithAttributes(attribute.String("cluster", cluster)))
 }
 
 // syncError records one error that a reconcile run logs.

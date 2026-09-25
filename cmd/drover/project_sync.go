@@ -160,7 +160,7 @@ func parseProjectSyncConfig(args []string, output io.Writer, getenv func(string)
 		"annotation key on the namespace that gets the display name of the project")
 	flags.DurationVar(&cfg.interval, "interval", 60*time.Second, "time between two runs")
 	flags.Float64Var(&cfg.patchRate, "patch-rate", 10,
-		"namespace patches per second that the watch of one cluster sends")
+		"namespace patches and project namespace lists per second that the watches of one cluster send, together")
 	flags.StringVar(&logLevel, "log-level", "info", "debug, info, warn or error")
 	tf := registerTelemetryFlags(flags, getenv)
 

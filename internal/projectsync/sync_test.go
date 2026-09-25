@@ -363,7 +363,7 @@ func TestNamespaceListKeepsOnlyTheKeysThatTheSyncReads(t *testing.T) {
 	})
 	ctx := context.Background()
 
-	items, err := syncer.namespaces(ctx, serviceToken, "c-1")
+	items, err := syncer.namespaces(ctx, serviceToken, "c-1", projectLabel)
 	if err != nil {
 		t.Fatalf("list the namespaces of c-1: %v", err)
 	}
@@ -427,7 +427,7 @@ func TestReconcileRewritesARecordAboveTheBound(t *testing.T) {
 	syncer, _ := newSyncer(t, rancher, tokenFile(t, serviceToken))
 	ctx := context.Background()
 
-	items, err := syncer.namespaces(ctx, serviceToken, "c-1")
+	items, err := syncer.namespaces(ctx, serviceToken, "c-1", projectLabel)
 	if err != nil {
 		t.Fatalf("list the namespaces of c-1: %v", err)
 	}
@@ -499,7 +499,7 @@ func TestNamespaceListFailsAfterASecondExpiredContinueToken(t *testing.T) {
 	rancher := newFakeRancher(t, twoPages(), expiring("page-2", 2))
 	syncer, _ := newSyncer(t, rancher, tokenFile(t, serviceToken))
 
-	_, err := syncer.namespaces(context.Background(), serviceToken, "c-1")
+	_, err := syncer.namespaces(context.Background(), serviceToken, "c-1", projectLabel)
 	var status statusError
 	if !errors.As(err, &status) || status.status != http.StatusGone {
 		t.Fatalf("error = %v, want status 410", err)
