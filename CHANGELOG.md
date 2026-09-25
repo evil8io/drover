@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.17.0](https://github.com/evil8io/drover/compare/v0.16.2...v0.17.0) (2026-09-25)
+
+
+### Features
+
+* **api-filter:** read the allowed set of a ServiceAccount caller from its RBAC rules ([#94](https://github.com/evil8io/drover/issues/94)) ([eaa93ca](https://github.com/evil8io/drover/commit/eaa93ca9b97349c0fe84d083cc87e262b72144e1))
+
+
+### Bug Fixes
+
+* **deps:** update module google.golang.org/grpc to v1.84.0 ([#92](https://github.com/evil8io/drover/issues/92)) ([ec38ba9](https://github.com/evil8io/drover/commit/ec38ba9f11272536504bbe5a2d738d1f599b7725))
+
 ## [0.16.2](https://github.com/evil8io/drover/compare/v0.16.1...v0.16.2) (2026-09-24)
 
 
