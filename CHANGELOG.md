@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.0](https://github.com/evil8io/drover/compare/v0.17.0...v0.18.0) (2026-09-25)
+
+
+### Features
+
+* **project-sync:** watch the projects of the Rancher cluster ([#95](https://github.com/evil8io/drover/issues/95)) ([9260b0b](https://github.com/evil8io/drover/commit/9260b0b2531e58b8dbcce3a74817220cd0377475))
+
 ## [0.17.0](https://github.com/evil8io/drover/compare/v0.16.2...v0.17.0) (2026-09-25)
 
 
