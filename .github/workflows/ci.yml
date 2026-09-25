@@ -38,7 +38,7 @@ jobs:
       - uses: golangci/golangci-lint-action@v9
         with:
           # renovate: datasource=github-releases depName=golangci/golangci-lint
-          version: v2.13.2
+          version: v2.14.0
 
       # image.yml is a reusable-workflow call, so it cannot run a step of its
       # own. Compute its version and tags here instead.
