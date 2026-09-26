@@ -23,7 +23,7 @@ Human doc: `docs/project-sync.md`. Update it with a behaviour change.
 
 ## Service accounts
 
-Verified against Rancher 2.14.5 and its webhook.
+Verified live against Rancher 2.14.5, and against the source of Rancher 2.14.6 and its webhook 0.10.12.
 
 - Trust an account project only by the label `drover-service-accounts` together with the annotation `field.cattle.io/creatorId` equal to the service user. A project owner can set the label on its own project. The webhook denies a change and an addition of the creator annotation on an update, also for an admin. A cluster member can create a project with the service user as creator, because no webhook compares the annotation with the requester, but Rancher then binds only the service user as owner, so the maker gets no role in it.
 - Create the account project without `field.cattle.io/no-creator-rbac`. The webhook rejects that annotation together with a creator, and a project without a creator fails the trust check.
