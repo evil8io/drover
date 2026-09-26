@@ -267,6 +267,7 @@ func TestProjectWatchSetsANewDisplayName(t *testing.T) {
 	var target namespace
 	target.Metadata.Name = "alpha-two"
 	target.Metadata.Labels = map[string]string{projectLabel: "p-alpha"}
+	target.Metadata.Annotations = map[string]string{projectAnnotation: "c-1:p-alpha"}
 	p.watches.get("c-1").patches.put(patchItem{target: target, origin: originWatch})
 	p.wait(t)
 	if got := p.lastBody(t, alphaTwoPath); !strings.Contains(got, `"`+nameLabel+`":"Alpha"`) {

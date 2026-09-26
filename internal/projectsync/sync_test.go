@@ -20,10 +20,11 @@ import (
 )
 
 const (
-	alphaTwoPath   = "/k8s/clusters/c-1/api/v1/namespaces/alpha-two"
-	alphaMovedPath = "/k8s/clusters/c-1/api/v1/namespaces/alpha-moved"
-	betaOnePath    = "/k8s/clusters/c-2/api/v1/namespaces/beta-one"
-	alphaListPath  = "/k8s/clusters/c-1/api/v1/namespaces"
+	alphaTwoPath      = "/k8s/clusters/c-1/api/v1/namespaces/alpha-two"
+	alphaMovedPath    = "/k8s/clusters/c-1/api/v1/namespaces/alpha-moved"
+	alphaDepartedPath = "/k8s/clusters/c-1/api/v1/namespaces/alpha-departed"
+	betaOnePath       = "/k8s/clusters/c-2/api/v1/namespaces/beta-one"
+	alphaListPath     = "/k8s/clusters/c-1/api/v1/namespaces"
 
 	alphaTwoBody = `{"metadata":{"labels":{"cost-center":"cc-1"},` +
 		`"annotations":{"drover-managed-annotations":"owner","drover-managed-labels":"cost-center",` +
@@ -31,6 +32,17 @@ const (
 	alphaMovedBody = `{"metadata":{"labels":{"tier":null},"annotations":{"drover-managed-labels":"cost-center"}}}`
 	betaOneBody    = `{"metadata":{"labels":{"cost-center":"cc-2"},` +
 		`"annotations":{"drover-managed-labels":"cost-center"}}}`
+
+	// alphaDepartedItem is alpha-departed while it still has the keys of
+	// p-alpha, but its project annotation is already gone: Rancher keeps the
+	// label. alphaDepartedBody is the patch that removes those keys and the
+	// records that name them.
+	alphaDepartedItem = `{"metadata":{"name":"alpha-departed","resourceVersion":"16",` +
+		`"labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1"},` +
+		`"annotations":{"owner":"alpha@example.com","drover-managed-labels":"cost-center",` +
+		`"drover-managed-annotations":"owner"}}}`
+	alphaDepartedBody = `{"metadata":{"labels":{"cost-center":null},` +
+		`"annotations":{"drover-managed-annotations":null,"drover-managed-labels":null,"owner":null}}}`
 )
 
 // reconcileOnce runs one reconcile against a fake Rancher with a token file.
@@ -54,6 +66,17 @@ func requestsOfPath(rancher *fakeRancher, path string) []recorded {
 	var out []recorded
 	for _, request := range rancher.all() {
 		if request.path == path {
+			out = append(out, request)
+		}
+	}
+	return out
+}
+
+// requestsOfPathAndMethod returns the requests of path with method.
+func requestsOfPathAndMethod(rancher *fakeRancher, path, method string) []recorded {
+	var out []recorded
+	for _, request := range requestsOfPath(rancher, path) {
+		if request.method == method {
 			out = append(out, request)
 		}
 	}
@@ -88,8 +111,8 @@ func TestReconcileSetsAMissingKeyAndOverwritesADifferentValue(t *testing.T) {
 	if len(lists) != 1 {
 		t.Fatalf("namespace list requests of c-1 = %d, want 1", len(lists))
 	}
-	if got := lists[0].query.Get("labelSelector"); got != projectLabel {
-		t.Errorf("label selector = %q, want %q", got, projectLabel)
+	if got := lists[0].query.Get("labelSelector"); got != "" {
+		t.Errorf("label selector = %q, want none", got)
 	}
 	if !strings.Contains(logs.String(), `msg="namespace unchanged" cluster=c-1 namespace=alpha-one`) {
 		t.Errorf("no unchanged line for alpha-one:\n%s", logs.String())
@@ -206,20 +229,74 @@ func TestReconcileIgnoresAKeyOutsideTheAllowList(t *testing.T) {
 	}
 }
 
-func TestReconcileIgnoresANamespaceWithoutTheProjectLabel(t *testing.T) {
+func TestReconcileWritesNoPatchForANamespaceInNoProjectWithoutRecords(t *testing.T) {
 	t.Parallel()
 	rancher, logs := reconcileOnce(t)
 
+	// alpha-three has neither the project label nor the project annotation,
+	// and no records, so the run lists it but writes nothing.
 	for _, patch := range rancher.method(http.MethodPatch) {
-		if strings.HasSuffix(patch.path, "/alpha-three") || strings.HasSuffix(patch.path, "/alpha-orphan") {
+		if strings.HasSuffix(patch.path, "/alpha-three") {
 			t.Errorf("patch of %s, want no patch", patch.path)
 		}
 	}
-	if !strings.Contains(logs.String(), `msg="namespace skipped" cluster=c-1 namespace=alpha-three`) {
-		t.Errorf("no skipped line for alpha-three:\n%s", logs.String())
+	if !strings.Contains(logs.String(), `msg="namespace unchanged" cluster=c-1 namespace=alpha-three`) {
+		t.Errorf("no unchanged line for alpha-three:\n%s", logs.String())
+	}
+}
+
+func TestReconcileSkipsANamespaceWhoseAnnotationNamesAnUnknownProject(t *testing.T) {
+	t.Parallel()
+	rancher, logs := reconcileOnce(t)
+
+	// alpha-orphan's project annotation names p-gone, which the snapshot does
+	// not have.
+	for _, patch := range rancher.method(http.MethodPatch) {
+		if strings.HasSuffix(patch.path, "/alpha-orphan") {
+			t.Errorf("patch of %s, want no patch", patch.path)
+		}
 	}
 	if !strings.Contains(logs.String(), `msg="namespace skipped" cluster=c-1 namespace=alpha-orphan project=p-gone`) {
 		t.Errorf("no skipped line for alpha-orphan:\n%s", logs.String())
+	}
+}
+
+// TestReconcileRemovesTheRecordedKeysOfANamespaceThatLeftItsProject checks
+// that the reconcile run removes the keys of the records, and the records
+// themselves, of a namespace whose project annotation is gone while Rancher
+// still keeps its label.
+func TestReconcileRemovesTheRecordedKeysOfANamespaceThatLeftItsProject(t *testing.T) {
+	t.Parallel()
+	page := `{"kind":"NamespaceList","items":[` + alphaDepartedItem + `]}`
+	rancher := newFakeRancher(t, listing("c-1", map[string]string{"": page}))
+	syncer, _ := newSyncer(t, rancher, tokenFile(t, serviceToken))
+
+	syncer.reconcile(context.Background())
+
+	patches := requestsOfPathAndMethod(rancher, alphaDepartedPath, http.MethodPatch)
+	if len(patches) != 1 {
+		t.Fatalf("patch requests of %s = %d, want 1", alphaDepartedPath, len(patches))
+	}
+	if got := patches[0].body; got != alphaDepartedBody {
+		t.Errorf("patch of %s = %s, want %s", alphaDepartedPath, got, alphaDepartedBody)
+	}
+}
+
+// TestNameLabelValueLogsNoWarningForANamespaceInNoProject checks that an
+// empty source, the project of a namespace in no project, gives an empty
+// value and no warning, instead of a warning about an invalid display name.
+func TestNameLabelValueLogsNoWarningForANamespaceInNoProject(t *testing.T) {
+	t.Parallel()
+	rancher := newFakeRancher(t)
+	syncer, logs := newSyncer(t, rancher, tokenFile(t, serviceToken), func(cfg *Config) {
+		cfg.NameLabel = "example.com/project-name"
+	})
+
+	if got := syncer.nameLabelValue(context.Background(), "c-1", project{}, make(map[string]string)); got != "" {
+		t.Errorf("value = %q, want empty", got)
+	}
+	if strings.Contains(logs.String(), "the project display name has no valid label value") {
+		t.Errorf("a display-name warning for a namespace in no project:\n%s", logs.String())
 	}
 }
 
@@ -350,6 +427,7 @@ func TestNamespaceListKeepsOnlyTheKeysThatTheSyncReads(t *testing.T) {
 		fmt.Fprintf(&page, `{"metadata":{"name":"bulk-%03d","resourceVersion":"%d",`+
 			`"labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"old","tier":"gold","app":"web",%q:"Alpha"},`+
 			`"annotations":{"owner":"alpha@example.com",%q:"Alpha","note":"outside the allow list","bulk":%q,`+
+			`"field.cattle.io/projectId":"c-1:p-alpha",`+
 			`"drover-managed-labels":"cost-center,%s","drover-managed-annotations":"%s,owner"}}}`,
 			i, 100+i, nameLabel, nameAnnotation, bulk, nameLabel, nameAnnotation)
 	}
@@ -363,7 +441,7 @@ func TestNamespaceListKeepsOnlyTheKeysThatTheSyncReads(t *testing.T) {
 	})
 	ctx := context.Background()
 
-	items, err := syncer.namespaces(ctx, serviceToken, "c-1", projectLabel)
+	items, err := syncer.namespaces(ctx, serviceToken, "c-1", "")
 	if err != nil {
 		t.Fatalf("list the namespaces of c-1: %v", err)
 	}
@@ -379,6 +457,7 @@ func TestNamespaceListKeepsOnlyTheKeysThatTheSyncReads(t *testing.T) {
 	wantAnnotations := map[string]string{
 		"owner":               "alpha@example.com",
 		nameAnnotation:        "Alpha",
+		projectAnnotation:     "c-1:p-alpha",
 		managedLabelsKey:      "cost-center," + nameLabel,
 		managedAnnotationsKey: nameAnnotation + ",owner",
 	}
@@ -422,12 +501,13 @@ func TestReconcileRewritesARecordAboveTheBound(t *testing.T) {
 	page := `{"kind":"NamespaceList","items":[{"metadata":{"name":"alpha-filled","resourceVersion":"40",` +
 		`"labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1"},` +
 		`"annotations":{"owner":"alpha@example.com","drover-managed-annotations":"owner",` +
+		`"field.cattle.io/projectId":"c-1:p-alpha",` +
 		`"drover-managed-labels":"` + record + `"}}}]}`
 	rancher := newFakeRancher(t, listing("c-1", map[string]string{"": page}))
 	syncer, _ := newSyncer(t, rancher, tokenFile(t, serviceToken))
 	ctx := context.Background()
 
-	items, err := syncer.namespaces(ctx, serviceToken, "c-1", projectLabel)
+	items, err := syncer.namespaces(ctx, serviceToken, "c-1", "")
 	if err != nil {
 		t.Fatalf("list the namespaces of c-1: %v", err)
 	}
@@ -465,8 +545,8 @@ func TestNamespaceListFollowsTheContinueToken(t *testing.T) {
 		if got := list.query.Get("limit"); got != "500" {
 			t.Errorf("limit = %q, want 500", got)
 		}
-		if got := list.query.Get("labelSelector"); got != projectLabel {
-			t.Errorf("label selector = %q, want %q", got, projectLabel)
+		if got := list.query.Get("labelSelector"); got != "" {
+			t.Errorf("label selector = %q, want none", got)
 		}
 	}
 	if got := patchedPaths(rancher); !slices.Equal(got, []string{alphaMovedPath, alphaTwoPath, betaOnePath}) {
@@ -499,7 +579,7 @@ func TestNamespaceListFailsAfterASecondExpiredContinueToken(t *testing.T) {
 	rancher := newFakeRancher(t, twoPages(), expiring("page-2", 2))
 	syncer, _ := newSyncer(t, rancher, tokenFile(t, serviceToken))
 
-	_, err := syncer.namespaces(context.Background(), serviceToken, "c-1", projectLabel)
+	_, err := syncer.namespaces(context.Background(), serviceToken, "c-1", "")
 	var status statusError
 	if !errors.As(err, &status) || status.status != http.StatusGone {
 		t.Fatalf("error = %v, want status 410", err)

@@ -697,50 +697,30 @@ func (s *Syncer) dropBinding(ctx context.Context, token, cluster, collection str
 }
 
 // dropStrayRoleBindings deletes the role bindings of the service in a
-// namespace that left its project, or whose project gets no accounts. A
-// namespace of a project that the run does not know stays, because a project
-// can be newer than the project list of the run. A namespace of a pending
-// project stays too, because the check of its account namespace failed in
-// this run.
+// namespace in no project, or whose project gets no accounts. A namespace of
+// a project that the run does not know stays, because a project can be newer
+// than the project list of the run, and so does a namespace that the list of
+// the run does not have. A namespace of a pending project stays too, because
+// the check of its account namespace failed in this run.
 func (s *Syncer) dropStrayRoleBindings(ctx context.Context, token, cluster string, projects map[string]project, byName map[string]namespace, trusted map[string]string, pending map[string]bool, roleBindings []binding, run *counters) {
-	lost := make(map[string]bool)
 	for _, item := range roleBindings {
 		if !managedRoleBinding(item) {
 			continue
 		}
 		nsName := item.Metadata.Namespace
-		if member, listed := byName[nsName]; listed {
-			name := projectOf(member, cluster)
-			if _, ok := trusted[name]; ok || pending[name] {
-				continue
-			}
-			if _, known := projects[name]; !known && name != "" {
-				continue
-			}
-		} else {
-			gone, checked := lost[nsName]
-			if !checked {
-				gone = s.lostProject(ctx, token, cluster, nsName, run)
-				lost[nsName] = gone
-			}
-			if !gone {
-				continue
-			}
+		member, listed := byName[nsName]
+		if !listed {
+			continue
+		}
+		name := projectOf(member, cluster)
+		if _, ok := trusted[name]; ok || pending[name] {
+			continue
+		}
+		if _, known := projects[name]; !known && name != "" {
+			continue
 		}
 		s.dropBinding(ctx, token, cluster, roleBindingsPath(cluster, nsName), item, item.Metadata.Labels[accountProjectKey], run)
 	}
-}
-
-// lostProject reports whether the namespace nsName exists, is not in
-// Terminating, and has no project.
-func (s *Syncer) lostProject(ctx context.Context, token, cluster, nsName string, run *counters) bool {
-	var item namespace
-	found, err := s.getObject(ctx, token, namespacePath(cluster, nsName), &item)
-	if err != nil {
-		s.accountFailure(ctx, run, "the namespace request failed", err, "cluster", cluster, "namespace", nsName)
-		return false
-	}
-	return found && item.Metadata.DeletionTimestamp == "" && projectOf(item, cluster) == ""
 }
 
 // sweepAccountNamespaces deletes an account namespace whose project gets no

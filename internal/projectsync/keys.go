@@ -41,9 +41,7 @@ func namespaceKeys(cfg Config) (labels, annotations []string) {
 	if cfg.NameAnnotation != "" {
 		annotations = append(annotations, cfg.NameAnnotation)
 	}
-	if cfg.ServiceAccounts {
-		annotations = append(annotations, projectAnnotation)
-	}
+	annotations = append(annotations, projectAnnotation)
 	return labels, annotations
 }
 
