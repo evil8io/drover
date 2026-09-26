@@ -40,6 +40,7 @@ type metrics struct {
 	events     metric.Int64Counter
 	watches    metric.Int64UpDownCounter
 	changed    metric.Int64Counter
+	accounts   metric.Int64Counter
 }
 
 // newMetrics creates the instruments of the syncer, on the meter that
@@ -90,6 +91,13 @@ func newMetrics(provider metric.MeterProvider) (*metrics, error) {
 		return nil, err
 	}
 
+	accounts, err := meter.Int64Counter("drover.sync.accounts.changes",
+		metric.WithDescription("Writes of the service accounts, their namespaces, and their bindings."),
+		metric.WithUnit("1"))
+	if err != nil {
+		return nil, err
+	}
+
 	return &metrics{
 		reconciles: reconciles,
 		patched:    patched,
@@ -98,6 +106,7 @@ func newMetrics(provider metric.MeterProvider) (*metrics, error) {
 		events:     events,
 		watches:    watches,
 		changed:    changed,
+		accounts:   accounts,
 	}, nil
 }
 
@@ -146,4 +155,12 @@ func (m *metrics) projectChanged(ctx context.Context, cluster string) {
 // syncError records one error that a reconcile run logs.
 func (m *metrics) syncError(ctx context.Context) {
 	m.errors.Add(ctx, 1)
+}
+
+// accountChanged records one write of the accounts. kind is the object kind,
+// and action is create, update, move, or delete.
+func (m *metrics) accountChanged(ctx context.Context, kind, action string) {
+	m.accounts.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("kind", kind),
+		attribute.String("action", action)))
 }

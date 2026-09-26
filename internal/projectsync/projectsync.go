@@ -55,6 +55,9 @@ type Config struct {
 	// NameAnnotation is the annotation key that gets the display name of the
 	// project. Empty turns the annotation off.
 	NameAnnotation string
+	// ServiceAccounts keeps one ServiceAccount per project role for every
+	// project, in an account project of each cluster.
+	ServiceAccounts bool
 	// Interval is the time between two runs. Zero selects 60 s.
 	Interval time.Duration
 	// PatchRate bounds the namespace patches and the project namespace lists
@@ -90,6 +93,9 @@ type Syncer struct {
 	metrics        *metrics
 	tracer         trace.Tracer
 
+	// serviceAccounts turns the accounts on.
+	serviceAccounts bool
+
 	// readLabels and readAnnotations are the namespace keys that the sync
 	// reads. A decoded namespace keeps only these keys.
 	readLabels      []string
@@ -106,9 +112,15 @@ type Syncer struct {
 	watches *watchSet
 
 	// mu guards clusters, which the reconcile run and the project watch write,
-	// and a watcher reads.
+	// and a watcher reads, and accounts, which the reconcile run and the
+	// lister write, and the worker reads.
 	mu       sync.RWMutex
 	clusters map[string]map[string]project
+	accounts map[string]accountState
+
+	// selfMu guards self, the id of the service user.
+	selfMu sync.Mutex
+	self   string
 }
 
 // New returns a syncer for the configuration. It needs at least one label key,
@@ -129,8 +141,8 @@ func New(cfg Config) (*Syncer, error) {
 	if cfg.TokenFile == "" {
 		return nil, errors.New("the token file is required")
 	}
-	if len(cfg.Labels)+len(cfg.Annotations) == 0 && cfg.NameLabel == "" && cfg.NameAnnotation == "" {
-		return nil, errors.New("at least one label key, annotation key, name label key, or name annotation key is required")
+	if len(cfg.Labels)+len(cfg.Annotations) == 0 && cfg.NameLabel == "" && cfg.NameAnnotation == "" && !cfg.ServiceAccounts {
+		return nil, errors.New("at least one label key, annotation key, name label key, or name annotation key, or the service accounts, is required")
 	}
 	keys := slices.Concat(cfg.Labels, cfg.Annotations)
 	for _, key := range []string{cfg.NameLabel, cfg.NameAnnotation} {
@@ -192,6 +204,7 @@ func New(cfg Config) (*Syncer, error) {
 		annotations:     slices.Clone(cfg.Annotations),
 		nameLabel:       cfg.NameLabel,
 		nameAnnotation:  cfg.NameAnnotation,
+		serviceAccounts: cfg.ServiceAccounts,
 		readLabels:      readLabels,
 		readAnnotations: readAnnotations,
 		pageCap:         maxBody,
@@ -244,6 +257,7 @@ type counters struct {
 	projects   int
 	namespaces int
 	patched    int
+	accounts   int
 	errors     int
 }
 
@@ -252,6 +266,7 @@ func (c *counters) add(other counters) {
 	c.projects += other.projects
 	c.namespaces += other.namespaces
 	c.patched += other.patched
+	c.accounts += other.accounts
 	c.errors += other.errors
 }
 
@@ -439,6 +454,10 @@ func (s *Syncer) syncCluster(ctx context.Context, token, cluster string, project
 		if outcome == resultPatched {
 			run.patched++
 		}
+	}
+
+	if s.serviceAccounts {
+		s.syncAccounts(ctx, token, cluster, projects, items, run)
 	}
 }
 
@@ -668,9 +687,12 @@ func keysOf(values map[string]string) []string {
 }
 
 func (s *Syncer) logSummary(ctx context.Context, run counters) {
-	s.logger.InfoContext(ctx, "reconcile",
-		"clusters", run.clusters, "projects", run.projects, "namespaces", run.namespaces,
-		"patched", run.patched, "errors", run.errors)
+	attrs := []any{"clusters", run.clusters, "projects", run.projects, "namespaces", run.namespaces,
+		"patched", run.patched, "errors", run.errors}
+	if s.serviceAccounts {
+		attrs = append(attrs, "accounts_changed", run.accounts)
+	}
+	s.logger.InfoContext(ctx, "reconcile", attrs...)
 }
 
 // logListFailure writes the line of a failed namespace list of cluster. A 403

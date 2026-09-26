@@ -250,8 +250,16 @@ func (s *Syncer) streamNamespaces(ctx context.Context, cluster, resourceVersion 
 			if err != nil {
 				return "", err
 			}
-			if event.Type == watchAdded || event.Type == watchModified {
+			switch event.Type {
+			case watchAdded, watchModified:
 				patches.put(patchItem{target: s.pruneNamespace(item), origin: originWatch})
+			case watchDeleted:
+				// A namespace that loses its project label leaves the
+				// selection of the watch, and the watch sends DELETED for it.
+				if s.serviceAccounts {
+					target := s.pruneNamespace(item)
+					patches.put(patchItem{target: target, origin: originWatch, deleted: target.Metadata.DeletionTimestamp != ""})
+				}
 			}
 			return item.Metadata.ResourceVersion, nil
 		})
@@ -333,6 +341,7 @@ func (s *Syncer) readWatch(ctx context.Context, kind, cluster, path, selector, r
 // cluster bounds the patches per second.
 func (s *Syncer) patchWorker(ctx context.Context, cluster string, watch *clusterWatch) {
 	names := make(map[string]string)
+	seen := make(map[string]string)
 	for {
 		item, ok := watch.patches.next(ctx)
 		if !ok {
@@ -344,7 +353,12 @@ func (s *Syncer) patchWorker(ctx context.Context, cluster string, watch *cluster
 		default:
 		}
 		if watch.limiter.wait(ctx) {
-			s.applyPending(ctx, cluster, item, names)
+			if !item.deleted {
+				s.applyPending(ctx, cluster, item, names)
+			}
+			if s.serviceAccounts {
+				s.applyAccounts(ctx, cluster, watch, item, seen)
+			}
 		}
 		watch.patches.done()
 		if ctx.Err() != nil {
@@ -384,10 +398,11 @@ func (s *Syncer) applyPending(ctx context.Context, cluster string, item patchIte
 }
 
 // patchItem is a namespace that waits for a patch. origin names the path that
-// found it.
+// found it. deleted marks a namespace that the API server deleted.
 type patchItem struct {
-	target namespace
-	origin string
+	target  namespace
+	origin  string
+	deleted bool
 }
 
 // queue has the items of one cluster that wait for a worker, by the key that
