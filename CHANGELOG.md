@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.0](https://github.com/evil8io/drover/compare/v0.18.0...v0.19.0) (2026-09-26)
+
+
+### Features
+
+* **project-sync:** keep ServiceAccounts per project role ([#97](https://github.com/evil8io/drover/issues/97)) ([522879a](https://github.com/evil8io/drover/commit/522879a9eb9566734840d769c5d7e61dbd2cea38))
+
 ## [0.18.0](https://github.com/evil8io/drover/compare/v0.17.0...v0.18.0) (2026-09-25)
 
 
