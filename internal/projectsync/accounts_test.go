@@ -480,8 +480,10 @@ func TestReconcileDeletesAStrayBindingOnlyWhenTheNamespaceHasNoProject(t *testin
 	if got := filterMethod(fake.requestsOfPath(lostPath), http.MethodDelete); len(got) != 1 {
 		t.Errorf("DELETE requests of the binding without a project = %d, want 1", len(got))
 	}
-	if got := filterMethod(fake.requestsOfPath(namespacePath(acctCluster, "ns-x")), http.MethodGet); len(got) != 1 {
-		t.Errorf("GET requests of ns-x = %d, want 1", len(got))
+	// The reconcile list has no selector, so it already lists ns-x, and the
+	// stray binding check needs no extra request for it.
+	if got := filterMethod(fake.requestsOfPath(namespacePath(acctCluster, "ns-x")), http.MethodGet); len(got) != 0 {
+		t.Errorf("GET requests of ns-x = %d, want 0 (the reconcile list already has it)", len(got))
 	}
 
 	unknownPath := roleBindingsPath(acctCluster, "ns-y") + "/" + roleBindingName(accountRoles[0])

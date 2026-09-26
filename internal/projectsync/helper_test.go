@@ -31,18 +31,21 @@ const (
 	// The five namespaces of cluster c-1. alpha-two and alpha-moved need a
 	// patch. alpha-one is in the wanted state already, and its tier label
 	// belongs to the tenant, because the managed annotation does not name it.
-	// alpha-moved owns tier, and the project does not set it.
-	alphaOneItem    = `{"metadata":{"name":"alpha-one","resourceVersion":"11","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1","tier":"gold"},"annotations":{"owner":"alpha@example.com","drover-managed-labels":"cost-center","drover-managed-annotations":"owner"}}}`
-	alphaTwoItem    = `{"metadata":{"name":"alpha-two","resourceVersion":"12","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"old","tier":"gold"},"annotations":{}}}`
+	// alpha-moved owns tier, and the project does not set it. Rancher writes
+	// the project annotation next to the label on every namespace of a
+	// project; alpha-three has neither, and alpha-orphan's annotation names a
+	// project that the snapshot does not have.
+	alphaOneItem    = `{"metadata":{"name":"alpha-one","resourceVersion":"11","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1","tier":"gold"},"annotations":{"owner":"alpha@example.com","drover-managed-labels":"cost-center","drover-managed-annotations":"owner","field.cattle.io/projectId":"c-1:p-alpha"}}}`
+	alphaTwoItem    = `{"metadata":{"name":"alpha-two","resourceVersion":"12","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"old","tier":"gold"},"annotations":{"field.cattle.io/projectId":"c-1:p-alpha"}}}`
 	alphaThreeItem  = `{"metadata":{"name":"alpha-three","resourceVersion":"13","labels":{"other":"value"},"annotations":{}}}`
-	alphaOrphanItem = `{"metadata":{"name":"alpha-orphan","resourceVersion":"14","labels":{"field.cattle.io/projectId":"p-gone"},"annotations":{}}}`
-	alphaMovedItem  = `{"metadata":{"name":"alpha-moved","resourceVersion":"15","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1","tier":"gold"},"annotations":{"owner":"alpha@example.com","drover-managed-labels":"cost-center,tier","drover-managed-annotations":"owner"}}}`
+	alphaOrphanItem = `{"metadata":{"name":"alpha-orphan","resourceVersion":"14","labels":{"field.cattle.io/projectId":"p-gone"},"annotations":{"field.cattle.io/projectId":"c-1:p-gone"}}}`
+	alphaMovedItem  = `{"metadata":{"name":"alpha-moved","resourceVersion":"15","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1","tier":"gold"},"annotations":{"owner":"alpha@example.com","drover-managed-labels":"cost-center,tier","drover-managed-annotations":"owner","field.cattle.io/projectId":"c-1:p-alpha"}}}`
 
 	alphaNamespaces = `{"kind":"NamespaceList","items":[` +
 		alphaOneItem + `,` + alphaTwoItem + `,` + alphaThreeItem + `,` + alphaOrphanItem + `,` + alphaMovedItem + `]}`
 
 	betaNamespaces = `{"kind":"NamespaceList","items":[
-{"metadata":{"name":"beta-one","resourceVersion":"21","labels":{"field.cattle.io/projectId":"p-beta"},"annotations":{}}}
+{"metadata":{"name":"beta-one","resourceVersion":"21","labels":{"field.cattle.io/projectId":"p-beta"},"annotations":{"field.cattle.io/projectId":"c-2:p-beta"}}}
 ]}`
 
 	// nextPage is the pagination link of Rancher. Its host is the server URL of
@@ -80,6 +83,10 @@ type fakeRancher struct {
 	patchStatus map[string]int
 	// patchBody is the answer body of a patch that fails, by namespace name.
 	patchBody map[string]string
+	// freshNamespaces are the bodies that answer a GET of one namespace, by
+	// name. This is the read that refreshItem makes after a DELETED event
+	// without a deletionTimestamp. A name without an entry gets status 404.
+	freshNamespaces map[string]string
 	// lists are the pages of the namespace list of a cluster, by the continue
 	// token that selects the page. The empty token selects the first page. A
 	// cluster without an entry gets its fixed list.
@@ -195,6 +202,16 @@ func failPatch(namespace string, status int, body string) func(*fakeRancher) {
 	}
 }
 
+// refreshed serves body as the answer of a GET of the single namespace name.
+func refreshed(name, body string) func(*fakeRancher) {
+	return func(f *fakeRancher) {
+		if f.freshNamespaces == nil {
+			f.freshNamespaces = make(map[string]string)
+		}
+		f.freshNamespaces[name] = body
+	}
+}
+
 func (f *fakeRancher) serve(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	f.mu.Lock()
@@ -216,6 +233,8 @@ func (f *fakeRancher) serve(w http.ResponseWriter, r *http.Request) {
 		f.serveProjectWatch(w, r)
 	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/api/v1/namespaces"):
 		f.serveNamespaces(w, r)
+	case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/api/v1/namespaces/"):
+		f.serveNamespaceItem(w, r)
 	case r.Method == http.MethodPatch:
 		f.servePatch(w, r)
 	default:
@@ -268,6 +287,20 @@ func (f *fakeRancher) servePatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = io.WriteString(w, `{"kind":"Namespace"}`)
+}
+
+// serveNamespaceItem answers a GET of one namespace, by name from the freshNamespaces
+// bodies. A name without an entry gets status 404.
+func (f *fakeRancher) serveNamespaceItem(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+	f.mu.Lock()
+	body, ok := f.freshNamespaces[name]
+	f.mu.Unlock()
+	if !ok {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	_, _ = io.WriteString(w, body)
 }
 
 func (f *fakeRancher) serveNamespaces(w http.ResponseWriter, r *http.Request) {

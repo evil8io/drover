@@ -255,11 +255,11 @@ func (s *Syncer) streamNamespaces(ctx context.Context, cluster, resourceVersion 
 				patches.put(patchItem{target: s.pruneNamespace(item), origin: originWatch})
 			case watchDeleted:
 				// A namespace that loses its project label leaves the
-				// selection of the watch, and the watch sends DELETED for it.
-				if s.serviceAccounts {
-					target := s.pruneNamespace(item)
-					patches.put(patchItem{target: target, origin: originWatch, deleted: target.Metadata.DeletionTimestamp != ""})
-				}
+				// selection of the watch, and the watch sends DELETED for
+				// it, with the object before the change.
+				target := s.pruneNamespace(item)
+				deleted := target.Metadata.DeletionTimestamp != ""
+				patches.put(patchItem{target: target, origin: originWatch, deleted: deleted, refresh: !deleted})
 			}
 			return item.Metadata.ResourceVersion, nil
 		})
@@ -353,6 +353,9 @@ func (s *Syncer) patchWorker(ctx context.Context, cluster string, watch *cluster
 		default:
 		}
 		if watch.limiter.wait(ctx) {
+			if item.refresh {
+				item = s.refreshItem(ctx, cluster, item)
+			}
 			if !item.deleted {
 				s.applyPending(ctx, cluster, item, names)
 			}
@@ -376,8 +379,8 @@ func (s *Syncer) patchWorker(ctx context.Context, cluster string, watch *cluster
 func (s *Syncer) applyPending(ctx context.Context, cluster string, item patchItem, names map[string]string) {
 	target := item.target
 	name := target.Metadata.Name
-	projectName := target.Metadata.Labels[projectLabel]
-	source, ok := s.projectsOf(cluster)[projectName]
+	projectName := projectOf(target, cluster)
+	source, ok := sourceOf(s.projectsOf(cluster), projectName)
 	if !ok {
 		s.logger.DebugContext(ctx, "namespace skipped",
 			"cluster", cluster, "namespace", name, "project", projectName)
@@ -398,11 +401,40 @@ func (s *Syncer) applyPending(ctx context.Context, cluster string, item patchIte
 }
 
 // patchItem is a namespace that waits for a patch. origin names the path that
-// found it. deleted marks a namespace that the API server deleted.
+// found it. deleted marks a namespace that the API server deleted. refresh
+// marks a target from before its last change, which the worker reads again.
 type patchItem struct {
 	target  namespace
 	origin  string
 	deleted bool
+	refresh bool
+}
+
+// refreshItem reads the namespace of item again. A namespace that is gone
+// returns a deleted item. A failed read keeps the target of the event, and
+// the next reconcile run repeats the work.
+func (s *Syncer) refreshItem(ctx context.Context, cluster string, item patchItem) patchItem {
+	item.refresh = false
+	token, err := rancherclient.ReadToken(s.tokenFile)
+	if err != nil {
+		s.logFailure(ctx, slog.LevelWarn, "the namespace request failed", err,
+			"cluster", cluster, "namespace", item.target.Metadata.Name)
+		return item
+	}
+	var fresh namespace
+	found, err := s.getObject(ctx, token, namespacePath(cluster, item.target.Metadata.Name), &fresh)
+	if err != nil {
+		s.logFailure(ctx, slog.LevelWarn, "the namespace request failed", err,
+			"cluster", cluster, "namespace", item.target.Metadata.Name)
+		return item
+	}
+	if !found {
+		item.deleted = true
+		return item
+	}
+	item.target = s.pruneNamespace(fresh)
+	item.deleted = item.target.Metadata.DeletionTimestamp != ""
+	return item
 }
 
 // queue has the items of one cluster that wait for a worker, by the key that

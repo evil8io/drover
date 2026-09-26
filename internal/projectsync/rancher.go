@@ -277,9 +277,9 @@ func (s *Syncer) listNamespaces(ctx context.Context, token, cluster, selector st
 // token of the next page.
 func (s *Syncer) namespacePage(ctx context.Context, token, cluster, selector, next string) ([]namespace, string, error) {
 	path := namespacesPath(cluster)
-	query := url.Values{
-		"labelSelector": []string{selector},
-		"limit":         []string{strconv.Itoa(pageSize)},
+	query := url.Values{"limit": []string{strconv.Itoa(pageSize)}}
+	if selector != "" {
+		query.Set("labelSelector", selector)
 	}
 	if next != "" {
 		query.Set("continue", next)

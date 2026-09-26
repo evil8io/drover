@@ -22,17 +22,52 @@ const (
 		`{"name":"alpha-new","resourceVersion":"30","labels":{},"annotations":{}}}}`
 	modifiedEvent = `{"type":"MODIFIED","object":{"kind":"Namespace","metadata":` +
 		`{"name":"alpha-new","resourceVersion":"31",` +
-		`"labels":{"field.cattle.io/projectId":"p-alpha"},"annotations":{}}}}`
+		`"labels":{"field.cattle.io/projectId":"p-alpha"},` +
+		`"annotations":{"field.cattle.io/projectId":"c-1:p-alpha"}}}}`
 	// otherEvent is the event of a second namespace of project p-alpha.
 	otherEvent = `{"type":"MODIFIED","object":{"kind":"Namespace","metadata":` +
 		`{"name":"alpha-other","resourceVersion":"33",` +
-		`"labels":{"field.cattle.io/projectId":"p-alpha"},"annotations":{}}}}`
+		`"labels":{"field.cattle.io/projectId":"p-alpha"},` +
+		`"annotations":{"field.cattle.io/projectId":"c-1:p-alpha"}}}}`
 	bookmarkEvent = `{"type":"BOOKMARK","object":{"kind":"Namespace","metadata":{"resourceVersion":"32"}}}`
 	expiredEvent  = `{"type":"ERROR","object":{"kind":"Status","reason":"Expired",` +
 		`"message":"too old resource version: 5 (9)"}}`
 
 	terminatingBody = `{"kind":"Status","reason":"Forbidden",` +
 		`"message":"unable to create new content in namespace alpha-new because it is being terminated"}`
+
+	// departedEvent is a MODIFIED event of alpha-departed: Rancher kept its
+	// project label, but the project annotation is already gone.
+	departedEvent = `{"type":"MODIFIED","object":{"kind":"Namespace","metadata":` +
+		`{"name":"alpha-departed","resourceVersion":"35",` +
+		`"labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1"},` +
+		`"annotations":{"owner":"alpha@example.com","drover-managed-labels":"cost-center",` +
+		`"drover-managed-annotations":"owner"}}}}`
+
+	// deletedEvent is a DELETED event of alpha-departed without a
+	// deletionTimestamp: the namespace left the label selection of the watch.
+	// The API server sends the object from before the change, so its label
+	// and annotation still name p-alpha; the worker reads the namespace again
+	// before it acts.
+	deletedEvent = `{"type":"DELETED","object":{"kind":"Namespace","metadata":` +
+		`{"name":"alpha-departed","resourceVersion":"36",` +
+		`"labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1"},` +
+		`"annotations":{"owner":"alpha@example.com","drover-managed-labels":"cost-center",` +
+		`"drover-managed-annotations":"owner","field.cattle.io/projectId":"c-1:p-alpha"}}}}`
+
+	// deletedWithTimestampEvent is a DELETED event of a namespace that the API
+	// server deleted.
+	deletedWithTimestampEvent = `{"type":"DELETED","object":{"kind":"Namespace","metadata":` +
+		`{"name":"alpha-departed","resourceVersion":"37","deletionTimestamp":"2024-01-01T00:00:00Z",` +
+		`"labels":{"field.cattle.io/projectId":"p-alpha"},"annotations":{}}}}`
+
+	// freshDeparted is the current state of alpha-departed that the refresh
+	// GET answers after a DELETED event without a deletionTimestamp: no
+	// project label or annotation, with its records still on it.
+	freshDeparted = `{"metadata":{"name":"alpha-departed","resourceVersion":"38",` +
+		`"labels":{"cost-center":"cc-1"},` +
+		`"annotations":{"owner":"alpha@example.com","drover-managed-labels":"cost-center",` +
+		`"drover-managed-annotations":"owner"}}}`
 )
 
 // streamOnce fills the project snapshot with one reconcile run, then it reads
@@ -291,7 +326,8 @@ func TestWatchSkipsANamespaceOfAnUnknownProject(t *testing.T) {
 	t.Parallel()
 	event := `{"type":"MODIFIED","object":{"kind":"Namespace","metadata":` +
 		`{"name":"alpha-new","resourceVersion":"31",` +
-		`"labels":{"field.cattle.io/projectId":"p-gone"},"annotations":{}}}}`
+		`"labels":{"field.cattle.io/projectId":"p-gone"},` +
+		`"annotations":{"field.cattle.io/projectId":"c-1:p-gone"}}}}`
 	rancher, logs, _, err := streamOnce(t, watching("c-1", event))
 	if err != nil {
 		t.Fatalf("stream the namespace watch: %v", err)
@@ -301,6 +337,80 @@ func TestWatchSkipsANamespaceOfAnUnknownProject(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), `msg="namespace skipped" cluster=c-1 namespace=alpha-new project=p-gone`) {
 		t.Errorf("no skipped line for alpha-new:\n%s", logs.String())
+	}
+}
+
+// TestWatchRemovesTheRecordedKeysOfANamespaceThatLeftItsProject checks that a
+// MODIFIED event of a namespace whose project annotation is gone, while
+// Rancher still keeps its label, removes the keys of its records, and the
+// records themselves.
+func TestWatchRemovesTheRecordedKeysOfANamespaceThatLeftItsProject(t *testing.T) {
+	t.Parallel()
+	rancher, _, _, err := streamOnce(t, watching("c-1", departedEvent))
+	if err != nil {
+		t.Fatalf("stream the namespace watch: %v", err)
+	}
+	patches := requestsOfPathAndMethod(rancher, alphaDepartedPath, http.MethodPatch)
+	if len(patches) != 1 {
+		t.Fatalf("patch requests of %s = %d, want 1", alphaDepartedPath, len(patches))
+	}
+	if got := patches[0].body; got != alphaDepartedBody {
+		t.Errorf("patch of %s = %s, want %s", alphaDepartedPath, got, alphaDepartedBody)
+	}
+}
+
+// TestWatchRemovesTheRecordedKeysOfANamespaceDeletedWithoutADeletionTimestamp
+// checks that a DELETED event without a deletionTimestamp makes the worker
+// read the namespace again, and act on its current state: no project, so the
+// keys of its records, and the records, come off.
+func TestWatchRemovesTheRecordedKeysOfANamespaceDeletedWithoutADeletionTimestamp(t *testing.T) {
+	t.Parallel()
+	rancher, _, _, err := streamOnce(t,
+		watching("c-1", deletedEvent),
+		refreshed("alpha-departed", freshDeparted))
+	if err != nil {
+		t.Fatalf("stream the namespace watch: %v", err)
+	}
+	if got := len(requestsOfPathAndMethod(rancher, alphaDepartedPath, http.MethodGet)); got != 1 {
+		t.Errorf("GET requests of %s = %d, want 1", alphaDepartedPath, got)
+	}
+	patches := requestsOfPathAndMethod(rancher, alphaDepartedPath, http.MethodPatch)
+	if len(patches) != 1 {
+		t.Fatalf("patch requests of %s = %d, want 1", alphaDepartedPath, len(patches))
+	}
+	if got := patches[0].body; got != alphaDepartedBody {
+		t.Errorf("patch of %s = %s, want %s", alphaDepartedPath, got, alphaDepartedBody)
+	}
+}
+
+// TestWatchSendsNoPatchForANamespaceDeletedWithADeletionTimestamp checks that
+// a DELETED event with a deletionTimestamp is skipped outright: no refresh
+// read, and no patch.
+func TestWatchSendsNoPatchForANamespaceDeletedWithADeletionTimestamp(t *testing.T) {
+	t.Parallel()
+	rancher, _, _, err := streamOnce(t, watching("c-1", deletedWithTimestampEvent))
+	if err != nil {
+		t.Fatalf("stream the namespace watch: %v", err)
+	}
+	if got := requestsOfPath(rancher, alphaDepartedPath); len(got) != 0 {
+		t.Errorf("requests of %s = %d, want 0", alphaDepartedPath, len(got))
+	}
+}
+
+// TestWatchSendsNoPatchWhenTheRefreshFindsTheNamespaceGone checks that a 404
+// on the refresh read of a DELETED event marks the item deleted, so the
+// worker sends no patch.
+func TestWatchSendsNoPatchWhenTheRefreshFindsTheNamespaceGone(t *testing.T) {
+	t.Parallel()
+	rancher, _, _, err := streamOnce(t, watching("c-1", deletedEvent))
+	if err != nil {
+		t.Fatalf("stream the namespace watch: %v", err)
+	}
+	if got := len(requestsOfPathAndMethod(rancher, alphaDepartedPath, http.MethodGet)); got != 1 {
+		t.Errorf("GET requests of %s = %d, want 1", alphaDepartedPath, got)
+	}
+	if got := len(requestsOfPathAndMethod(rancher, alphaDepartedPath, http.MethodPatch)); got != 0 {
+		t.Errorf("PATCH requests of %s = %d, want 0", alphaDepartedPath, got)
 	}
 }
 

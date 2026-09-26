@@ -425,7 +425,7 @@ func (s *Syncer) byCluster(ctx context.Context, projects []project) map[string]m
 }
 
 func (s *Syncer) syncCluster(ctx context.Context, token, cluster string, projects map[string]project, run *counters) {
-	items, err := s.namespaces(ctx, token, cluster, projectLabel)
+	items, err := s.namespaces(ctx, token, cluster, "")
 	if err != nil {
 		run.errors++
 		s.logListFailure(ctx, err, cluster)
@@ -436,8 +436,8 @@ func (s *Syncer) syncCluster(ctx context.Context, token, cluster string, project
 	nameLabels := make(map[string]string)
 	for _, item := range items {
 		name := item.Metadata.Name
-		projectName := item.Metadata.Labels[projectLabel]
-		source, ok := projects[projectName]
+		projectName := projectOf(item, cluster)
+		source, ok := sourceOf(projects, projectName)
 		if !ok {
 			s.logger.DebugContext(ctx, "namespace skipped",
 				"cluster", cluster, "namespace", name, "project", projectName)
@@ -461,6 +461,18 @@ func (s *Syncer) syncCluster(ctx context.Context, token, cluster string, project
 	}
 }
 
+// sourceOf returns the project that the keys of a namespace of project name
+// come from. A namespace in no project gets an empty project, so the sync
+// removes the keys of its records. A project that the snapshot does not have
+// returns false.
+func sourceOf(projects map[string]project, name string) (project, bool) {
+	if name == "" {
+		return project{}, true
+	}
+	source, ok := projects[name]
+	return source, ok
+}
+
 // result is the outcome of one namespace.
 type result int
 
@@ -475,7 +487,7 @@ const (
 // metric. nameLabels caches the sanitised display name per project id.
 func (s *Syncer) applyNamespace(ctx context.Context, token, cluster string, source project, target namespace, nameLabels map[string]string, origin string) (result, error) {
 	name := target.Metadata.Name
-	projectName := target.Metadata.Labels[projectLabel]
+	projectName := projectOf(target, cluster)
 
 	value := s.nameLabelValue(ctx, cluster, source, nameLabels)
 	change := desired(source, target, s.labels, s.annotations, s.nameLabel, s.nameAnnotation, value)
@@ -513,9 +525,10 @@ func (s *Syncer) applyNamespace(ctx context.Context, token, cluster string, sour
 
 // nameLabelValue returns the sanitised label value of the project's display
 // name, cached in cache by project id. It logs one warning per project id when
-// the display name has no valid label value. An off name label returns "".
+// the display name has no valid label value. An off name label, and a
+// namespace in no project, return "".
 func (s *Syncer) nameLabelValue(ctx context.Context, cluster string, source project, cache map[string]string) string {
-	if s.nameLabel == "" {
+	if s.nameLabel == "" || source.ID == "" {
 		return ""
 	}
 	if value, ok := cache[source.ID]; ok {

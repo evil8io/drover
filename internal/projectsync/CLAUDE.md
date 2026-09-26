@@ -3,6 +3,7 @@
 Human doc: `docs/project-sync.md`. Update it with a behaviour change.
 
 - Rancher sets `field.cattle.io/projectId` on a new namespace about 3 s after the create. Act on `MODIFIED` as well as on `ADDED`, or a new namespace misses its keys until the next reconcile.
+- Read the project of a namespace from the annotation `field.cattle.io/projectId`, never from the label. Rancher sets the label from the annotation, but it keeps the label when the annotation goes, and it grants the project roles by the annotation. A kubectl removal of the annotation and a project delete leave the label. The Rancher UI "no project" move removes both in one write, so that namespace leaves the label selector of the watch with a DELETED event, and only a reconcile list without a selector finds it. That DELETED event has the object from before the change, verified on Kubernetes 1.35, so read the namespace again before acting on it.
 - The cluster set comes from `GET /v3/projects`, which Rancher filters by RBAC. Do not add a cluster list call. A cluster without a visible project has nothing to sync.
 - Prune every decoded namespace to the keys that the sync reads. A tenant controls the size of its namespace metadata, and the pod has a fixed memory limit.
 - Treat a record value above `maxRecordValue` (4096 bytes) as absent. A tenant can fill a record up to the 256 KiB annotation limit, and a record that the service writes is a short key list.
@@ -34,6 +35,5 @@ Verified live against Rancher 2.14.5, and against the source of Rancher 2.14.6 a
 - Delete an account namespace of an unknown project only after `GET /v3/projects/<cluster>:<project>` answers 404. Keep it on any other status. The project list of a run can be older than a new project.
 - Delete the bindings of a project before its account namespace. A binding names a ServiceAccount by namespace and name, not by uid, so a binding that outlives the namespace grants a tenant who creates that namespace name next.
 - Never set `blockOwnerDeletion` on an owner reference. It needs a right on the owner that the service user does not have.
-- Read the project of a namespace from the annotation `field.cattle.io/projectId`, never from the label. Rancher sets the label from the annotation, but it keeps the label when the annotation goes, and it grants the project roles by the annotation. A namespace that leaves its project thus stays on the namespace watch, whose label selector still matches, and the service acts on the MODIFIED event. A DELETED event comes only when the label goes too.
 - Rancher creates `<project>-namespaces-edit` and `<project>-namespaces-readonly` shortly after the project, also without a member or a namespace.
 - Send a PATCH as `application/merge-patch+json`. The API server answers 415 to `application/json`.
