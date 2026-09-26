@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.1](https://github.com/evil8io/drover/compare/v0.19.0...v0.19.1) (2026-09-26)
+
+
+### Bug Fixes
+
+* **project-sync:** remove the synced keys from a namespace in no project ([#100](https://github.com/evil8io/drover/issues/100)) ([239d46b](https://github.com/evil8io/drover/commit/239d46b3df844a3e1cd1dacccf857b5cee61135b))
+
 ## [0.19.0](https://github.com/evil8io/drover/compare/v0.18.0...v0.19.0) (2026-09-26)
 
 
