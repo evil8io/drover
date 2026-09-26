@@ -108,7 +108,7 @@ The service applies these rules:
 - The service uses an account namespace only in an account project. A tenant can create the name `drover-<project>` first in its own project. The service then writes a warning, gives the project no accounts, and deletes the bindings of the project.
 - A deleted account project leaves its namespaces in no project, because Rancher deletes only the namespaces with the annotation `field.cattle.io/creatorId`. The reconcile run creates a new account project, and it moves such a namespace into it when a ClusterRoleBinding of the service names the namespace as its owner.
 - The reconcile run deletes an account namespace whose project is gone, after Rancher answers 404 for that project. It deletes the bindings of the project first.
-- To make every token of a ServiceAccount invalid, delete the ServiceAccount. The next reconcile run creates it again.
+- To make every token of a ServiceAccount invalid, delete the ServiceAccount. The next reconcile run creates it again. Do not delete the account namespace for this. A binding names its ServiceAccount by namespace and name, and the garbage collector deletes the bindings only some time after the namespace. Until then, a tenant who creates a namespace of that name gets the rights of the bindings.
 
 ## Telemetry
 
