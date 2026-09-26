@@ -29,6 +29,7 @@ type projectSyncConfig struct {
 	annotations        []string
 	nameLabel          string
 	nameAnnotation     string
+	serviceAccounts    bool
 	interval           time.Duration
 	patchRate          float64
 	logLevel           slog.Level
@@ -71,6 +72,7 @@ func runProjectSync(args []string) int {
 		Annotations:        cfg.annotations,
 		NameLabel:          cfg.nameLabel,
 		NameAnnotation:     cfg.nameAnnotation,
+		ServiceAccounts:    cfg.serviceAccounts,
 		Interval:           cfg.interval,
 		PatchRate:          cfg.patchRate,
 		Logger:             logger,
@@ -106,6 +108,7 @@ func runProjectSync(args []string) int {
 		"annotations", cfg.annotations,
 		"name_label", cfg.nameLabel,
 		"name_annotation", cfg.nameAnnotation,
+		"service_accounts", cfg.serviceAccounts,
 	)
 
 	syncDone := make(chan struct{})
@@ -158,6 +161,8 @@ func parseProjectSyncConfig(args []string, output io.Writer, getenv func(string)
 	flags.StringVar(&nameLabel, "name-label", "", "label key on the namespace that gets the display name of the project")
 	flags.StringVar(&nameAnnotation, "name-annotation", "",
 		"annotation key on the namespace that gets the display name of the project")
+	flags.BoolVar(&cfg.serviceAccounts, "service-accounts", false,
+		"keep one ServiceAccount per project role for every project, in an account project of each cluster")
 	flags.DurationVar(&cfg.interval, "interval", 60*time.Second, "time between two runs")
 	flags.Float64Var(&cfg.patchRate, "patch-rate", 10,
 		"namespace patches and project namespace lists per second that the watches of one cluster send, together")
@@ -200,8 +205,8 @@ func parseProjectSyncConfig(args []string, output io.Writer, getenv func(string)
 	if cfg.nameAnnotation, err = parseNameKey("name-annotation", nameAnnotation); err != nil {
 		return projectSyncConfig{}, err
 	}
-	if len(cfg.labels)+len(cfg.annotations) == 0 && cfg.nameLabel == "" && cfg.nameAnnotation == "" {
-		return projectSyncConfig{}, errors.New("-labels, -annotations, -name-label or -name-annotation needs at least one key")
+	if len(cfg.labels)+len(cfg.annotations) == 0 && cfg.nameLabel == "" && cfg.nameAnnotation == "" && !cfg.serviceAccounts {
+		return projectSyncConfig{}, errors.New("-labels, -annotations, -name-label or -name-annotation needs at least one key, or -service-accounts must be set")
 	}
 	return cfg, nil
 }

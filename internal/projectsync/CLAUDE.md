@@ -20,3 +20,20 @@ Human doc: `docs/project-sync.md`. Update it with a behaviour change.
 - Take a token from the cluster limiter before the lister lists a project. A project owner can edit its Project in a loop, so an unlimited lister would repeat the list rapidly.
 - Replace the snapshot maps of a cluster on every change. Never mutate them in place, because a worker and the reconcile run read them without a lock.
 - A reconcile run that reads the project list before a Project change can overwrite that change in the snapshot, and patch the old values back. This is a known, accepted gap: the window lasts one list request, and the next event or run closes it.
+
+## Service accounts
+
+Verified against Rancher 2.14.5 and its webhook.
+
+- Trust an account project only by the label `drover-service-accounts` together with the annotation `field.cattle.io/creatorId` equal to the service user. A project owner can set the label on its own project. The webhook denies a change and an addition of the creator annotation on an update, also for an admin. A cluster member can create a project with the service user as creator, because no webhook compares the annotation with the requester, but Rancher then binds only the service user as owner, so the maker gets no role in it.
+- Create the account project without `field.cattle.io/no-creator-rbac`. The webhook rejects that annotation together with a creator, and a project without a creator fails the trust check.
+- Use an account namespace only in an account project. The name is no proof, because a tenant can create it first in its own project.
+- Move a namespace in no project into the account project only when a ClusterRoleBinding of the service names it as owner by uid. The namespace webhook checks `manage-namespaces` on the new project only, and nothing on a removal of the project annotation, so a project owner can put its own namespace, with its own RoleBindings, into no project.
+- Do not set `field.cattle.io/creatorId` on an account namespace. Rancher deletes a namespace with that annotation together with its project, and every token of its ServiceAccounts with it. Without it, a deleted account project leaves its namespaces in no project, and the next run moves them into a new account project.
+- Never bind `view` or `edit` in an account namespace. The API filter reviews the rules of a ServiceAccount in its own namespace, and such a binding makes the allowed set unbounded. See `internal/filter/CLAUDE.md`.
+- Delete an account namespace of an unknown project only after `GET /v3/projects/<cluster>:<project>` answers 404. Keep it on any other status. The project list of a run can be older than a new project.
+- Delete the bindings of a project before its account namespace. A binding names a ServiceAccount by namespace and name, not by uid, so a binding that outlives the namespace grants a tenant who creates that namespace name next.
+- Never set `blockOwnerDeletion` on an owner reference. It needs a right on the owner that the service user does not have.
+- Read the project of a namespace from the annotation `field.cattle.io/projectId`, never from the label. Rancher sets the label from the annotation, but it keeps the label when the annotation goes, and it grants the project roles by the annotation. A namespace that leaves its project thus stays on the namespace watch, whose label selector still matches, and the service acts on the MODIFIED event. A DELETED event comes only when the label goes too.
+- Rancher creates `<project>-namespaces-edit` and `<project>-namespaces-readonly` shortly after the project, also without a member or a namespace.
+- Send a PATCH as `application/merge-patch+json`. The API server answers 415 to `application/json`.

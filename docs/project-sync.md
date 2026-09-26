@@ -2,11 +2,20 @@
 
 This service copies labels and annotations of a Rancher project to every namespace of that project, because Rancher does not copy them. The `--labels` and `--annotations` flags are the allow list of keys. The value of the project wins, and the service overwrites a different value on the namespace. The service polls Rancher at every `--interval`, and it also keeps one namespace watch per cluster open, so that a new namespace gets its keys within a few seconds. It keeps one project watch too, so a project label, annotation, or display name change reaches its namespaces within seconds. One replica is enough, because every run is a full reconcile. A namespace list that returns status 403 means that the service user may not list namespaces on that cluster. The service writes a warning with the cluster id and continues with the next cluster.
 
+With `--service-accounts`, the service also keeps three ServiceAccounts per Rancher project, one per project role. A CI job of a project authenticates with a token of such a ServiceAccount, through the Rancher proxy. See [Service accounts](#service-accounts).
+
 ## Requirements
 
 1. A Rancher service user with `get`, `list`, `watch`, and `patch` on `namespaces`, in every cluster whose namespaces the service syncs. A `cluster-owner` binding also covers that.
 2. The same service user with `list` and `watch` on `projects` of `management.cattle.io`, cluster-wide, in the Rancher cluster. The Rancher cluster is the cluster that Rancher itself runs in, cluster id `local`. A `ClusterRoleTemplateBinding` on that cluster, with a role template that has those two verbs, gives this permission. The bindings on the other clusters do not give it. Without it, a project watch request answers with status 403. The service then writes one warning per attempt, with the backoff between attempts, and the periodic reconcile run continues on its own.
 3. An API token of that service user, in a Secret that the service mounts.
+4. With `--service-accounts`, the same service user also needs these rights in every cluster, and in the Rancher cluster through a `ClusterRoleTemplateBinding`:
+   - every verb on `namespaces`, and `create` and `manage-namespaces` on `projects` of `management.cattle.io`. With these rights the user holds every rule of the Rancher ClusterRoles `<project>-namespaces-edit` and `<project>-namespaces-readonly`, so it binds them without `bind`.
+   - `get`, `list`, `watch`, `create`, and `delete` on `serviceaccounts`.
+   - `get`, `list`, `watch`, `create`, `update`, and `delete` on `rolebindings` and `clusterrolebindings`.
+   - `bind` on the ClusterRoles `admin`, `edit`, `view`, and `create-ns`, with `resourceNames`. Do not grant `bind` on every ClusterRole, because that equals cluster admin.
+
+   Give the service its own service user. The API filter is on the request path of every tenant, and its user needs only the namespace list.
 
 ## Configuration
 
@@ -22,6 +31,7 @@ This service copies labels and annotations of a Rancher project to every namespa
 | `--annotations` | | Comma-separated annotation keys of a project to copy. |
 | `--name-label` | | Label key on the namespace that gets the display name of the project. |
 | `--name-annotation` | | Annotation key on the namespace that gets the display name of the project. |
+| `--service-accounts` | `false` | Keep three ServiceAccounts per project, one per project role. |
 | `--interval` | `60s` | Time between two runs. |
 | `--patch-rate` | `10` | Namespace patches and project namespace lists per second that the watches of one cluster send, together. |
 | `--listen` | `:8080` | Address the service listens on. |
@@ -31,7 +41,7 @@ This service copies labels and annotations of a Rancher project to every namespa
 | `--otlp-metrics` | `true` | Send metrics to the OTLP endpoint. |
 | `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | `service.name` resource attribute. |
 
-The flags need at least one label key, annotation key, name label key, or name annotation key. A key must be a valid Kubernetes label or annotation key. A key whose prefix is `cattle.io`, `kubernetes.io`, or `k8s.io`, or a subdomain of one of them, is not valid, because Rancher and Kubernetes own those domains.
+The flags need at least one label key, annotation key, name label key, or name annotation key, or `--service-accounts`. A key must be a valid Kubernetes label or annotation key. A key whose prefix is `cattle.io`, `kubernetes.io`, or `k8s.io`, or a subdomain of one of them, is not valid, because Rancher and Kubernetes own those domains.
 
 The `--name-annotation` value is the raw display name of the project. The `--name-label` value is a sanitised copy: the service replaces every character outside `[A-Za-z0-9._-]` with `-`, and cuts the result to 63 characters. It then trims the leading and trailing characters that are not alphanumeric. A name that sanitises to an empty value gets no label, and the service writes one warning line for that project in that run.
 
@@ -73,6 +83,33 @@ A display name change clears the name cache of the worker first, so the worker c
 
 A project owner edits the labels, the annotations, and the display name of its own project. The values that the sync copies are tenant input, as they were with the reconcile run. The project watch only shortens the delay before a change reaches its namespaces. The queue and the shared limiter of a cluster bound the requests that a storm of project edits causes. The project watch never starts a reconcile run. The service logs project ids and key names, never a display name or a value.
 
+## Service accounts
+
+With `--service-accounts`, the service keeps these objects in every cluster that the reconcile run syncs:
+
+1. One account project, with the display name `drover`, the label `drover-service-accounts: "true"`, and the service user in the annotation `field.cattle.io/creatorId`. Rancher then binds the service user as its owner, and no tenant gets a role in it. The service creates the project when the cluster has none.
+2. Per tenant project, the account namespace `drover-<project>` in the account project. `<project>` is the project name, for example `p-n52j9`.
+3. In the account namespace, the ServiceAccounts `project-owner`, `project-member`, and `read-only`. The user name of such a ServiceAccount is `system:serviceaccount:drover-<project>:<role>`.
+4. In every namespace of the tenant project, the RoleBindings `drover-project-owner`, `drover-project-member`, and `drover-read-only`, to the ClusterRoles `admin`, `edit`, and `view`.
+5. Per role, the ClusterRoleBinding `drover-<project>-<role>-namespaces`, to the Rancher ClusterRole `<project>-namespaces-edit` for `project-owner` and `project-member`, and to `<project>-namespaces-readonly` for `read-only`. Rancher keeps the `resourceNames` of these ClusterRoles equal to the project namespaces, so the API filter answers the namespace list of the ServiceAccount from them.
+6. For `project-owner` and `project-member`, the ClusterRoleBinding `drover-<project>-<role>-create-ns`, to the Rancher ClusterRole `create-ns`.
+
+Every object has the labels `drover-project: <project>` and `drover-role: <role>`, and every binding has one subject. The account namespace owns the bindings, so the garbage collector deletes them with it.
+
+A tenant project is every project but the System project, the Default project, and an account project. The service reads the System and the Default project from the labels `authz.management.cattle.io/system-project` and `authz.management.cattle.io/default-project`.
+
+The ServiceAccounts get the Kubernetes rights of a project role through `admin`, `edit`, and `view`. They do not get the extra rules of the Rancher role templates, for example the monitoring resources or the read of nodes.
+
+The service applies these rules:
+
+- A namespace that joins a project gets the three RoleBindings. A namespace that moves to another project gets the subjects and the owner of the new project. A namespace that leaves its project loses the RoleBindings. The namespace watch starts this work within seconds.
+- A new project gets its account namespace, ServiceAccounts, and ClusterRoleBindings within seconds, through the project watch.
+- The reconcile run corrects a binding that differs and creates a missing object again. A tenant can edit or delete the RoleBindings in its namespaces, and the next run restores them.
+- The service uses an account namespace only in an account project. A tenant can create the name `drover-<project>` first in its own project. The service then writes a warning, gives the project no accounts, and deletes the bindings of the project.
+- A deleted account project leaves its namespaces in no project, because Rancher deletes only the namespaces with the annotation `field.cattle.io/creatorId`. The reconcile run creates a new account project, and it moves such a namespace into it when a ClusterRoleBinding of the service names the namespace as its owner.
+- The reconcile run deletes an account namespace whose project is gone, after Rancher answers 404 for that project. It deletes the bindings of the project first.
+- To make every token of a ServiceAccount invalid, delete the ServiceAccount. The next reconcile run creates it again.
+
 ## Telemetry
 
 With `--otlp-endpoint` set, one reconcile run produces a span named `reconcile`, and one patched namespace produces a span named `patch_namespace`. That span has the attributes `drover.cluster`, `drover.origin`, and `k8s.namespace.name`. The `drover.origin` value is `reconcile`, `watch`, or `project`. The service exports these metrics:
@@ -86,5 +123,6 @@ With `--otlp-endpoint` set, one reconcile run produces a span named `reconcile`,
 | `drover.sync.events` | Counter | `1` | `cluster`, `kind`, `type` |
 | `drover.sync.watches.open` | UpDownCounter | `1` | `cluster`, `kind` |
 | `drover.sync.projects.changed` | Counter | `1` | `cluster` |
+| `drover.sync.accounts.changes` | Counter | `1` | `kind`, `action` |
 
-The `kind` attribute is `namespace` or `project`. For the project watch, `cluster` is always `local`.
+The `kind` attribute of the watch metrics is `namespace` or `project`. For the project watch, `cluster` is always `local`. The `kind` attribute of `drover.sync.accounts.changes` is `project`, `namespace`, `serviceaccount`, `rolebinding`, or `clusterrolebinding`, and `action` is `create`, `update`, `move`, or `delete`. With `--service-accounts`, the summary line of a run has the field `accounts_changed`, and every write has a line `account object changed`.

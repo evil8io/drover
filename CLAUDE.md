@@ -11,7 +11,8 @@ drover is a set of tenancy extensions for Rancher: one Go binary, one subcommand
 
 - The Helm chart is not in this repository. It is `charts/drover` in the public [evil8io/charts](https://github.com/evil8io/charts) repository, synced from a private source. Do not add a chart here. A release here reaches a deployment only after an `appVersion` bump in that chart.
 - The image entrypoint is the binary, and the chart passes the subcommand and the flags as arguments.
-- Every component authenticates as one Rancher service user through one token file. `rotate-token` is the only writer of that Secret, and the other two components read the file on every use, so a rotation needs no restart. Keep that split.
+- The API filter and `project-sync` authenticate as two Rancher service users, each through its own token file. The filter is on the request path of every tenant and needs only the namespace list, and `project-sync` with `--service-accounts` writes namespaces and bindings. Keep the users apart, so the rights of the sync never serve a tenant request.
+- `rotate-token` runs once per service user, and it is the only writer of each token Secret. The other components read the file on every use, so a rotation needs no restart. Keep that split.
 - This repository has unit tests only. The integration tests run in the private repository that deploys the chart. A change that a unit test cannot cover needs a live check with a real client; name the client in the pull request.
 
 ## Components

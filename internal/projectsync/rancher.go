@@ -34,8 +34,16 @@ type project struct {
 	ID          string            `json:"id"`
 	ClusterID   string            `json:"clusterId"`
 	Name        string            `json:"name"`
+	CreatorID   string            `json:"creatorId"`
+	Created     string            `json:"created"`
 	Labels      map[string]string `json:"labels"`
 	Annotations map[string]string `json:"annotations"`
+
+	// reserved marks the System and the Default project, and marked marks a
+	// project with the label of the account project. pruneProject sets both
+	// before it drops the labels that the sync does not copy.
+	reserved bool
+	marked   bool
 }
 
 // pagination is the part of the pagination of a Rancher collection that the
@@ -47,10 +55,12 @@ type pagination struct {
 // namespace is the part of a Kubernetes namespace that the service reads.
 type namespace struct {
 	Metadata struct {
-		Name            string            `json:"name"`
-		ResourceVersion string            `json:"resourceVersion"`
-		Labels          map[string]string `json:"labels"`
-		Annotations     map[string]string `json:"annotations"`
+		Name              string            `json:"name"`
+		UID               string            `json:"uid"`
+		ResourceVersion   string            `json:"resourceVersion"`
+		DeletionTimestamp string            `json:"deletionTimestamp"`
+		Labels            map[string]string `json:"labels"`
+		Annotations       map[string]string `json:"annotations"`
 	} `json:"metadata"`
 }
 
@@ -65,7 +75,9 @@ type listMeta struct {
 func (s *Syncer) pruneNamespace(item namespace) namespace {
 	var out namespace
 	out.Metadata.Name = item.Metadata.Name
+	out.Metadata.UID = item.Metadata.UID
 	out.Metadata.ResourceVersion = item.Metadata.ResourceVersion
+	out.Metadata.DeletionTimestamp = item.Metadata.DeletionTimestamp
 	out.Metadata.Labels = pick(item.Metadata.Labels, s.readLabels)
 	out.Metadata.Annotations = pick(item.Metadata.Annotations, s.readAnnotations)
 	// A tenant can fill a record up to the annotation limit of the API server,
@@ -81,6 +93,8 @@ func (s *Syncer) pruneNamespace(item namespace) namespace {
 // pruneProject returns item with only the labels and the annotations that the
 // sync copies.
 func (s *Syncer) pruneProject(item project) project {
+	item.reserved = item.Labels[systemProjectLabel] == "true" || item.Labels[defaultProjectLabel] == "true"
+	item.marked = item.Labels[accountProjectLabel] == "true"
 	item.Labels = pick(item.Labels, s.labels)
 	item.Annotations = pick(item.Annotations, s.annotations)
 	return item

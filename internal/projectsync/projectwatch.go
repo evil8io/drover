@@ -22,11 +22,12 @@ const (
 // the service reads.
 type projectObject struct {
 	Metadata struct {
-		Name            string            `json:"name"`
-		Namespace       string            `json:"namespace"`
-		ResourceVersion string            `json:"resourceVersion"`
-		Labels          map[string]string `json:"labels"`
-		Annotations     map[string]string `json:"annotations"`
+		Name              string            `json:"name"`
+		Namespace         string            `json:"namespace"`
+		ResourceVersion   string            `json:"resourceVersion"`
+		CreationTimestamp string            `json:"creationTimestamp"`
+		Labels            map[string]string `json:"labels"`
+		Annotations       map[string]string `json:"annotations"`
 	} `json:"metadata"`
 	Spec struct {
 		ClusterName string `json:"clusterName"`
@@ -59,6 +60,8 @@ func (s *Syncer) decodeProject(raw json.RawMessage) (watchedProject, error) {
 			ID:          object.Metadata.Namespace + ":" + object.Metadata.Name,
 			ClusterID:   object.Spec.ClusterName,
 			Name:        object.Spec.DisplayName,
+			CreatorID:   object.Metadata.Annotations[creatorAnnotation],
+			Created:     object.Metadata.CreationTimestamp,
 			Labels:      object.Metadata.Labels,
 			Annotations: object.Metadata.Annotations,
 		}),
@@ -124,6 +127,8 @@ func (s *Syncer) applyProject(ctx context.Context, watches *watchSet, eventType 
 
 	old, known := projects[item.name]
 	if known && old.Name == item.project.Name &&
+		old.CreatorID == item.project.CreatorID &&
+		old.reserved == item.project.reserved && old.marked == item.project.marked &&
 		maps.Equal(old.Labels, item.project.Labels) &&
 		maps.Equal(old.Annotations, item.project.Annotations) {
 		s.logger.DebugContext(ctx, "project unchanged", "cluster", cluster, "project", id)
@@ -199,6 +204,9 @@ func (s *Syncer) listProject(ctx context.Context, cluster, name string, patches 
 		s.logFailure(ctx, slog.LevelWarn, "the namespace list request failed", err,
 			"cluster", cluster, "project", name)
 		return
+	}
+	if s.serviceAccounts {
+		s.ensureProjectAccounts(ctx, token, cluster, name)
 	}
 	items, err := s.namespaces(ctx, token, cluster, projectLabel+"="+name)
 	if err != nil {
