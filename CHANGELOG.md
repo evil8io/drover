@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.0](https://github.com/evil8io/drover/compare/v0.20.0...v0.21.0) (2026-09-27)
+
+
+### Features
+
+* **project-sync:** send the Rancher CA in the OpenBao config ([#104](https://github.com/evil8io/drover/issues/104)) ([c6051bf](https://github.com/evil8io/drover/commit/c6051bf7cdbaab42e99e69a8a9665c4bf1b26727))
+
 ## [0.20.0](https://github.com/evil8io/drover/compare/v0.19.1...v0.20.0) (2026-09-27)
 
 
