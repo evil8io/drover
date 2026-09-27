@@ -25,6 +25,10 @@ func accountNamespaceIn(project string) namespace {
 	return ns
 }
 
+// testCA is a Rancher CA chain in the tests. The service passes it on as it
+// is, so it needs no valid certificate.
+const testCA = "-----BEGIN CERTIFICATE-----\nMIIBtest\n-----END CERTIFICATE-----\n"
+
 func wantOpenBaoRules() []policyRule {
 	names := []string{"project-owner", "project-member", "read-only"}
 	return []policyRule{
@@ -213,6 +217,9 @@ func TestReconcileGivesNoOpenBaoConfigWhenATenantOwnsTheNamespace(t *testing.T) 
 	if got := fake.requestsOfPath(tokenRequestPath(acctCluster)); len(got) != 0 {
 		t.Errorf("token requests = %d, want 0", len(got))
 	}
+	if got := fake.requestsOfPath(rancherCAPath); len(got) != 0 {
+		t.Errorf("Rancher CA requests without a ready cluster = %d, want 0", len(got))
+	}
 	if got := setup.bao.all(); len(got) != 0 {
 		t.Errorf("OpenBao requests = %d, want 0", len(got))
 	}
@@ -348,6 +355,7 @@ func TestReconcileWritesTheConfigOfAClusterIntoOpenBao(t *testing.T) {
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	fake := newAccountsFake(t)
 	fake.addProject("p-alpha", nil)
+	fake.setCA(testCA, 0)
 	setup := newOpenBaoSetup(t, fake, func(cfg *Config) { cfg.MeterProvider = provider })
 
 	setup.syncer.reconcile(context.Background())
@@ -387,6 +395,7 @@ func TestReconcileWritesTheConfigOfAClusterIntoOpenBao(t *testing.T) {
 	}
 	wantConfig := map[string]any{
 		"kubernetes_host":      baoRancher + "/k8s/clusters/c-1",
+		"kubernetes_ca_cert":   testCA,
 		"service_account_jwt":  "sa-token-1",
 		"disable_local_ca_jwt": true,
 	}
@@ -599,6 +608,81 @@ func TestReconcileWritesAgainForANewServiceAccount(t *testing.T) {
 	}
 }
 
+func TestReconcileSendsAnEmptyCAForAPublicRancherCertificate(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	setup := newOpenBaoSetup(t, fake)
+
+	setup.syncer.reconcile(context.Background())
+
+	writes := setup.bao.writes(acctCluster)
+	if len(writes) != 1 {
+		t.Fatalf("OpenBao config writes = %d, want 1", len(writes))
+	}
+	ca, ok := decodeMap(t, writes[0].body)["kubernetes_ca_cert"]
+	if !ok || ca != "" {
+		t.Errorf("kubernetes_ca_cert = %v, present %v; want an empty string", ca, ok)
+	}
+}
+
+func TestReconcileWritesANewRancherCAInsideTheWindow(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	fake.setCA(testCA, 0)
+	setup := newOpenBaoSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+
+	rotated := strings.Replace(testCA, "MIIB", "MIIC", 1)
+	fake.setCA(rotated, 0)
+	setup.clock.advance(time.Hour)
+	setup.syncer.reconcile(context.Background())
+	setup.syncer.reconcile(context.Background())
+
+	writes := setup.bao.writes(acctCluster)
+	if len(writes) != 2 {
+		t.Fatalf("OpenBao config writes = %d, want 2", len(writes))
+	}
+	if got := decodeMap(t, writes[1].body)["kubernetes_ca_cert"]; got != rotated {
+		t.Errorf("kubernetes_ca_cert of the second write = %v, want the new CA", got)
+	}
+}
+
+func TestReconcileWritesNothingAfterAFailedRancherCARead(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	fake.setCA(testCA, http.StatusInternalServerError)
+	setup := newOpenBaoSetup(t, fake)
+
+	setup.syncer.reconcile(context.Background())
+
+	logs := setup.logs.String()
+	if !strings.Contains(logs, `level=ERROR msg="the Rancher CA request failed"`) {
+		t.Errorf("no error line for the CA read:\n%s", logs)
+	}
+	if !strings.Contains(logs, "errors=1") {
+		t.Errorf("the summary line does not count the failed CA read:\n%s", logs)
+	}
+	if got := fake.requestsOfPath(tokenRequestPath(acctCluster)); len(got) != 0 {
+		t.Errorf("token requests after a failed CA read = %d, want 0", len(got))
+	}
+	if got := setup.bao.all(); len(got) != 0 {
+		t.Errorf("OpenBao requests after a failed CA read = %d, want 0", len(got))
+	}
+
+	fake.setCA(testCA, 0)
+	setup.syncer.reconcile(context.Background())
+	writes := setup.bao.writes(acctCluster)
+	if len(writes) != 1 {
+		t.Fatalf("OpenBao config writes after the second run = %d, want 1", len(writes))
+	}
+	if got := decodeMap(t, writes[0].body)["kubernetes_ca_cert"]; got != testCA {
+		t.Errorf("kubernetes_ca_cert = %v, want the CA", got)
+	}
+}
+
 func TestRefreshOpenBaoLogsInOncePerRun(t *testing.T) {
 	t.Parallel()
 	fake := newAccountsFake(t)
@@ -610,6 +694,9 @@ func TestRefreshOpenBaoLogsInOncePerRun(t *testing.T) {
 
 	if got := setup.bao.logins(); len(got) != 1 {
 		t.Errorf("OpenBao logins = %d, want 1", len(got))
+	}
+	if got := fake.requestsOfPath(rancherCAPath); len(got) != 1 {
+		t.Errorf("Rancher CA requests = %d, want 1", len(got))
 	}
 	for _, cluster := range []string{"c-1", "c-2"} {
 		if got := fake.requestsOfPath(tokenRequestPath(cluster)); len(got) != 1 {
