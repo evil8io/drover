@@ -38,6 +38,11 @@ const (
 
 	// maxOpenBaoBody bounds the answer of OpenBao that the service reads.
 	maxOpenBaoBody = 1 << 20
+
+	// rancherCASetting is the Rancher setting with the CA chain of a private
+	// Rancher certificate. It is empty for a certificate of a public CA.
+	rancherCASetting = "cacerts"
+	rancherCAPath    = "/v3/settings/" + rancherCASetting
 )
 
 // OpenBaoConfig configures the write of the Kubernetes secrets engine config
@@ -84,11 +89,13 @@ type openbaoWriter struct {
 	written map[string]openbaoEntry
 }
 
-// openbaoEntry is the token of the last successful write of a cluster.
+// openbaoEntry is the token and the Rancher CA of the last successful write of
+// a cluster.
 type openbaoEntry struct {
 	// account is the uid of the ServiceAccount of the token. A new
 	// ServiceAccount makes every token of the old one invalid.
 	account string
+	ca      string
 	issued  time.Time
 	expiry  time.Time
 }
@@ -315,14 +322,25 @@ func (s *Syncer) ensureOpenBaoAccount(ctx context.Context, token, cluster string
 	return created.Metadata.UID
 }
 
-// refreshOpenBao writes the config of every cluster of ready whose token is
-// due. ready maps a cluster to the uid of its OpenBao ServiceAccount. The
-// service logs in once, and only when a cluster is due. names are the
-// clusters of the run, and the writer forgets every other cluster.
+// refreshOpenBao writes the config of every cluster of ready that is due.
+// ready maps a cluster to the uid of its OpenBao ServiceAccount. The service
+// reads the Rancher CA once, and logs in once, only when a cluster is due. A
+// failed read of the CA writes nothing, so that no write clears the CA of a
+// private Rancher certificate. names are the clusters of the run, and the
+// writer forgets every other cluster.
 func (s *Syncer) refreshOpenBao(ctx context.Context, token string, names []string, ready map[string]string, run *counters) {
 	w := s.openbao
 	w.keep(names)
-	due := w.due(ready)
+	if len(ready) == 0 {
+		return
+	}
+	ca, err := s.rancherCA(ctx, token)
+	if err != nil {
+		run.errors++
+		s.logFailure(ctx, slog.LevelError, "the Rancher CA request failed", err)
+		return
+	}
+	due := w.due(ready, ca)
 	if len(due) == 0 {
 		return
 	}
@@ -339,7 +357,7 @@ func (s *Syncer) refreshOpenBao(ctx context.Context, token string, names []strin
 
 	var mu sync.Mutex
 	eachCluster(due, func(cluster string) {
-		if s.writeOpenBao(ctx, token, clientToken, cluster, ready[cluster]) {
+		if s.writeOpenBao(ctx, token, clientToken, cluster, ready[cluster], ca) {
 			return
 		}
 		mu.Lock()
@@ -360,10 +378,11 @@ func (s *Syncer) loginOpenBao(ctx context.Context) (string, error) {
 }
 
 // writeOpenBao requests a new token of the OpenBao ServiceAccount of cluster,
-// and writes it into the config of the cluster. account is the uid of that
-// ServiceAccount. It returns false when the write fails with an error. A
-// missing mount is no error, and the next run tries again.
-func (s *Syncer) writeOpenBao(ctx context.Context, token, clientToken, cluster, account string) bool {
+// and writes it into the config of the cluster, with the Rancher CA ca.
+// account is the uid of that ServiceAccount. It returns false when the write
+// fails with an error. A missing mount is no error, and the next run tries
+// again.
+func (s *Syncer) writeOpenBao(ctx context.Context, token, clientToken, cluster, account, ca string) bool {
 	ctx, span := s.tracer.Start(ctx, "openbao_config", trace.WithAttributes(attribute.String("drover.cluster", cluster)))
 	defer span.End()
 	w := s.openbao
@@ -378,7 +397,7 @@ func (s *Syncer) writeOpenBao(ctx context.Context, token, clientToken, cluster, 
 		return false
 	}
 
-	err = w.writeConfig(ctx, clientToken, cluster, jwt)
+	err = w.writeConfig(ctx, clientToken, cluster, jwt, ca)
 	if missingMount(err) {
 		s.metrics.openbaoWritten(ctx, cluster, outcomeMissingMount)
 		s.logger.InfoContext(ctx, "the OpenBao mount does not exist yet",
@@ -390,7 +409,7 @@ func (s *Syncer) writeOpenBao(ctx context.Context, token, clientToken, cluster, 
 		return false
 	}
 
-	w.remember(cluster, openbaoEntry{account: account, issued: issued, expiry: expiry})
+	w.remember(cluster, openbaoEntry{account: account, ca: ca, issued: issued, expiry: expiry})
 	s.metrics.openbaoWritten(ctx, cluster, outcomeOK)
 	s.logger.InfoContext(ctx, "the OpenBao config is written",
 		"cluster", cluster, "expires", expiry.UTC().Format(time.RFC3339))
@@ -428,6 +447,29 @@ func (s *Syncer) requestToken(ctx context.Context, token, cluster string) (strin
 	return answer.Status.Token, answer.Status.ExpirationTimestamp, nil
 }
 
+// rancherCA returns the value of the Rancher setting cacerts: the CA chain of
+// a private Rancher certificate, or "" for a certificate of a public CA.
+func (s *Syncer) rancherCA(ctx context.Context, token string) (string, error) {
+	status, body, err := s.do(ctx, http.MethodGet, s.target(rancherCAPath, nil), token, "", nil)
+	if err != nil {
+		return "", err
+	}
+	if status != http.StatusOK {
+		return "", newStatusError(http.MethodGet, rancherCAPath, status, body)
+	}
+	var answer struct {
+		ID    string `json:"id"`
+		Value string `json:"value"`
+	}
+	if err := json.Unmarshal(body, &answer); err != nil {
+		return "", fmt.Errorf("decode the answer of GET %s: %w", rancherCAPath, err)
+	}
+	if answer.ID != rancherCASetting {
+		return "", fmt.Errorf("the answer of GET %s is not the setting %s", rancherCAPath, rancherCASetting)
+	}
+	return answer.Value, nil
+}
+
 // keep forgets every cluster that names does not have.
 func (w *openbaoWriter) keep(names []string) {
 	w.mu.Lock()
@@ -438,17 +480,19 @@ func (w *openbaoWriter) keep(names []string) {
 }
 
 // due returns the clusters of ready that need a write, sorted. A cluster needs
-// one without an entry, after a change of its ServiceAccount, and when less
-// than half of the lifetime of its token remains. OpenBao keeps a written
-// token and never renews it, so the other half is the time left for a retry.
-func (w *openbaoWriter) due(ready map[string]string) []string {
+// one without an entry, after a change of its ServiceAccount or of the Rancher
+// CA ca, and when less than half of the lifetime of its token remains. OpenBao
+// keeps a written token and never renews it, so the other half is the time
+// left for a retry.
+func (w *openbaoWriter) due(ready map[string]string, ca string) []string {
 	now := w.now()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	var out []string
 	for _, cluster := range slices.Sorted(maps.Keys(ready)) {
 		entry, ok := w.written[cluster]
-		if !ok || entry.account != ready[cluster] || entry.expiry.Sub(now) < entry.expiry.Sub(entry.issued)/2 {
+		if !ok || entry.account != ready[cluster] || entry.ca != ca ||
+			entry.expiry.Sub(now) < entry.expiry.Sub(entry.issued)/2 {
 			out = append(out, cluster)
 		}
 	}
@@ -484,15 +528,18 @@ func (w *openbaoWriter) login(ctx context.Context) (string, error) {
 }
 
 // writeConfig writes the config of the secrets engine mount of cluster. The
-// engine reaches the cluster through the Rancher proxy, with jwt.
-func (w *openbaoWriter) writeConfig(ctx context.Context, clientToken, cluster, jwt string) error {
+// engine reaches the cluster through the Rancher proxy, with jwt, and verifies
+// Rancher with ca. An empty ca clears the stored CA, so that OpenBao verifies
+// with the system roots.
+func (w *openbaoWriter) writeConfig(ctx context.Context, clientToken, cluster, jwt, ca string) error {
 	host := w.rancher
 	host.Path = clusterPath(cluster)
 	body := struct {
 		Host              string `json:"kubernetes_host"`
+		CACert            string `json:"kubernetes_ca_cert"`
 		JWT               string `json:"service_account_jwt"`
 		DisableLocalCAJWT bool   `json:"disable_local_ca_jwt"`
-	}{Host: host.String(), JWT: jwt, DisableLocalCAJWT: true}
+	}{Host: host.String(), CACert: ca, JWT: jwt, DisableLocalCAJWT: true}
 	return w.post(ctx, w.mountPrefix+"/"+cluster+"/config", clientToken, body, nil)
 }
 

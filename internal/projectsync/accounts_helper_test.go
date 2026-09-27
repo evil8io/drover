@@ -82,6 +82,10 @@ type accountsFake struct {
 	tokenClock func() time.Time
 	tokenCap   time.Duration
 	tokens     int
+	// ca is the value of the setting cacerts, and caStatus is the status that
+	// a read of it answers instead, zero for none.
+	ca       string
+	caStatus int
 }
 
 func newAccountsFake(t *testing.T) *accountsFake {
@@ -308,6 +312,8 @@ func (f *accountsFake) serve(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && path == usersPath:
 		f.serveSelf(w)
+	case r.Method == http.MethodGet && path == rancherCAPath:
+		f.serveCA(w)
 	case r.Method == http.MethodGet && path == projectsPath:
 		f.serveProjectList(w)
 	case r.Method == http.MethodGet && strings.HasPrefix(path, projectsPath+"/"):
@@ -419,6 +425,25 @@ func (f *accountsFake) serveSelf(w http.ResponseWriter) {
 	}{Data: []struct {
 		ID string `json:"id"`
 	}{{ID: self}}})
+}
+
+func (f *accountsFake) setCA(ca string, status int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ca, f.caStatus = ca, status
+}
+
+func (f *accountsFake) serveCA(w http.ResponseWriter) {
+	f.mu.Lock()
+	ca, status := f.ca, f.caStatus
+	f.mu.Unlock()
+	if status != 0 {
+		writeStatus(w, status, "ServerError", "the setting read failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": rancherCASetting, "type": "setting", "name": rancherCASetting, "value": ca, "default": "",
+	})
 }
 
 func (f *accountsFake) toProject(name string, p storedProject) project {
