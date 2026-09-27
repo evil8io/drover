@@ -179,6 +179,10 @@ func parseProjectSyncConfig(args []string, output io.Writer, getenv func(string)
 	flags.StringVar(&openbaoRancherURL, "openbao-rancher-url", "", "Rancher URL that OpenBao uses, https:// only")
 	flags.DurationVar(&openbao.TokenTTL, "openbao-token-ttl", 24*time.Hour,
 		"requested lifetime of the cluster token that OpenBao gets; the API server can shorten it")
+	flags.DurationVar(&openbao.CredentialTTL, "openbao-credential-ttl", 10*time.Minute,
+		"default lifetime of a credential of a project role that OpenBao creates")
+	flags.DurationVar(&openbao.CredentialMaxTTL, "openbao-credential-max-ttl", time.Hour,
+		"longest lifetime of a credential of a project role that OpenBao creates")
 	flags.DurationVar(&cfg.interval, "interval", 60*time.Second, "time between two runs")
 	flags.Float64Var(&cfg.patchRate, "patch-rate", 10,
 		"namespace patches and project namespace lists per second that the watches of one cluster send, together")
@@ -270,6 +274,12 @@ func parseOpenBao(flags *flag.FlagSet, serviceAccounts bool, address, rancherURL
 	}
 	if cfg.TokenTTL < 10*time.Minute {
 		return nil, fmt.Errorf("-openbao-token-ttl %s is shorter than 10m0s, the minimum of a token request", cfg.TokenTTL)
+	}
+	if cfg.CredentialTTL < time.Second {
+		return nil, fmt.Errorf("-openbao-credential-ttl %s is shorter than 1s", cfg.CredentialTTL)
+	}
+	if cfg.CredentialMaxTTL < cfg.CredentialTTL {
+		return nil, fmt.Errorf("-openbao-credential-max-ttl %s is shorter than -openbao-credential-ttl %s", cfg.CredentialMaxTTL, cfg.CredentialTTL)
 	}
 	return &cfg, nil
 }

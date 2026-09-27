@@ -22,8 +22,9 @@ const (
 )
 
 // fakeOpenBao answers the login of the Kubernetes auth mount at
-// auth/kubernetes, and the config write of the secrets engine mounts under
-// kubernetes/. It records every request.
+// auth/kubernetes, the mounts of the Kubernetes secrets engine, their config,
+// their roles, and the ACL policies. It keeps them in memory, and records
+// every request.
 type fakeOpenBao struct {
 	server *httptest.Server
 
@@ -32,14 +33,25 @@ type fakeOpenBao struct {
 	issued   []string
 	// loginStatus is the status of a login, zero for success.
 	loginStatus int
-	// missing is the status that a config write of a cluster answers when its
-	// mount does not exist: 404, or 400 as an older server answers.
-	missing map[string]int
+	// missing is the status that a config write of a cluster answers, as for
+	// a mount that does not exist: 404, or 400 as an older server answers.
+	missing  map[string]int
+	mounts   map[string]string
+	roles    map[string]map[string]map[string]any
+	policies map[string]string
+	// denied are the routes that answer 403 to every client token.
+	denied map[string]bool
 }
 
 func newFakeOpenBao(t *testing.T) *fakeOpenBao {
 	t.Helper()
-	f := &fakeOpenBao{missing: make(map[string]int)}
+	f := &fakeOpenBao{
+		missing:  make(map[string]int),
+		mounts:   make(map[string]string),
+		roles:    make(map[string]map[string]map[string]any),
+		policies: map[string]string{"default": "# default", "root": ""},
+		denied:   make(map[string]bool),
+	}
 	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.server.Close)
 	return f
@@ -52,38 +64,202 @@ func (f *fakeOpenBao) serve(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.requests = append(f.requests, recorded{
-		method: r.Method, path: r.URL.Path, header: r.Header.Clone(), body: string(body), at: time.Now(),
+		method: r.Method, path: r.URL.Path, query: r.URL.Query(), header: r.Header.Clone(), body: string(body), at: time.Now(),
 	})
 
 	route := strings.TrimPrefix(r.URL.Path, "/v1/")
-	switch {
-	case r.Method == http.MethodPost && route == "auth/kubernetes/login":
+	if r.Method == http.MethodPost && route == "auth/kubernetes/login" {
 		if f.loginStatus != 0 {
 			writeJSON(w, f.loginStatus, map[string][]string{"errors": {"permission denied"}})
 			return
 		}
 		token := fmt.Sprintf("bao-%d", len(f.issued)+1)
 		f.issued = append(f.issued, token)
-		writeJSON(w, http.StatusOK, map[string]any{"auth": map[string]any{"client_token": token}})
-	case r.Method == http.MethodPost && strings.HasPrefix(route, "kubernetes/") && strings.HasSuffix(route, "/config"):
-		if !slices.Contains(f.issued, r.Header.Get("X-Vault-Token")) {
-			writeJSON(w, http.StatusForbidden, map[string][]string{"errors": {"permission denied"}})
-			return
-		}
-		cluster := strings.TrimSuffix(strings.TrimPrefix(route, "kubernetes/"), "/config")
-		switch f.missing[cluster] {
-		case http.StatusNotFound:
-			writeJSON(w, http.StatusNotFound, map[string][]string{"errors": {
-				fmt.Sprintf("no handler for route %q. route entry not found.", route)}})
-		case http.StatusBadRequest:
-			writeJSON(w, http.StatusBadRequest, map[string][]string{"errors": {
-				fmt.Sprintf("no handler for route '%s'", route)}})
-		default:
-			w.WriteHeader(http.StatusNoContent)
-		}
+		writeJSON(w, http.StatusOK, map[string]any{"auth": map[string]any{"client_token": token, "lease_duration": 300}})
+		return
+	}
+	if !slices.Contains(f.issued, r.Header.Get("X-Vault-Token")) || f.denied[route] {
+		writeJSON(w, http.StatusForbidden, map[string][]string{"errors": {"permission denied"}})
+		return
+	}
+	list := r.URL.Query().Get("list") == "true"
+
+	switch {
+	case strings.HasPrefix(route, "sys/mounts/"):
+		f.serveMount(w, r, strings.TrimPrefix(route, "sys/mounts/"), body)
+	case route == "sys/policies/acl" && list:
+		f.writeKeys(w, sortedKeys(f.policies))
+	case strings.HasPrefix(route, "sys/policies/acl/"):
+		f.servePolicy(w, r, strings.TrimPrefix(route, "sys/policies/acl/"), body)
+	case strings.HasPrefix(route, "kubernetes/"):
+		f.serveEngine(w, r, strings.TrimPrefix(route, "kubernetes/"), list, body)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string][]string{"errors": {}})
 	}
+}
+
+func (f *fakeOpenBao) noHandler(w http.ResponseWriter, route string) {
+	writeJSON(w, http.StatusNotFound, map[string][]string{"errors": {
+		fmt.Sprintf("no handler for route %q. route entry not found.", route)}})
+}
+
+func (f *fakeOpenBao) writeKeys(w http.ResponseWriter, keys []string) {
+	if len(keys) == 0 {
+		writeJSON(w, http.StatusNotFound, map[string][]string{"errors": {}})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{"keys": keys}})
+}
+
+func (f *fakeOpenBao) serveMount(w http.ResponseWriter, r *http.Request, path string, body []byte) {
+	switch r.Method {
+	case http.MethodGet:
+		kind, ok := f.mounts[path]
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, map[string][]string{"errors": {"No secret engine mount at " + path + "/"}})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"type": kind, "data": map[string]any{"type": kind}})
+	case http.MethodPost:
+		var request struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(body, &request)
+		f.mounts[path] = request.Type
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string][]string{"errors": {}})
+	}
+}
+
+func (f *fakeOpenBao) servePolicy(w http.ResponseWriter, r *http.Request, name string, body []byte) {
+	switch r.Method {
+	case http.MethodGet:
+		text, ok := f.policies[name]
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string][]string{"errors": {}})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{"name": name, "policy": text}})
+	case http.MethodPut, http.MethodPost:
+		var request struct {
+			Policy string `json:"policy"`
+		}
+		_ = json.Unmarshal(body, &request)
+		f.policies[name] = request.Policy
+		w.WriteHeader(http.StatusNoContent)
+	case http.MethodDelete:
+		delete(f.policies, name)
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// serveEngine serves <cluster>/config and <cluster>/roles of the mounts under
+// kubernetes/.
+func (f *fakeOpenBao) serveEngine(w http.ResponseWriter, r *http.Request, rest string, list bool, body []byte) {
+	cluster, sub, _ := strings.Cut(rest, "/")
+	if _, ok := f.mounts["kubernetes/"+cluster]; !ok {
+		f.noHandler(w, "kubernetes/"+rest)
+		return
+	}
+	switch {
+	case sub == "config" && r.Method == http.MethodPost:
+		switch f.missing[cluster] {
+		case http.StatusNotFound:
+			f.noHandler(w, "kubernetes/"+rest)
+		case http.StatusBadRequest:
+			writeJSON(w, http.StatusBadRequest, map[string][]string{"errors": {
+				fmt.Sprintf("no handler for route '%s'", "kubernetes/"+rest)}})
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	case sub == "roles" && list:
+		f.writeKeys(w, sortedKeys(f.roles[cluster]))
+	case strings.HasPrefix(sub, "roles/"):
+		name := strings.TrimPrefix(sub, "roles/")
+		switch r.Method {
+		case http.MethodGet:
+			data, ok := f.roles[cluster][name]
+			if !ok {
+				writeJSON(w, http.StatusNotFound, map[string][]string{"errors": {}})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"data": data})
+		case http.MethodPost, http.MethodPut:
+			var data map[string]any
+			_ = json.Unmarshal(body, &data)
+			if f.roles[cluster] == nil {
+				f.roles[cluster] = make(map[string]map[string]any)
+			}
+			f.roles[cluster][name] = data
+			w.WriteHeader(http.StatusNoContent)
+		case http.MethodDelete:
+			delete(f.roles[cluster], name)
+			w.WriteHeader(http.StatusNoContent)
+		}
+	default:
+		f.noHandler(w, "kubernetes/"+rest)
+	}
+}
+
+func (f *fakeOpenBao) deny(route string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.denied[route] = true
+}
+
+// revokeTokens makes every issued client token invalid, as an expiry does.
+func (f *fakeOpenBao) revokeTokens() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.issued = []string{"revoked"}
+}
+
+func (f *fakeOpenBao) role(cluster, name string) (map[string]any, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	data, ok := f.roles[cluster][name]
+	return data, ok
+}
+
+func (f *fakeOpenBao) setRole(cluster, name string, data map[string]any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.roles[cluster] == nil {
+		f.roles[cluster] = make(map[string]map[string]any)
+	}
+	f.roles[cluster][name] = data
+}
+
+func (f *fakeOpenBao) policy(name string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	text, ok := f.policies[name]
+	return text, ok
+}
+
+func (f *fakeOpenBao) setPolicy(name, text string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.policies[name] = text
+}
+
+func (f *fakeOpenBao) addMount(path string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.mounts[path] = "kubernetes"
+}
+
+// changes returns every request that writes: a POST, PUT, or DELETE, but the
+// login.
+func (f *fakeOpenBao) changes() []recorded {
+	var out []recorded
+	for _, req := range f.all() {
+		if req.method != http.MethodGet && req.path != "/v1/auth/kubernetes/login" {
+			out = append(out, req)
+		}
+	}
+	return out
 }
 
 func (f *fakeOpenBao) setMissing(cluster string, status int) {
@@ -187,6 +363,9 @@ func newOpenBaoSetup(t *testing.T, fake *accountsFake, opts ...func(*Config)) *o
 			MountPrefix: "kubernetes",
 			RancherURL:  rancher,
 			TokenTTL:    24 * time.Hour,
+
+			CredentialTTL:    10 * time.Minute,
+			CredentialMaxTTL: time.Hour,
 		}
 	}}, opts...)...)
 
