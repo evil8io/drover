@@ -33,6 +33,30 @@ func parseRancherURL(name, raw string) (*url.URL, error) {
 	return target, nil
 }
 
+// parseServiceURL returns the URL of a server. The name is the flag name, for
+// the error message. httpsOnly rejects the http scheme.
+func parseServiceURL(name, raw string, httpsOnly bool) (*url.URL, error) {
+	target, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", name, err)
+	}
+	if httpsOnly && target.Scheme != "https" {
+		return nil, fmt.Errorf("%s scheme %q is not https", name, target.Scheme)
+	}
+	if target.Scheme != "http" && target.Scheme != "https" {
+		return nil, fmt.Errorf("%s scheme %q is not http or https", name, target.Scheme)
+	}
+	if target.Host == "" {
+		return nil, fmt.Errorf("%s has no host", name)
+	}
+	if target.Path != "" && target.Path != "/" {
+		return nil, fmt.Errorf("%s path %q is not empty", name, target.Path)
+	}
+	target.Path = ""
+	target.RawPath = ""
+	return target, nil
+}
+
 func parseLevel(name string) (slog.Level, error) {
 	switch name {
 	case "debug":

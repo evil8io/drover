@@ -63,6 +63,7 @@ type accountsFake struct {
 	namespaces          map[string]namespace
 	serviceAccounts     map[string]map[string]object
 	roleBindings        map[string]map[string]binding
+	roles               map[string]map[string]role
 	clusterRoleBindings map[string]binding
 	projects            map[string]storedProject
 	// unlisted are projects that answer 200 on the single-project lookup, but
@@ -75,6 +76,12 @@ type accountsFake struct {
 	// patchFailures is the status that a PATCH of a namespace answers,
 	// instead of applying it, by namespace name.
 	patchFailures map[string]int
+	// tokenClock is the start of the lifetime of a token that a token request
+	// answers, and tokenCap is the longest lifetime that the fake grants, zero
+	// for none. tokens counts the answered token requests.
+	tokenClock func() time.Time
+	tokenCap   time.Duration
+	tokens     int
 }
 
 func newAccountsFake(t *testing.T) *accountsFake {
@@ -83,10 +90,12 @@ func newAccountsFake(t *testing.T) *accountsFake {
 		namespaces:          make(map[string]namespace),
 		serviceAccounts:     make(map[string]map[string]object),
 		roleBindings:        make(map[string]map[string]binding),
+		roles:               make(map[string]map[string]role),
 		clusterRoleBindings: make(map[string]binding),
 		projects:            make(map[string]storedProject),
 		unlisted:            make(map[string]storedProject),
 		self:                acctSelf,
+		tokenClock:          time.Now,
 	}
 	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.server.Close)
@@ -214,6 +223,42 @@ func (f *accountsFake) mutateClusterRoleBinding(name string, edit func(*binding)
 	f.clusterRoleBindings[name] = b
 }
 
+func (f *accountsFake) addServiceAccount(obj object) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ns := obj.Metadata.Namespace
+	if f.serviceAccounts[ns] == nil {
+		f.serviceAccounts[ns] = make(map[string]object)
+	}
+	f.serviceAccounts[ns][obj.Metadata.Name] = obj
+}
+
+func (f *accountsFake) removeServiceAccount(ns, name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.serviceAccounts[ns], name)
+}
+
+func (f *accountsFake) removeRoleBinding(ns, name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.roleBindings[ns], name)
+}
+
+func (f *accountsFake) mutateRole(ns, name string, edit func(*role)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	item := f.roles[ns][name]
+	edit(&item)
+	f.roles[ns][name] = item
+}
+
+func (f *accountsFake) removeRole(ns, name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.roles[ns], name)
+}
+
 func (f *accountsFake) removeClusterRoleBinding(name string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -269,6 +314,10 @@ func (f *accountsFake) serve(w http.ResponseWriter, r *http.Request) {
 		f.serveProjectItem(w, strings.TrimPrefix(path, projectsPath+"/"))
 	case r.Method == http.MethodPost && path == clusterPath(rancherCluster)+managementProjects+acctCluster+"/projects":
 		f.createProject(w, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(path, "/k8s/clusters/") && strings.HasSuffix(path, "/token"):
+		f.serveTokenRequest(w, r)
+	case r.Method == http.MethodGet && path == acctRBACBase+"/roles":
+		f.serveAllRoles(w, r)
 	case strings.HasPrefix(path, acctRBACBase+"/clusterrolebindings"):
 		f.serveClusterRoleBindings(w, r, strings.TrimPrefix(path, acctRBACBase+"/clusterrolebindings"))
 	case r.Method == http.MethodGet && path == acctRBACBase+"/rolebindings":
@@ -461,7 +510,7 @@ func (f *accountsFake) serveNamespaces(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 
-	parts := strings.SplitN(rest, "/", 2)
+	parts := strings.SplitN(rest, "/", 3)
 	if len(parts) == 2 && parts[1] == "serviceaccounts" {
 		ns := parts[0]
 		switch r.Method {
@@ -472,6 +521,10 @@ func (f *accountsFake) serveNamespaces(w http.ResponseWriter, r *http.Request, r
 		default:
 			http.NotFound(w, r)
 		}
+		return
+	}
+	if len(parts) == 3 && parts[1] == "serviceaccounts" && r.Method == http.MethodGet {
+		f.getServiceAccount(w, parts[0], parts[2])
 		return
 	}
 	if len(parts) == 1 {
@@ -596,6 +649,53 @@ func (f *accountsFake) listServiceAccounts(w http.ResponseWriter, r *http.Reques
 	writeList(w, items)
 }
 
+func (f *accountsFake) getServiceAccount(w http.ResponseWriter, ns, name string) {
+	f.mu.Lock()
+	obj, ok := f.serviceAccounts[ns][name]
+	f.mu.Unlock()
+	if !ok {
+		writeStatus(w, http.StatusNotFound, "NotFound", "service account "+name+" not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, obj)
+}
+
+// serveTokenRequest answers a TokenRequest of any cluster. The lifetime is the
+// requested one, cut to tokenCap, from tokenClock.
+func (f *accountsFake) serveTokenRequest(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	var request struct {
+		Spec struct {
+			ExpirationSeconds int64 `json:"expirationSeconds"`
+		} `json:"spec"`
+	}
+	if err := json.Unmarshal(body, &request); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	f.mu.Lock()
+	f.tokens++
+	token := fmt.Sprintf("sa-token-%d", f.tokens)
+	lifetime := time.Duration(request.Spec.ExpirationSeconds) * time.Second
+	if f.tokenCap > 0 {
+		lifetime = min(lifetime, f.tokenCap)
+	}
+	expiry := f.tokenClock().Add(lifetime)
+	f.mu.Unlock()
+
+	var answer struct {
+		APIVersion string `json:"apiVersion"`
+		Kind       string `json:"kind"`
+		Status     struct {
+			Token               string    `json:"token"`
+			ExpirationTimestamp time.Time `json:"expirationTimestamp"`
+		} `json:"status"`
+	}
+	answer.APIVersion, answer.Kind = "authentication.k8s.io/v1", "TokenRequest"
+	answer.Status.Token, answer.Status.ExpirationTimestamp = token, expiry.UTC().Truncate(time.Second)
+	writeJSON(w, http.StatusCreated, answer)
+}
+
 func (f *accountsFake) serveAllServiceAccounts(w http.ResponseWriter, r *http.Request) {
 	selector := r.URL.Query().Get("labelSelector")
 	f.mu.Lock()
@@ -655,6 +755,10 @@ func (f *accountsFake) serveAllRoleBindings(w http.ResponseWriter, r *http.Reque
 
 func (f *accountsFake) serveNamespacedRoleBindings(w http.ResponseWriter, r *http.Request, rest string) {
 	parts := strings.SplitN(rest, "/", 3)
+	if len(parts) >= 2 && parts[1] == "roles" {
+		f.serveNamespacedRoles(w, r, parts)
+		return
+	}
 	if len(parts) < 2 || parts[1] != "rolebindings" {
 		http.NotFound(w, r)
 		return
@@ -863,4 +967,80 @@ func (f *accountsFake) deleteBinding(w http.ResponseWriter, ns, name string, sto
 	}
 	delete(store[ns], name)
 	writeJSON(w, http.StatusOK, kubeStatus{})
+}
+
+// --- roles ---
+
+func (f *accountsFake) serveAllRoles(w http.ResponseWriter, r *http.Request) {
+	selector := r.URL.Query().Get("labelSelector")
+	f.mu.Lock()
+	var items []role
+	for _, ns := range sortedKeys(f.roles) {
+		for _, name := range sortedKeys(f.roles[ns]) {
+			item := f.roles[ns][name]
+			if selectorMatches(item.Metadata.Labels, selector) {
+				items = append(items, item)
+			}
+		}
+	}
+	f.mu.Unlock()
+	writeList(w, items)
+}
+
+// serveNamespacedRoles serves the roles of one namespace. parts are the
+// namespace, "roles", and the name when the path has one.
+func (f *accountsFake) serveNamespacedRoles(w http.ResponseWriter, r *http.Request, parts []string) {
+	ns := parts[0]
+	if len(parts) == 2 {
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var item role
+		if err := json.Unmarshal(body, &item); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.roles[ns] == nil {
+			f.roles[ns] = make(map[string]role)
+		}
+		if _, exists := f.roles[ns][item.Metadata.Name]; exists {
+			writeStatus(w, http.StatusConflict, "AlreadyExists", "role "+item.Metadata.Name+" exists")
+			return
+		}
+		item.Metadata.Namespace = ns
+		item.Metadata.ResourceVersion = "1"
+		f.roles[ns][item.Metadata.Name] = item
+		writeJSON(w, http.StatusCreated, item)
+		return
+	}
+
+	name := parts[2]
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	have, ok := f.roles[ns][name]
+	if !ok {
+		writeStatus(w, http.StatusNotFound, "NotFound", "role "+name+" not found")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, have)
+	case http.MethodPut:
+		body, _ := io.ReadAll(r.Body)
+		var item role
+		if err := json.Unmarshal(body, &item); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		item.Metadata.Namespace, item.Metadata.Name = ns, name
+		item.Metadata.ResourceVersion = have.Metadata.ResourceVersion + "+1"
+		f.roles[ns][name] = item
+		writeJSON(w, http.StatusOK, item)
+	default:
+		http.NotFound(w, r)
+	}
 }

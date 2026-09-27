@@ -4,6 +4,8 @@ This service copies labels and annotations of a Rancher project to every namespa
 
 With `--service-accounts`, the service also keeps three ServiceAccounts per Rancher project, one per project role. A CI job of a project authenticates with a token of such a ServiceAccount, through the Rancher proxy. See [Service accounts](#service-accounts).
 
+With `--openbao-address` as well, the service writes the Kubernetes secrets engine config of every cluster into OpenBao, so that OpenBao creates short-lived tokens of these ServiceAccounts. See [OpenBao config](#openbao-config).
+
 ## Requirements
 
 1. A Rancher service user with `get`, `list`, `watch`, and `patch` on `namespaces`, in every cluster whose namespaces the service syncs. A `cluster-owner` binding also covers that.
@@ -16,6 +18,17 @@ With `--service-accounts`, the service also keeps three ServiceAccounts per Ranc
    - `bind` on the ClusterRoles `admin`, `edit`, `view`, and `create-ns`, with `resourceNames`. Do not grant `bind` on every ClusterRole, because that equals cluster admin.
 
    Give the service its own service user. The API filter is on the request path of every tenant, and its user needs only the namespace list.
+5. With `--openbao-address`, the same service user also needs these rights in every cluster, and in the Rancher cluster through a `ClusterRoleTemplateBinding`:
+   - `create` on `serviceaccounts/token`, with the `resourceNames` `openbao`, `project-owner`, `project-member`, and `read-only`.
+   - `get`, `list`, `watch`, `create`, `update`, and `delete` on `roles`.
+
+   With these rights and the `get` on `serviceaccounts`, the user holds every rule of the Role `drover-openbao`, so it creates and binds that Role without `escalate` and without `bind`.
+6. With `--openbao-address`, OpenBao needs:
+   - a Kubernetes auth mount at `--openbao-auth-path`, with the role `--openbao-role` for the ServiceAccount of the pod of the service.
+   - a policy on that role with `update` on `<prefix>/<cluster id>/config` of every cluster. Without it, a write answers 403.
+   - a Kubernetes secrets engine mount at `<prefix>/<cluster id>` per cluster. Another component creates the mount and its roles.
+
+   OpenBao reaches each cluster through the Rancher proxy, with a ServiceAccount token of that cluster. Rancher accepts such a token only for a cluster with a `ClusterProxyConfig` that has `enabled: true`. See [the API filter document](api-filter.md).
 
 ## Configuration
 
@@ -32,6 +45,13 @@ With `--service-accounts`, the service also keeps three ServiceAccounts per Ranc
 | `--name-label` | | Label key on the namespace that gets the display name of the project. |
 | `--name-annotation` | | Annotation key on the namespace that gets the display name of the project. |
 | `--service-accounts` | `false` | Keep three ServiceAccounts per project, one per project role. |
+| `--openbao-address` | | URL of OpenBao. Use `http://` or `https://`. The path must be empty or `/`. Empty turns the OpenBao config off. |
+| `--openbao-auth-path` | `kubernetes` | Kubernetes auth mount of OpenBao that the service logs in to. |
+| `--openbao-role` | `project-sync` | Role of that auth mount. |
+| `--openbao-jwt-file` | | File with the ServiceAccount token of the pod, for the login. Required with `--openbao-address`. |
+| `--openbao-mount-prefix` | `kubernetes` | Path prefix of the secrets engine mounts. The config of a cluster is at `<prefix>/<cluster id>/config`. |
+| `--openbao-rancher-url` | | URL of Rancher that OpenBao uses. Use `https://`. The path must be empty or `/`. Required with `--openbao-address`. |
+| `--openbao-token-ttl` | `24h` | Requested lifetime of the token of a cluster. The minimum is `10m`. The API server can shorten it. |
 | `--interval` | `60s` | Time between two runs. |
 | `--patch-rate` | `10` | Namespace patches and project namespace lists per second that the watches of one cluster send, together. |
 | `--listen` | `:8080` | Address the service listens on. |
@@ -41,7 +61,7 @@ With `--service-accounts`, the service also keeps three ServiceAccounts per Ranc
 | `--otlp-metrics` | `true` | Send metrics to the OTLP endpoint. |
 | `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | `service.name` resource attribute. |
 
-The flags need at least one label key, annotation key, name label key, or name annotation key, or `--service-accounts`. A key must be a valid Kubernetes label or annotation key. A key whose prefix is `cattle.io`, `kubernetes.io`, or `k8s.io`, or a subdomain of one of them, is not valid, because Rancher and Kubernetes own those domains.
+The flags need at least one label key, annotation key, name label key, or name annotation key, or `--service-accounts`. Every `--openbao-` flag needs `--service-accounts`. A key must be a valid Kubernetes label or annotation key. A key whose prefix is `cattle.io`, `kubernetes.io`, or `k8s.io`, or a subdomain of one of them, is not valid, because Rancher and Kubernetes own those domains.
 
 The `--name-annotation` value is the raw display name of the project. The `--name-label` value is a sanitised copy: the service replaces every character outside `[A-Za-z0-9._-]` with `-`, and cuts the result to 63 characters. It then trims the leading and trailing characters that are not alphanumeric. A name that sanitises to an empty value gets no label, and the service writes one warning line for that project in that run.
 
@@ -110,9 +130,38 @@ The service applies these rules:
 - The reconcile run deletes an account namespace whose project is gone, after Rancher answers 404 for that project. It deletes the bindings of the project first.
 - To make every token of a ServiceAccount invalid, delete the ServiceAccount. The next reconcile run creates it again. Do not delete the account namespace for this. A binding names its ServiceAccount by namespace and name, and the garbage collector deletes the bindings only some time after the namespace. Until then, a tenant who creates a namespace of that name gets the rights of the bindings.
 
+## OpenBao config
+
+With `--openbao-address`, the service keeps these objects in every cluster that the reconcile run syncs, the Rancher cluster included:
+
+1. The namespace `drover-openbao` in the account project, with the label `drover-role: openbao`.
+2. In that namespace, the ServiceAccount `openbao`, with the same label.
+3. In every account namespace `drover-<project>`, the Role `drover-openbao`. It grants `get` on `serviceaccounts` and `create` on `serviceaccounts/token`, both with the `resourceNames` `project-owner`, `project-member`, and `read-only`.
+4. In every account namespace, the RoleBinding `drover-openbao` to that Role, with the one subject `drover-openbao/openbao`. The namespace `drover-openbao` owns the RoleBinding, so the garbage collector deletes it with that namespace.
+
+The Role and the RoleBinding have the labels `drover-project: <project>` and `drover-role: openbao`. The service applies these rules:
+
+- The service uses the namespace `drover-openbao` only in an account project, as it does with an account namespace. A tenant can create the name first in its own project. The service then writes a warning, writes no config for that cluster, and deletes every RoleBinding `drover-openbao` of the cluster.
+- A namespace `drover-openbao` in no project moves into the account project only when a RoleBinding `drover-openbao` in an account namespace names it as owner.
+- A project that gets no accounts, or whose account namespace the reconcile run deletes, loses its RoleBinding `drover-openbao` together with its other bindings.
+- The reconcile run corrects a Role or a RoleBinding that differs, and creates a missing one again. The project watch does not create them, so a new project waits for the next run.
+- A project with the name `openbao` gets no accounts, because its account namespace is `drover-openbao`.
+- The service deletes none of these objects when `--openbao-address` goes empty. It also keeps the config of a removed cluster in OpenBao.
+- To make the token in OpenBao invalid, delete the ServiceAccount `openbao`. The next run creates it again, and writes a new token. Do not delete the namespace `drover-openbao` for this, for the reason in [Service accounts](#service-accounts).
+
+For each cluster, the service writes the config in three steps:
+
+1. It requests a token of `drover-openbao/openbao` with the TokenRequest API, through the Rancher proxy: `POST /k8s/clusters/<cluster id>/api/v1/namespaces/drover-openbao/serviceaccounts/openbao/token`. The request has `spec.expirationSeconds` from `--openbao-token-ttl`, and no audiences. The API server can shorten the lifetime, for example to 24 hours on EKS, so the service uses `status.expirationTimestamp` of the answer.
+2. It logs in with `POST <address>/v1/auth/<auth path>/login`, with the role and the content of `--openbao-jwt-file`. It reads the file at every login, because the kubelet replaces the token. The service logs in once per run, and only when a cluster needs a write. It does not keep the client token after the run.
+3. It writes `POST <address>/v1/<prefix>/<cluster id>/config`, with the client token in the header `X-Vault-Token`, and the body `{"kubernetes_host": "<openbao rancher url>/k8s/clusters/<cluster id>", "service_account_jwt": "<token>", "disable_local_ca_jwt": true}`.
+
+OpenBao keeps a written token and never renews it. The service therefore keeps in memory, per cluster, the expiry of the token of the last successful write. The reconcile run writes the config of a cluster again when less than half of the lifetime of that token remains, or when the ServiceAccount has a new uid. After a restart, the service has no expiry, so the first run writes the config of every cluster. A failed write keeps the old expiry, and the next run tries again.
+
+OpenBao checks the policy before the mount. With `update` on the path, OpenBao answers 404 with the message `no handler for route` to a write under a mount that does not exist, and an older server answers 400 with the same message. The service then writes an info line with the cluster id, counts the write with the outcome `missing_mount`, and tries again in the next run. Every other failure gives an error line, and the next run tries again. The service logs no token and no JWT.
+
 ## Telemetry
 
-With `--otlp-endpoint` set, one reconcile run produces a span named `reconcile`, and one patched namespace produces a span named `patch_namespace`. That span has the attributes `drover.cluster`, `drover.origin`, and `k8s.namespace.name`. The `drover.origin` value is `reconcile`, `watch`, or `project`. The service exports these metrics:
+With `--otlp-endpoint` set, one reconcile run produces a span named `reconcile`, and one patched namespace produces a span named `patch_namespace`. That span has the attributes `drover.cluster`, `drover.origin`, and `k8s.namespace.name`. The `drover.origin` value is `reconcile`, `watch`, or `project`. With `--openbao-address`, the OpenBao login produces a span named `openbao_login`, and the config write of one cluster produces a span named `openbao_config`, with the attribute `drover.cluster`. The service exports these metrics:
 
 | Metric | Kind | Unit | Attributes |
 | --- | --- | --- | --- |
@@ -124,5 +173,6 @@ With `--otlp-endpoint` set, one reconcile run produces a span named `reconcile`,
 | `drover.sync.watches.open` | UpDownCounter | `1` | `cluster`, `kind` |
 | `drover.sync.projects.changed` | Counter | `1` | `cluster` |
 | `drover.sync.accounts.changes` | Counter | `1` | `kind`, `action` |
+| `drover.sync.openbao.writes` | Counter | `1` | `cluster`, `outcome` |
 
-The `kind` attribute of the watch metrics is `namespace` or `project`. For the project watch, `cluster` is always `local`. The `kind` attribute of `drover.sync.accounts.changes` is `project`, `namespace`, `serviceaccount`, `rolebinding`, or `clusterrolebinding`, and `action` is `create`, `update`, `move`, or `delete`. With `--service-accounts`, the summary line of a run has the field `accounts_changed`, and every write has a line `account object changed`.
+The `kind` attribute of the watch metrics is `namespace` or `project`. For the project watch, `cluster` is always `local`. The `kind` attribute of `drover.sync.accounts.changes` is `project`, `namespace`, `serviceaccount`, `role`, `rolebinding`, or `clusterrolebinding`, and `action` is `create`, `update`, `move`, or `delete`. With `--service-accounts`, the summary line of a run has the field `accounts_changed`, and every write has a line `account object changed`. The `outcome` attribute of `drover.sync.openbao.writes` is `ok`, `missing_mount`, or `error`. A failed login counts one `error` per cluster that needed a write. A successful write has the line `the OpenBao config is written`, with the fields `cluster` and `expires`.

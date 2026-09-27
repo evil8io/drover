@@ -58,6 +58,9 @@ type Config struct {
 	// ServiceAccounts keeps one ServiceAccount per project role for every
 	// project, in an account project of each cluster.
 	ServiceAccounts bool
+	// OpenBao writes the Kubernetes secrets engine config of every cluster
+	// into OpenBao. It needs ServiceAccounts. Nil turns it off.
+	OpenBao *OpenBaoConfig
 	// Interval is the time between two runs. Zero selects 60 s.
 	Interval time.Duration
 	// PatchRate bounds the namespace patches and the project namespace lists
@@ -95,6 +98,9 @@ type Syncer struct {
 
 	// serviceAccounts turns the accounts on.
 	serviceAccounts bool
+	// openbao writes the config of each cluster into OpenBao. Nil turns it
+	// off.
+	openbao *openbaoWriter
 
 	// readLabels and readAnnotations are the namespace keys that the sync
 	// reads. A decoded namespace keeps only these keys.
@@ -143,6 +149,9 @@ func New(cfg Config) (*Syncer, error) {
 	}
 	if len(cfg.Labels)+len(cfg.Annotations) == 0 && cfg.NameLabel == "" && cfg.NameAnnotation == "" && !cfg.ServiceAccounts {
 		return nil, errors.New("at least one label key, annotation key, name label key, or name annotation key, or the service accounts, is required")
+	}
+	if cfg.OpenBao != nil && !cfg.ServiceAccounts {
+		return nil, errors.New("the OpenBao config needs the service accounts")
 	}
 	keys := slices.Concat(cfg.Labels, cfg.Annotations)
 	for _, key := range []string{cfg.NameLabel, cfg.NameAnnotation} {
@@ -197,6 +206,15 @@ func New(cfg Config) (*Syncer, error) {
 
 	readLabels, readAnnotations := namespaceKeys(cfg)
 
+	timeout := min(interval, maxTimeout)
+	userAgent := "drover/" + version
+	var openbao *openbaoWriter
+	if cfg.OpenBao != nil {
+		if openbao, err = newOpenBaoWriter(*cfg.OpenBao, timeout, userAgent, meterProvider); err != nil {
+			return nil, err
+		}
+	}
+
 	return &Syncer{
 		rancher:         &rancher,
 		tokenFile:       cfg.TokenFile,
@@ -205,13 +223,14 @@ func New(cfg Config) (*Syncer, error) {
 		nameLabel:       cfg.NameLabel,
 		nameAnnotation:  cfg.NameAnnotation,
 		serviceAccounts: cfg.ServiceAccounts,
+		openbao:         openbao,
 		readLabels:      readLabels,
 		readAnnotations: readAnnotations,
 		pageCap:         maxBody,
 		interval:        interval,
-		timeout:         min(interval, maxTimeout),
+		timeout:         timeout,
 		patchRate:       patchRate,
-		userAgent:       "drover/" + version,
+		userAgent:       userAgent,
 		logger:          logger,
 		client:          &http.Client{Transport: rancherclient.WrapTransport(transport, meterProvider)},
 		metrics:         m,
@@ -308,9 +327,32 @@ func (s *Syncer) reconcile(ctx context.Context) {
 	s.watches.startProjects(base)
 	s.watches.resetNames()
 
+	var mu sync.Mutex
+	ready := make(map[string]string)
+	eachCluster(names, func(cluster string) {
+		one := counters{projects: len(clusters[cluster])}
+		account := s.syncCluster(ctx, token, cluster, clusters[cluster], &one)
+
+		mu.Lock()
+		defer mu.Unlock()
+		run.add(one)
+		if account != "" {
+			ready[cluster] = account
+		}
+	})
+	if s.openbao != nil {
+		s.refreshOpenBao(ctx, token, names, ready, &run)
+	}
+
+	s.finishReconcile(ctx, span, run, start)
+}
+
+// eachCluster calls fn once per cluster of names, for at most
+// maxParallelClusters clusters at the same time. It returns when every call
+// returns.
+func eachCluster(names []string, fn func(cluster string)) {
 	var (
 		group sync.WaitGroup
-		mu    sync.Mutex
 		slots = make(chan struct{}, maxParallelClusters)
 	)
 	for _, cluster := range names {
@@ -319,18 +361,10 @@ func (s *Syncer) reconcile(ctx context.Context) {
 		go func() {
 			defer group.Done()
 			defer func() { <-slots }()
-
-			one := counters{projects: len(clusters[cluster])}
-			s.syncCluster(ctx, token, cluster, clusters[cluster], &one)
-
-			mu.Lock()
-			defer mu.Unlock()
-			run.add(one)
+			fn(cluster)
 		}()
 	}
 	group.Wait()
-
-	s.finishReconcile(ctx, span, run, start)
 }
 
 // setClusters stores the project map of the run. A watcher reads it, so the
@@ -424,12 +458,15 @@ func (s *Syncer) byCluster(ctx context.Context, projects []project) map[string]m
 	return clusters
 }
 
-func (s *Syncer) syncCluster(ctx context.Context, token, cluster string, projects map[string]project, run *counters) {
+// syncCluster syncs the namespaces and the accounts of one cluster. It returns
+// the uid of the OpenBao ServiceAccount of the cluster when the run keeps the
+// OpenBao objects, and "" otherwise.
+func (s *Syncer) syncCluster(ctx context.Context, token, cluster string, projects map[string]project, run *counters) string {
 	items, err := s.namespaces(ctx, token, cluster, "")
 	if err != nil {
 		run.errors++
 		s.logListFailure(ctx, err, cluster)
-		return
+		return ""
 	}
 	run.namespaces += len(items)
 
@@ -457,8 +494,9 @@ func (s *Syncer) syncCluster(ctx context.Context, token, cluster string, project
 	}
 
 	if s.serviceAccounts {
-		s.syncAccounts(ctx, token, cluster, projects, items, run)
+		return s.syncAccounts(ctx, token, cluster, projects, items, run)
 	}
+	return ""
 }
 
 // sourceOf returns the project that the keys of a namespace of project name
