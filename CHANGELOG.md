@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.0](https://github.com/evil8io/drover/compare/v0.19.1...v0.20.0) (2026-09-27)
+
+
+### Features
+
+* **project-sync:** write the Kubernetes secrets engine config into OpenBao ([#102](https://github.com/evil8io/drover/issues/102)) ([3a609c1](https://github.com/evil8io/drover/commit/3a609c12c659f1084d1e8845e89a6d8dd4d10b4d))
+
 ## [0.19.1](https://github.com/evil8io/drover/compare/v0.19.0...v0.19.1) (2026-09-26)
 
 
