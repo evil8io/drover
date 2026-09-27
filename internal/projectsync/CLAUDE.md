@@ -37,3 +37,18 @@ Verified live against Rancher 2.14.5, and against the source of Rancher 2.14.6 a
 - Never set `blockOwnerDeletion` on an owner reference. It needs a right on the owner that the service user does not have.
 - Rancher creates `<project>-namespaces-edit` and `<project>-namespaces-readonly` shortly after the project, also without a member or a namespace.
 - Send a PATCH as `application/merge-patch+json`. The API server answers 415 to `application/json`.
+
+## OpenBao
+
+The answer to a missing mount comes from the source of OpenBao 2.7.0. No part of this section has a live check yet.
+
+- Refresh the config of a cluster when less than half of the lifetime of its token remains. OpenBao keeps a written `service_account_jwt` and never renews it, and EKS limits a TokenRequest to 24 h. The other half is the time for the retries of a failed write.
+- Take the expiry from `status.expirationTimestamp` of the TokenRequest answer, never from `--openbao-token-ttl`. The API server can shorten the lifetime.
+- Compare the uid of the ServiceAccount `openbao` with the uid of the last write. A new ServiceAccount makes the written token invalid, and the expiry alone would wait up to half of the lifetime.
+- Keep `--openbao-rancher-url` apart from `--rancher-url`. The service can reach Rancher through its Service with `--rancher-insecure-skip-verify`, but OpenBao verifies the certificate of Rancher.
+- OpenBao checks the policy before it routes a request. A write under a missing mount answers 404 `no handler for route "<path>". route entry not found.` only when the policy allows `update` on the path, and 403 otherwise. An older Vault server answers 400 with the same message. The sources are `internal/vault/routing/router.go` and `sdk/logical/response_util.go`.
+- Use `drover-openbao` only in an account project. Move it out of no project only with the proof of an OpenBao RoleBinding in a trusted account namespace, because only the service and an admin write there. Never take a binding in another namespace as proof: a tenant can write one with that owner reference in its own namespace.
+- The RoleBinding `drover-openbao` names `drover-openbao/openbao` by namespace and name. Let the namespace `drover-openbao` own it by uid, and delete every such RoleBinding when the namespace is not trusted. Otherwise a tenant who creates `drover-openbao` and a ServiceAccount `openbao` gets the tokens of every project role.
+- Skip `drover-openbao` in the sweep of the account namespaces. It has the account prefix and no project, so the 404 check of the sweep deletes it. For the same name, a project called `openbao` gets no accounts.
+- Keep the `resourceNames` of the Role inside the `serviceaccounts/token` grant of the service user. The user creates and binds the Role without `escalate` and `bind`, because it holds every rule of the Role.
+- OpenBao reaches a cluster through the Rancher proxy with a ServiceAccount token. Rancher needs a `ClusterProxyConfig` per cluster for that, see `internal/filter/CLAUDE.md`.

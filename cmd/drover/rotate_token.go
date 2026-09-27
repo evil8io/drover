@@ -227,28 +227,6 @@ func parseRotateConfig(args []string, output io.Writer, getenv func(string) stri
 	return cfg, nil
 }
 
-func parseServiceURL(name, raw string, httpsOnly bool) (*url.URL, error) {
-	target, err := url.Parse(raw)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", name, err)
-	}
-	if httpsOnly && target.Scheme != "https" {
-		return nil, fmt.Errorf("%s scheme %q is not https", name, target.Scheme)
-	}
-	if target.Scheme != "http" && target.Scheme != "https" {
-		return nil, fmt.Errorf("%s scheme %q is not http or https", name, target.Scheme)
-	}
-	if target.Host == "" {
-		return nil, fmt.Errorf("%s has no host", name)
-	}
-	if target.Path != "" && target.Path != "/" {
-		return nil, fmt.Errorf("%s path %q is not empty", name, target.Path)
-	}
-	target.Path = ""
-	target.RawPath = ""
-	return target, nil
-}
-
 func parseSecretRef(flagName, raw string) (namespace, name string, err error) {
 	if raw == "" {
 		return "", "", fmt.Errorf("%s is required", flagName)

@@ -18,6 +18,9 @@ const (
 const (
 	outcomeOK    = "ok"
 	outcomeError = "error"
+	// outcomeMissingMount is an OpenBao config write to a mount that does not
+	// exist yet.
+	outcomeMissingMount = "missing_mount"
 
 	// originReconcile, originWatch, and originProject name the path that
 	// patched a namespace. originProject is a namespace that the lister found
@@ -41,6 +44,7 @@ type metrics struct {
 	watches    metric.Int64UpDownCounter
 	changed    metric.Int64Counter
 	accounts   metric.Int64Counter
+	openbao    metric.Int64Counter
 }
 
 // newMetrics creates the instruments of the syncer, on the meter that
@@ -97,6 +101,12 @@ func newMetrics(provider metric.MeterProvider) (*metrics, error) {
 	if err != nil {
 		return nil, err
 	}
+	openbao, err := meter.Int64Counter("drover.sync.openbao.writes",
+		metric.WithDescription("Writes of the Kubernetes secrets engine config of a cluster into OpenBao."),
+		metric.WithUnit("1"))
+	if err != nil {
+		return nil, err
+	}
 
 	return &metrics{
 		reconciles: reconciles,
@@ -107,6 +117,7 @@ func newMetrics(provider metric.MeterProvider) (*metrics, error) {
 		watches:    watches,
 		changed:    changed,
 		accounts:   accounts,
+		openbao:    openbao,
 	}, nil
 }
 
@@ -163,4 +174,12 @@ func (m *metrics) accountChanged(ctx context.Context, kind, action string) {
 	m.accounts.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("kind", kind),
 		attribute.String("action", action)))
+}
+
+// openbaoWritten records one OpenBao config write of cluster. outcome is ok,
+// missing_mount, or error.
+func (m *metrics) openbaoWritten(ctx context.Context, cluster, outcome string) {
+	m.openbao.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("cluster", cluster),
+		attribute.String("outcome", outcome)))
 }

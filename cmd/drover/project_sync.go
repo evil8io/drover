@@ -30,6 +30,7 @@ type projectSyncConfig struct {
 	nameLabel          string
 	nameAnnotation     string
 	serviceAccounts    bool
+	openbao            *projectsync.OpenBaoConfig
 	interval           time.Duration
 	patchRate          float64
 	logLevel           slog.Level
@@ -73,6 +74,7 @@ func runProjectSync(args []string) int {
 		NameLabel:          cfg.nameLabel,
 		NameAnnotation:     cfg.nameAnnotation,
 		ServiceAccounts:    cfg.serviceAccounts,
+		OpenBao:            cfg.openbao,
 		Interval:           cfg.interval,
 		PatchRate:          cfg.patchRate,
 		Logger:             logger,
@@ -109,6 +111,7 @@ func runProjectSync(args []string) int {
 		"name_label", cfg.nameLabel,
 		"name_annotation", cfg.nameAnnotation,
 		"service_accounts", cfg.serviceAccounts,
+		"openbao_address", openbaoAddress(cfg.openbao),
 	)
 
 	syncDone := make(chan struct{})
@@ -143,13 +146,16 @@ func parseProjectSyncConfig(args []string, output io.Writer, getenv func(string)
 	flags.SetOutput(output)
 
 	var (
-		cfg            projectSyncConfig
-		rancherURL     string
-		labels         string
-		annotations    string
-		nameLabel      string
-		nameAnnotation string
-		logLevel       string
+		cfg               projectSyncConfig
+		rancherURL        string
+		labels            string
+		annotations       string
+		nameLabel         string
+		nameAnnotation    string
+		logLevel          string
+		openbaoAddr       string
+		openbaoRancherURL string
+		openbao           projectsync.OpenBaoConfig
 	)
 	flags.StringVar(&cfg.listen, "listen", ":8080", "listen address")
 	flags.StringVar(&rancherURL, "rancher-url", "", "Rancher URL, http:// or https://")
@@ -163,6 +169,16 @@ func parseProjectSyncConfig(args []string, output io.Writer, getenv func(string)
 		"annotation key on the namespace that gets the display name of the project")
 	flags.BoolVar(&cfg.serviceAccounts, "service-accounts", false,
 		"keep one ServiceAccount per project role for every project, in an account project of each cluster")
+	flags.StringVar(&openbaoAddr, "openbao-address", "",
+		"OpenBao URL, http:// or https://, that gets the Kubernetes secrets engine config of every cluster; empty turns it off")
+	flags.StringVar(&openbao.AuthPath, "openbao-auth-path", "kubernetes", "Kubernetes auth mount of OpenBao that the service logs in to")
+	flags.StringVar(&openbao.Role, "openbao-role", "project-sync", "role of the OpenBao auth mount")
+	flags.StringVar(&openbao.JWTFile, "openbao-jwt-file", "", "file with the ServiceAccount token of the pod, for the OpenBao login")
+	flags.StringVar(&openbao.MountPrefix, "openbao-mount-prefix", "kubernetes",
+		"path prefix of the secrets engine mounts; the config of a cluster is at <prefix>/<cluster id>/config")
+	flags.StringVar(&openbaoRancherURL, "openbao-rancher-url", "", "Rancher URL that OpenBao uses, https:// only")
+	flags.DurationVar(&openbao.TokenTTL, "openbao-token-ttl", 24*time.Hour,
+		"requested lifetime of the cluster token that OpenBao gets; the API server can shorten it")
 	flags.DurationVar(&cfg.interval, "interval", 60*time.Second, "time between two runs")
 	flags.Float64Var(&cfg.patchRate, "patch-rate", 10,
 		"namespace patches and project namespace lists per second that the watches of one cluster send, together")
@@ -208,7 +224,63 @@ func parseProjectSyncConfig(args []string, output io.Writer, getenv func(string)
 	if len(cfg.labels)+len(cfg.annotations) == 0 && cfg.nameLabel == "" && cfg.nameAnnotation == "" && !cfg.serviceAccounts {
 		return projectSyncConfig{}, errors.New("-labels, -annotations, -name-label or -name-annotation needs at least one key, or -service-accounts must be set")
 	}
+	if cfg.openbao, err = parseOpenBao(flags, cfg.serviceAccounts, openbaoAddr, openbaoRancherURL, openbao); err != nil {
+		return projectSyncConfig{}, err
+	}
 	return cfg, nil
+}
+
+// parseOpenBao validates the OpenBao flags. It returns nil when address is
+// empty, because that turns the OpenBao config off.
+func parseOpenBao(flags *flag.FlagSet, serviceAccounts bool, address, rancherURL string, cfg projectsync.OpenBaoConfig) (*projectsync.OpenBaoConfig, error) {
+	var set []string
+	flags.Visit(func(f *flag.Flag) {
+		if strings.HasPrefix(f.Name, "openbao-") {
+			set = append(set, f.Name)
+		}
+	})
+	if len(set) > 0 && !serviceAccounts {
+		return nil, fmt.Errorf("-%s needs -service-accounts", set[0])
+	}
+	if address == "" {
+		return nil, nil
+	}
+
+	var err error
+	if cfg.Address, err = parseServiceURL("-openbao-address", address, false); err != nil {
+		return nil, err
+	}
+	if rancherURL == "" {
+		return nil, errors.New("-openbao-rancher-url is required, because -openbao-address is set")
+	}
+	if cfg.RancherURL, err = parseServiceURL("-openbao-rancher-url", rancherURL, true); err != nil {
+		return nil, err
+	}
+	if cfg.JWTFile == "" {
+		return nil, errors.New("-openbao-jwt-file is required, because -openbao-address is set")
+	}
+	for _, item := range []struct{ name, value string }{
+		{"-openbao-auth-path", cfg.AuthPath},
+		{"-openbao-role", cfg.Role},
+		{"-openbao-mount-prefix", cfg.MountPrefix},
+	} {
+		if strings.Trim(item.value, "/") == "" {
+			return nil, fmt.Errorf("%s is empty", item.name)
+		}
+	}
+	if cfg.TokenTTL < 10*time.Minute {
+		return nil, fmt.Errorf("-openbao-token-ttl %s is shorter than 10m0s, the minimum of a token request", cfg.TokenTTL)
+	}
+	return &cfg, nil
+}
+
+// openbaoAddress returns the OpenBao address for the start line, or "" when
+// the OpenBao config is off.
+func openbaoAddress(cfg *projectsync.OpenBaoConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	return cfg.Address.Redacted()
 }
 
 // parseNameKey validates the key of a -name-label or -name-annotation flag.

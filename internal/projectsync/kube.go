@@ -68,10 +68,34 @@ type object struct {
 	Spec       any        `json:"spec,omitempty"`
 }
 
-// maxKept bounds the subjects and the owner references that the service
-// keeps of a listed binding. A tenant can edit a binding in its namespace, and
-// the service only needs to see that a list has more than one entry.
-const maxKept = 2
+type policyRule struct {
+	APIGroups     []string `json:"apiGroups"`
+	Resources     []string `json:"resources"`
+	Verbs         []string `json:"verbs"`
+	ResourceNames []string `json:"resourceNames,omitempty"`
+}
+
+// role is a Role of rbac.authorization.k8s.io.
+type role struct {
+	APIVersion string       `json:"apiVersion,omitempty"`
+	Kind       string       `json:"kind,omitempty"`
+	Metadata   objectMeta   `json:"metadata"`
+	Rules      []policyRule `json:"rules"`
+}
+
+const (
+	// maxKept bounds the subjects and the owner references that the service
+	// keeps of a listed binding. A tenant can edit a binding in its namespace,
+	// and the service only needs to see that a list has more than one entry.
+	maxKept = 2
+
+	// maxKeptRules and maxKeptRuleItems bound the rules of a listed Role, and
+	// the entries of each list in a rule. A tenant can label a Role in its own
+	// namespace. The Role of the service has 2 rules with at most 3 entries per
+	// list, and the service needs one more to see a difference.
+	maxKeptRules     = 3
+	maxKeptRuleItems = 4
+)
 
 // pruneBinding keeps the fields that the service compares. The labels keep
 // only the keys of the service.
@@ -85,6 +109,30 @@ func pruneBinding(item binding) binding {
 		item.Metadata.OwnerReferences = item.Metadata.OwnerReferences[:maxKept]
 	}
 	return item
+}
+
+// pruneRole keeps the fields that the service compares. The labels keep only
+// the keys of the service.
+func pruneRole(item role) role {
+	item.Metadata.Labels = pick(item.Metadata.Labels, []string{accountProjectKey, accountRoleKey})
+	item.Metadata.Annotations = nil
+	item.Metadata.OwnerReferences = cut(item.Metadata.OwnerReferences, maxKept)
+	item.Rules = cut(item.Rules, maxKeptRules)
+	for i := range item.Rules {
+		rule := &item.Rules[i]
+		rule.APIGroups = cut(rule.APIGroups, maxKeptRuleItems)
+		rule.Resources = cut(rule.Resources, maxKeptRuleItems)
+		rule.Verbs = cut(rule.Verbs, maxKeptRuleItems)
+		rule.ResourceNames = cut(rule.ResourceNames, maxKeptRuleItems)
+	}
+	return item
+}
+
+func cut[T any](items []T, n int) []T {
+	if len(items) > n {
+		return items[:n]
+	}
+	return items
 }
 
 // pruneObject keeps the name, the namespace, the uid, and the labels of the
@@ -238,6 +286,13 @@ func roleBindingsPath(cluster, ns string) string {
 		return clusterPath(cluster) + "/apis/" + rbacAPIVersion + "/rolebindings"
 	}
 	return clusterPath(cluster) + "/apis/" + rbacAPIVersion + "/namespaces/" + ns + "/rolebindings"
+}
+
+func rolesPath(cluster, ns string) string {
+	if ns == "" {
+		return clusterPath(cluster) + "/apis/" + rbacAPIVersion + "/roles"
+	}
+	return clusterPath(cluster) + "/apis/" + rbacAPIVersion + "/namespaces/" + ns + "/roles"
 }
 
 func clusterRoleBindingsPath(cluster string) string {

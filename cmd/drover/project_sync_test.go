@@ -2,7 +2,9 @@ package main
 
 import (
 	"io"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseProjectSyncConfigTelemetryDefaults(t *testing.T) {
@@ -112,5 +114,98 @@ func TestParseProjectSyncConfigTelemetryFromEnvironment(t *testing.T) {
 	}
 	if cfg.telemetry.ServiceName != "custom" {
 		t.Errorf("service name = %q, want custom", cfg.telemetry.ServiceName)
+	}
+}
+
+// openbaoArgs are the flags of a valid project-sync with the OpenBao config
+// on, followed by args.
+func openbaoArgs(args ...string) []string {
+	return append([]string{
+		"--rancher-url", "https://rancher.cattle-system",
+		"--token-file", "/dev/null",
+		"--service-accounts",
+		"--openbao-address", "http://drover-openbao-active.drover-system:8200",
+		"--openbao-jwt-file", "/var/run/secrets/openbao/token",
+		"--openbao-rancher-url", "https://rancher.example.com/",
+	}, args...)
+}
+
+func TestParseProjectSyncConfigOpenBao(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := parseProjectSyncConfig(openbaoArgs(), io.Discard, noEnvironment)
+	if err != nil {
+		t.Fatalf("parseProjectSyncConfig: %v", err)
+	}
+	bao := cfg.openbao
+	if bao == nil {
+		t.Fatal("OpenBao config = nil, want one")
+	}
+	if got := bao.Address.String(); got != "http://drover-openbao-active.drover-system:8200" {
+		t.Errorf("address = %q", got)
+	}
+	if got := bao.RancherURL.String(); got != "https://rancher.example.com" {
+		t.Errorf("rancher url = %q, want https://rancher.example.com", got)
+	}
+	if bao.JWTFile != "/var/run/secrets/openbao/token" {
+		t.Errorf("jwt file = %q", bao.JWTFile)
+	}
+	if bao.AuthPath != "kubernetes" || bao.Role != "project-sync" || bao.MountPrefix != "kubernetes" || bao.TokenTTL != 24*time.Hour {
+		t.Errorf("defaults = auth path %q, role %q, mount prefix %q, ttl %s; want kubernetes, project-sync, kubernetes, 24h0m0s",
+			bao.AuthPath, bao.Role, bao.MountPrefix, bao.TokenTTL)
+	}
+
+	cfg, err = parseProjectSyncConfig([]string{
+		"--rancher-url", "https://rancher.cattle-system",
+		"--token-file", "/dev/null",
+		"--service-accounts",
+		"--openbao-role", "other",
+	}, io.Discard, noEnvironment)
+	if err != nil {
+		t.Fatalf("parseProjectSyncConfig without an address: %v", err)
+	}
+	if cfg.openbao != nil {
+		t.Error("OpenBao config without an address = set, want nil")
+	}
+}
+
+func TestParseProjectSyncConfigOpenBaoErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"address without service accounts", []string{
+			"--rancher-url", "https://rancher.cattle-system", "--token-file", "/dev/null", "--labels", "team",
+			"--openbao-address", "http://openbao:8200",
+		}, "-openbao-address needs -service-accounts"},
+		{"another OpenBao flag without service accounts", []string{
+			"--rancher-url", "https://rancher.cattle-system", "--token-file", "/dev/null", "--labels", "team",
+			"--openbao-role", "other",
+		}, "-openbao-role needs -service-accounts"},
+		{"address with a path", openbaoArgs("--openbao-address", "http://openbao:8200/v1"), "-openbao-address path"},
+		{"address with another scheme", openbaoArgs("--openbao-address", "ftp://openbao:8200"), "-openbao-address scheme"},
+		{"no rancher url", openbaoArgs("--openbao-rancher-url", ""), "-openbao-rancher-url is required"},
+		{"rancher url over http", openbaoArgs("--openbao-rancher-url", "http://rancher.example.com"), "is not https"},
+		{"rancher url with a path", openbaoArgs("--openbao-rancher-url", "https://rancher.example.com/rancher"), "-openbao-rancher-url path"},
+		{"no jwt file", openbaoArgs("--openbao-jwt-file", ""), "-openbao-jwt-file is required"},
+		{"empty auth path", openbaoArgs("--openbao-auth-path", "/"), "-openbao-auth-path is empty"},
+		{"empty role", openbaoArgs("--openbao-role", ""), "-openbao-role is empty"},
+		{"empty mount prefix", openbaoArgs("--openbao-mount-prefix", ""), "-openbao-mount-prefix is empty"},
+		{"short token lifetime", openbaoArgs("--openbao-token-ttl", "5m"), "-openbao-token-ttl 5m0s is shorter"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := parseProjectSyncConfig(tt.args, io.Discard, noEnvironment)
+			if err == nil {
+				t.Fatal("parseProjectSyncConfig = nil error, want an error")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.want)
+			}
+		})
 	}
 }
