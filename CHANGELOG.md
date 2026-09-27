@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.22.0](https://github.com/evil8io/drover/compare/v0.21.0...v0.22.0) (2026-09-27)
+
+
+### Features
+
+* **project-sync:** keep the OpenBao mounts, roles, and policies ([#109](https://github.com/evil8io/drover/issues/109)) ([3abc381](https://github.com/evil8io/drover/commit/3abc381a04da31d4e949aaff1487957943af6592))
+* **project-sync:** write the OpenBao Role and RoleBinding from the project watch ([#108](https://github.com/evil8io/drover/issues/108)) ([347ffe8](https://github.com/evil8io/drover/commit/347ffe8c3bc472b11f16e0c14e8f85a2a5939080))
+
+
+### Bug Fixes
+
+* **telemetry:** send no service.name for an empty service name ([#106](https://github.com/evil8io/drover/issues/106)) ([66fcaff](https://github.com/evil8io/drover/commit/66fcaff1ad881d6b299bd15853f4022465757e9e))
+
 ## [0.21.0](https://github.com/evil8io/drover/compare/v0.20.0...v0.21.0) (2026-09-27)
 
 
