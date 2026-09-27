@@ -757,3 +757,131 @@ func TestNewChecksTheOpenBaoConfig(t *testing.T) {
 		t.Errorf("New with a valid OpenBao config = %v, want no error", err)
 	}
 }
+
+// listNewProject runs the lister for the new project p-new of acctCluster,
+// with the account project p-acct and the OpenBao namespace uid space in the
+// account view, and no reconcile run.
+func listNewProject(t *testing.T, setup *openbaoSetup, space string) {
+	t.Helper()
+	markedProject(setup.fake, "p-acct")
+	setup.syncer.setAccounts(acctCluster, accountState{projects: []string{"p-acct"}, openbao: space})
+	setup.syncer.setClusters(map[string]map[string]project{
+		acctCluster: {"p-new": {ID: acctCluster + ":p-new", ClusterID: acctCluster, Name: "p-new"}},
+	})
+	setup.syncer.listProject(context.Background(), acctCluster, "p-new", newClusterWatch(10).patches)
+}
+
+func TestListProjectGivesANewProjectTheOpenBaoRoleAndRoleBinding(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	setup := newOpenBaoSetup(t, fake)
+
+	listNewProject(t, setup, "uid-bao")
+
+	nsName := accountNamespace("p-new")
+	rolePosts := filterMethod(fake.requestsOfPath(rolesPath(acctCluster, nsName)), http.MethodPost)
+	if len(rolePosts) != 1 {
+		t.Fatalf("role create requests in %s = %d, want 1", nsName, len(rolePosts))
+	}
+	if got := decodeBody[role](t, rolePosts[0].body).Rules; !reflect.DeepEqual(got, wantOpenBaoRules()) {
+		t.Errorf("rules = %+v, want %+v", got, wantOpenBaoRules())
+	}
+	var created *binding
+	for _, req := range filterMethod(fake.requestsOfPath(roleBindingsPath(acctCluster, nsName)), http.MethodPost) {
+		if b := decodeBody[binding](t, req.body); b.Metadata.Name == openbaoNamespace {
+			created = &b
+		}
+	}
+	if created == nil {
+		t.Fatalf("no create of the role binding %s in %s", openbaoNamespace, nsName)
+	}
+	wantOwner := []ownerReference{{APIVersion: "v1", Kind: "Namespace", Name: openbaoNamespace, UID: "uid-bao"}}
+	if !reflect.DeepEqual(created.Metadata.OwnerReferences, wantOwner) {
+		t.Errorf("owner references = %+v, want %+v", created.Metadata.OwnerReferences, wantOwner)
+	}
+
+	if got := fake.requestsOfPath(projectsPath); len(got) != 0 {
+		t.Errorf("project list requests = %d, want 0, because no reconcile run ran", len(got))
+	}
+	if got := fake.requestsOfPath(rolesPath(acctCluster, "")); len(got) != 0 {
+		t.Errorf("role list requests = %d, want 0", len(got))
+	}
+	if got := fake.requestsOfPath(namespacePath(acctCluster, openbaoNamespace)); len(got) != 0 {
+		t.Errorf("requests of the OpenBao namespace = %d, want 0", len(got))
+	}
+	state, _ := setup.syncer.accountsOf(acctCluster)
+	if state.openbao != "uid-bao" {
+		t.Errorf("OpenBao namespace uid after the lister = %q, want uid-bao", state.openbao)
+	}
+}
+
+func TestListProjectGivesNoOpenBaoObjectsWithoutATrustedNamespace(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	setup := newOpenBaoSetup(t, fake)
+
+	listNewProject(t, setup, "")
+
+	nsName := accountNamespace("p-new")
+	if got := fake.requestsOfPath(rolesPath(acctCluster, nsName)); len(got) != 0 {
+		t.Errorf("role requests in %s = %d, want 0", nsName, len(got))
+	}
+	if got := fake.requestsOfPath(roleBindingsPath(acctCluster, nsName)); len(got) != 0 {
+		t.Errorf("role binding requests in %s = %d, want 0", nsName, len(got))
+	}
+	if got := filterMethod(fake.requestsOfPath(serviceAccountsPath(acctCluster, nsName)), http.MethodPost); len(got) != 3 {
+		t.Errorf("service account create requests = %d, want 3", len(got))
+	}
+}
+
+func TestListProjectCorrectsTheOpenBaoRoleBindingOfAnExistingProject(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	setup := newOpenBaoSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+
+	nsName := accountNamespace("p-alpha")
+	fake.mutateRoleBinding(nsName, openbaoNamespace, func(b *binding) {
+		b.Subjects = append(b.Subjects, subject{Kind: "ServiceAccount", Name: "intruder", Namespace: "ns-a"})
+	})
+	fake.resetRequests()
+	setup.syncer.listProject(context.Background(), acctCluster, "p-alpha", newClusterWatch(10).patches)
+
+	path := roleBindingsPath(acctCluster, nsName) + "/" + openbaoNamespace
+	puts := filterMethod(fake.requestsOfPath(path), http.MethodPut)
+	if len(puts) != 1 {
+		t.Fatalf("role binding update requests = %d, want 1", len(puts))
+	}
+	want := []subject{{Kind: "ServiceAccount", Name: openbaoAccount, Namespace: openbaoNamespace}}
+	if got := decodeBody[binding](t, puts[0].body).Subjects; !reflect.DeepEqual(got, want) {
+		t.Errorf("subjects after the update = %+v, want %+v", got, want)
+	}
+	rolePath := rolesPath(acctCluster, nsName) + "/" + openbaoNamespace
+	if got := filterMethod(fake.requestsOfPath(rolePath), http.MethodPut); len(got) != 0 {
+		t.Errorf("role update requests = %d, want 0", len(got))
+	}
+}
+
+func TestReconcileKeepsTheOpenBaoNamespaceUidOnlyWhileItIsTrusted(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	fake.addProject("p-beta", nil)
+	setup := newOpenBaoSetup(t, fake)
+
+	setup.syncer.reconcile(context.Background())
+	state, _ := setup.syncer.accountsOf(acctCluster)
+	if want := fake.namespaceUID(openbaoNamespace); state.openbao != want || want == "" {
+		t.Fatalf("OpenBao namespace uid after a trusted run = %q, want %q", state.openbao, want)
+	}
+
+	fake.mutateNamespace(openbaoNamespace, func(ns *namespace) {
+		ns.Metadata.Annotations = map[string]string{projectAnnotation: acctCluster + ":p-beta"}
+	})
+	setup.syncer.reconcile(context.Background())
+	state, _ = setup.syncer.accountsOf(acctCluster)
+	if state.openbao != "" {
+		t.Errorf("OpenBao namespace uid after an untrusted run = %q, want empty", state.openbao)
+	}
+}

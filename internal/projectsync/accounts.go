@@ -80,6 +80,10 @@ type accountState struct {
 	// worker skips a namespace whose key is unchanged since that run, so a
 	// watch replay after a restart costs no request.
 	settled map[string]string
+	// openbao is the uid of the OpenBao namespace when the last run trusted
+	// it, and "" otherwise. The lister gives it to the OpenBao RoleBinding of
+	// a project as owner.
+	openbao string
 }
 
 // trust is the outcome of the check of an account namespace.
@@ -235,7 +239,8 @@ func (s *Syncer) setAccountNamespace(cluster, name, uid string) {
 		namespaces[name] = uid
 	}
 	next := maps.Clone(s.accounts)
-	next[cluster] = accountState{projects: state.projects, namespaces: namespaces, settled: state.settled}
+	state.namespaces = namespaces
+	next[cluster] = state
 	s.accounts = next
 }
 
@@ -360,9 +365,9 @@ func (s *Syncer) syncAccounts(ctx context.Context, token, cluster string, projec
 		}
 	}
 
-	var account string
+	var space, account string
 	if s.openbao != nil {
-		account = s.syncOpenBao(ctx, token, cluster, owners, byName, trusted, roleBindings, roleBindingsIn, run)
+		space, account = s.syncOpenBao(ctx, token, cluster, owners, byName, trusted, roleBindings, roleBindingsIn, run)
 	}
 
 	s.dropStrayRoleBindings(ctx, token, cluster, projects, byName, trusted, pending, roleBindings, run)
@@ -380,7 +385,7 @@ func (s *Syncer) syncAccounts(ctx context.Context, token, cluster string, projec
 			settled[item.Metadata.Name] = settledKey(name, "")
 		}
 	}
-	s.setAccounts(cluster, accountState{projects: owners, namespaces: trusted, settled: settled})
+	s.setAccounts(cluster, accountState{projects: owners, namespaces: trusted, settled: settled, openbao: space})
 
 	s.sweepAccountNamespaces(ctx, token, cluster, projects, self, owners, namespaces, trusted, clusterBindingsOf, roleBindingsOf, run)
 	return account
@@ -871,8 +876,9 @@ func (s *Syncer) projectGone(ctx context.Context, token, cluster, name string) (
 }
 
 // ensureProjectAccounts brings the accounts of one project up to date after a
-// project event: the account namespace, the ServiceAccounts, and the cluster
-// role bindings. The worker then handles the role bindings of each namespace
+// project event: the account namespace, the ServiceAccounts, the cluster role
+// bindings, and the OpenBao Role and RoleBinding when the last run trusted the
+// OpenBao namespace. The worker then handles the role bindings of each namespace
 // of the project. A namespace in no project waits for the reconcile run,
 // because only the run knows the account projects for certain.
 func (s *Syncer) ensureProjectAccounts(ctx context.Context, token, cluster, name string) {
@@ -912,6 +918,9 @@ func (s *Syncer) ensureProjectAccounts(ctx context.Context, token, cluster, name
 	}
 	s.ensureAccounts(ctx, token, cluster, name, accounts, nil)
 	s.ensureClusterBindings(ctx, token, cluster, name, uid, clusterBindings, nil)
+	if s.openbao != nil && state.openbao != "" {
+		s.ensureOpenBaoAccess(ctx, token, cluster, name, state.openbao, nil, nil, nil)
+	}
 	s.setAccountNamespace(cluster, name, uid)
 }
 

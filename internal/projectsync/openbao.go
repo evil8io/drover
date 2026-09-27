@@ -234,9 +234,9 @@ func openbaoRoleBinding(project, uid string) binding {
 // in the account namespace of every project of trusted. trusted maps a tenant
 // project to the uid of its account namespace. roleBindings are the listed
 // role bindings with the role label, and roleBindingsIn has them by
-// namespace. syncOpenBao returns the uid of the ServiceAccount when the
-// namespace is trusted, and "" otherwise.
-func (s *Syncer) syncOpenBao(ctx context.Context, token, cluster string, owners []string, byName map[string]namespace, trusted map[string]string, roleBindings []binding, roleBindingsIn map[string][]binding, run *counters) string {
+// namespace. When the namespace is trusted, syncOpenBao returns its uid and
+// the uid of the ServiceAccount. Otherwise it returns "" for both.
+func (s *Syncer) syncOpenBao(ctx context.Context, token, cluster string, owners []string, byName map[string]namespace, trusted map[string]string, roleBindings []binding, roleBindingsIn map[string][]binding, run *counters) (string, string) {
 	// Only the service and an admin write in an account namespace, so an
 	// OpenBao RoleBinding there proves the owner of the OpenBao namespace.
 	var proof []binding
@@ -250,7 +250,7 @@ func (s *Syncer) syncOpenBao(ctx context.Context, token, cluster string, owners 
 	uid, outcome := s.checkAccountNamespace(ctx, token, cluster, openbaoSpace(), owners, item, listed, proof, true, run)
 	switch outcome {
 	case trustUnknown:
-		return ""
+		return "", ""
 	case trustNo:
 		// A RoleBinding names the ServiceAccount by namespace and name, so it
 		// would grant the ServiceAccount of the namespace owner.
@@ -259,7 +259,7 @@ func (s *Syncer) syncOpenBao(ctx context.Context, token, cluster string, owners 
 				s.dropBinding(ctx, token, cluster, roleBindingsPath(cluster, item.Metadata.Namespace), item, item.Metadata.Labels[accountProjectKey], run)
 			}
 		}
-		return ""
+		return "", ""
 	}
 
 	account := s.ensureOpenBaoAccount(ctx, token, cluster, run)
@@ -267,18 +267,27 @@ func (s *Syncer) syncOpenBao(ctx context.Context, token, cluster string, owners 
 	roles, err := listAll(ctx, s, token, rolesPath(cluster, ""), accountRoleKey+"="+openbaoLabel, pruneRole)
 	if err != nil {
 		s.accountFailure(ctx, run, "the role list request failed", err, "cluster", cluster)
-		return account
+		return uid, account
 	}
 	rolesIn := groupBy(roles, func(item role) string { return item.Metadata.Namespace })
 	for _, name := range slices.Sorted(maps.Keys(trusted)) {
 		nsName := accountNamespace(name)
-		wantRole := openbaoRole(name)
-		s.reconcileRole(ctx, token, cluster, wantRole, findRole(rolesIn[nsName], wantRole.Metadata.Name), name, run)
-		wantBinding := openbaoRoleBinding(name, uid)
-		s.reconcileBinding(ctx, token, cluster, roleBindingsPath(cluster, nsName), wantBinding,
-			findBinding(roleBindingsIn[nsName], wantBinding.Metadata.Name), name, run)
+		s.ensureOpenBaoAccess(ctx, token, cluster, name, uid, rolesIn[nsName], roleBindingsIn[nsName], run)
 	}
-	return account
+	return uid, account
+}
+
+// ensureOpenBaoAccess reconciles the OpenBao Role and RoleBinding in the
+// account namespace of project name. uid is the uid of the trusted OpenBao
+// namespace. roles and bindings are the listed objects of that account
+// namespace. Without them, the service creates each object first, and reads
+// it after a 409.
+func (s *Syncer) ensureOpenBaoAccess(ctx context.Context, token, cluster, name, uid string, roles []role, bindings []binding, run *counters) {
+	wantRole := openbaoRole(name)
+	s.reconcileRole(ctx, token, cluster, wantRole, findRole(roles, wantRole.Metadata.Name), name, run)
+	wantBinding := openbaoRoleBinding(name, uid)
+	s.reconcileBinding(ctx, token, cluster, roleBindingsPath(cluster, accountNamespace(name)), wantBinding,
+		findBinding(bindings, wantBinding.Metadata.Name), name, run)
 }
 
 func findRole(items []role, name string) *role {

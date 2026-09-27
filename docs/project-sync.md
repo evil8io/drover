@@ -144,7 +144,8 @@ The Role and the RoleBinding have the labels `drover-project: <project>` and `dr
 - The service uses the namespace `drover-openbao` only in an account project, as it does with an account namespace. A tenant can create the name first in its own project. The service then writes a warning, writes no config for that cluster, and deletes every RoleBinding `drover-openbao` of the cluster.
 - A namespace `drover-openbao` in no project moves into the account project only when a RoleBinding `drover-openbao` in an account namespace names it as owner.
 - A project that gets no accounts, or whose account namespace the reconcile run deletes, loses its RoleBinding `drover-openbao` together with its other bindings.
-- The reconcile run corrects a Role or a RoleBinding that differs, and creates a missing one again. The project watch does not create them, so a new project waits for the next run.
+- A new or changed project gets its Role and RoleBinding within seconds, through the project watch, together with its ServiceAccounts. The project watch writes them only after a reconcile run trusted the namespace `drover-openbao` of that cluster, because the RoleBinding needs its uid as owner. Until then, the next reconcile run creates them.
+- The reconcile run corrects a Role or a RoleBinding that differs, and creates a missing one again.
 - A project with the name `openbao` gets no accounts, because its account namespace is `drover-openbao`.
 - The service deletes none of these objects when `--openbao-address` goes empty. It also keeps the config of a removed cluster in OpenBao.
 - To make the token in OpenBao invalid, delete the ServiceAccount `openbao`. The next run creates it again, and writes a new token. Do not delete the namespace `drover-openbao` for this, for the reason in [Service accounts](#service-accounts).
