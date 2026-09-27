@@ -276,13 +276,13 @@ func (s *Syncer) accountChanged(ctx context.Context, run *counters, cluster, kin
 
 // syncAccounts reconciles the accounts of every project of one cluster.
 // namespaces are the namespaces of the cluster with a project label. It
-// returns the uid of the OpenBao ServiceAccount of the cluster when the run
-// keeps the OpenBao objects, and "" otherwise.
-func (s *Syncer) syncAccounts(ctx context.Context, token, cluster string, projects map[string]project, namespaces []namespace, run *counters) string {
+// returns the OpenBao target of the cluster when the run keeps the OpenBao
+// objects, and nil otherwise.
+func (s *Syncer) syncAccounts(ctx context.Context, token, cluster string, projects map[string]project, namespaces []namespace, run *counters) *openbaoTarget {
 	self, err := s.selfID(ctx, token)
 	if err != nil {
 		s.accountFailure(ctx, run, "the user request failed", err, "cluster", cluster)
-		return ""
+		return nil
 	}
 
 	owners := accountProjects(projects, self)
@@ -290,7 +290,7 @@ func (s *Syncer) syncAccounts(ctx context.Context, token, cluster string, projec
 		name, err := s.createAccountProject(ctx, token, cluster, self)
 		if err != nil {
 			s.accountFailure(ctx, run, "the account project create failed", err, "cluster", cluster)
-			return ""
+			return nil
 		}
 		s.accountChanged(ctx, run, cluster, "project", "create", "", name, "")
 		owners = []string{name}
@@ -299,17 +299,17 @@ func (s *Syncer) syncAccounts(ctx context.Context, token, cluster string, projec
 	accounts, err := listAll(ctx, s, token, serviceAccountsPath(cluster, ""), accountProjectKey, pruneObject)
 	if err != nil {
 		s.accountFailure(ctx, run, "the service account list request failed", err, "cluster", cluster)
-		return ""
+		return nil
 	}
 	clusterBindings, err := listAll(ctx, s, token, clusterRoleBindingsPath(cluster), accountProjectKey, pruneBinding)
 	if err != nil {
 		s.accountFailure(ctx, run, "the cluster role binding list request failed", err, "cluster", cluster)
-		return ""
+		return nil
 	}
 	roleBindings, err := listAll(ctx, s, token, roleBindingsPath(cluster, ""), accountRoleKey, pruneBinding)
 	if err != nil {
 		s.accountFailure(ctx, run, "the role binding list request failed", err, "cluster", cluster)
-		return ""
+		return nil
 	}
 
 	byName := make(map[string]namespace, len(namespaces))
@@ -388,7 +388,10 @@ func (s *Syncer) syncAccounts(ctx context.Context, token, cluster string, projec
 	s.setAccounts(cluster, accountState{projects: owners, namespaces: trusted, settled: settled, openbao: space})
 
 	s.sweepAccountNamespaces(ctx, token, cluster, projects, self, owners, namespaces, trusted, clusterBindingsOf, roleBindingsOf, run)
-	return account
+	if account == "" {
+		return nil
+	}
+	return &openbaoTarget{account: account, tenants: slices.Sorted(maps.Keys(trusted))}
 }
 
 // groupBy returns items by the key that key returns.
@@ -877,8 +880,8 @@ func (s *Syncer) projectGone(ctx context.Context, token, cluster, name string) (
 
 // ensureProjectAccounts brings the accounts of one project up to date after a
 // project event: the account namespace, the ServiceAccounts, the cluster role
-// bindings, and the OpenBao Role and RoleBinding when the last run trusted the
-// OpenBao namespace. The worker then handles the role bindings of each namespace
+// bindings, and, when the last run trusted the OpenBao namespace, the OpenBao
+// Role and RoleBinding, and the roles and policies in OpenBao. The worker then handles the role bindings of each namespace
 // of the project. A namespace in no project waits for the reconcile run,
 // because only the run knows the account projects for certain.
 func (s *Syncer) ensureProjectAccounts(ctx context.Context, token, cluster, name string) {
@@ -920,6 +923,7 @@ func (s *Syncer) ensureProjectAccounts(ctx context.Context, token, cluster, name
 	s.ensureClusterBindings(ctx, token, cluster, name, uid, clusterBindings, nil)
 	if s.openbao != nil && state.openbao != "" {
 		s.ensureOpenBaoAccess(ctx, token, cluster, name, state.openbao, nil, nil, nil)
+		s.writeOpenBaoProject(ctx, cluster, name)
 	}
 	s.setAccountNamespace(cluster, name, uid)
 }

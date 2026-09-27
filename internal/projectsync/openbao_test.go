@@ -125,8 +125,8 @@ func TestReconcileKeepsTheOpenBaoObjectsOfEveryAccountNamespace(t *testing.T) {
 	if got := fake.requestsOfPath(projectsPath + "/" + acctCluster + ":openbao"); len(got) != 0 {
 		t.Errorf("project requests for the OpenBao namespace = %d, want 0", len(got))
 	}
-	if got := setup.bao.all(); len(got) != 0 {
-		t.Errorf("OpenBao requests of the second run = %d, want 0", len(got))
+	if got := setup.bao.changes(); len(got) != 0 {
+		t.Errorf("OpenBao writes of the second run = %d, want 0:\n%v", len(got), got)
 	}
 }
 
@@ -374,12 +374,13 @@ func TestReconcileWritesTheConfigOfAClusterIntoOpenBao(t *testing.T) {
 	}
 
 	requests := setup.bao.all()
-	if len(requests) != 2 {
-		t.Fatalf("OpenBao requests = %d, want a login and a write", len(requests))
+	logins, writes := setup.bao.logins(), setup.bao.writes(acctCluster)
+	if len(logins) != 1 || len(writes) != 1 {
+		t.Fatalf("OpenBao logins and config writes = %d and %d, want 1 and 1", len(logins), len(writes))
 	}
-	login, write := requests[0], requests[1]
-	if login.path != "/v1/auth/kubernetes/login" {
-		t.Fatalf("first OpenBao request = %s, want the login", login.path)
+	login, write := logins[0], writes[0]
+	if requests[0].path != "/v1/auth/kubernetes/login" {
+		t.Fatalf("first OpenBao request = %s, want the login", requests[0].path)
 	}
 	if got, want := decodeMap(t, login.body), map[string]any{"role": baoRole, "jwt": "jwt-1"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("login body = %v, want %v", got, want)
@@ -464,11 +465,12 @@ func TestReconcileWritesAgainAfterHalfOfTheRealTokenLifetime(t *testing.T) {
 			if got := fake.requestsOfPath(tokenRequestPath(acctCluster)); len(got) != 0 {
 				t.Errorf("token requests inside the first half = %d, want 0", len(got))
 			}
-			if got := setup.bao.all(); len(got) != 0 {
-				t.Errorf("OpenBao requests inside the first half = %d, want 0", len(got))
+			if got := setup.bao.writes(acctCluster); len(got) != 0 {
+				t.Errorf("OpenBao config writes inside the first half = %d, want 0", len(got))
 			}
 
 			setup.clock.advance(tc.after)
+			setup.bao.reset()
 			setup.syncer.reconcile(context.Background())
 			tokenRequests := fake.requestsOfPath(tokenRequestPath(acctCluster))
 			if len(tokenRequests) != 1 {
@@ -477,9 +479,6 @@ func TestReconcileWritesAgainAfterHalfOfTheRealTokenLifetime(t *testing.T) {
 			spec, _ := decodeMap(t, tokenRequests[0].body)["spec"].(map[string]any)
 			if got := spec["expirationSeconds"]; got != float64(86400) {
 				t.Errorf("requested lifetime = %v, want 86400", got)
-			}
-			if got := setup.bao.logins(); len(got) != 1 {
-				t.Errorf("OpenBao logins after the first half = %d, want 1", len(got))
 			}
 			writes := setup.bao.writes(acctCluster)
 			if len(writes) != 1 {
@@ -690,7 +689,7 @@ func TestRefreshOpenBaoLogsInOncePerRun(t *testing.T) {
 
 	var run counters
 	setup.syncer.refreshOpenBao(context.Background(), serviceToken, []string{"c-1", "c-2"},
-		map[string]string{"c-1": "uid-1", "c-2": "uid-2"}, &run)
+		map[string]openbaoTarget{"c-1": {account: "uid-1"}, "c-2": {account: "uid-2"}}, nil, &run)
 
 	if got := setup.bao.logins(); len(got) != 1 {
 		t.Errorf("OpenBao logins = %d, want 1", len(got))
@@ -721,6 +720,7 @@ func TestNewChecksTheOpenBaoConfig(t *testing.T) {
 		return OpenBaoConfig{
 			Address: address, AuthPath: "kubernetes", Role: baoRole, JWTFile: "/token",
 			MountPrefix: "kubernetes", RancherURL: rancher, TokenTTL: 24 * time.Hour,
+			CredentialTTL: 10 * time.Minute, CredentialMaxTTL: time.Hour,
 		}
 	}
 	insecure, _ := url.Parse("http://rancher.example.com")
@@ -739,6 +739,8 @@ func TestNewChecksTheOpenBaoConfig(t *testing.T) {
 		{name: "an empty auth path", edit: func(c *OpenBaoConfig) { c.AuthPath = "/" }, serviceAccounts: true},
 		{name: "a mount prefix with an empty segment", edit: func(c *OpenBaoConfig) { c.MountPrefix = "a//b" }, serviceAccounts: true},
 		{name: "an empty role", edit: func(c *OpenBaoConfig) { c.Role = "" }, serviceAccounts: true},
+		{name: "a zero credential lifetime", edit: func(c *OpenBaoConfig) { c.CredentialTTL = 0 }, serviceAccounts: true},
+		{name: "a credential lifetime over its maximum", edit: func(c *OpenBaoConfig) { c.CredentialMaxTTL = time.Minute }, serviceAccounts: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -829,6 +831,9 @@ func TestListProjectGivesNoOpenBaoObjectsWithoutATrustedNamespace(t *testing.T) 
 	if got := fake.requestsOfPath(roleBindingsPath(acctCluster, nsName)); len(got) != 0 {
 		t.Errorf("role binding requests in %s = %d, want 0", nsName, len(got))
 	}
+	if got := setup.bao.all(); len(got) != 0 {
+		t.Errorf("OpenBao requests = %d, want 0", len(got))
+	}
 	if got := filterMethod(fake.requestsOfPath(serviceAccountsPath(acctCluster, nsName)), http.MethodPost); len(got) != 3 {
 		t.Errorf("service account create requests = %d, want 3", len(got))
 	}
@@ -883,5 +888,257 @@ func TestReconcileKeepsTheOpenBaoNamespaceUidOnlyWhileItIsTrusted(t *testing.T) 
 	state, _ = setup.syncer.accountsOf(acctCluster)
 	if state.openbao != "" {
 		t.Errorf("OpenBao namespace uid after an untrusted run = %q, want empty", state.openbao)
+	}
+}
+
+// wantRoleData returns the role of project and role as the OpenBao fake
+// stores the body of a role write.
+func wantRoleData(project, role string) map[string]any {
+	return map[string]any{
+		"service_account_name":                  role,
+		"allowed_kubernetes_namespaces":         []any{accountNamespace(project)},
+		"allowed_kubernetes_namespace_selector": "",
+		"kubernetes_role_name":                  "",
+		"generated_role_rules":                  "",
+		"token_default_audiences":               []any{},
+		"token_default_ttl":                     float64(600),
+		"token_max_ttl":                         float64(3600),
+	}
+}
+
+func wantPolicyText(project, role string) string {
+	return "path \"kubernetes/c-1/creds/" + project + "-" + role + "\" {\n  capabilities = [\"update\"]\n}\n"
+}
+
+func policyNameOf(project, role string) string {
+	return "kubernetes-c-1-" + project + "-" + role
+}
+
+// assertCredentials checks the roles and the policies of projects in the
+// OpenBao fake.
+func assertCredentials(t *testing.T, bao *fakeOpenBao, projects ...string) {
+	t.Helper()
+	for _, project := range projects {
+		for _, role := range []string{"project-owner", "project-member", "read-only"} {
+			data, ok := bao.role(acctCluster, project+"-"+role)
+			if !ok || !reflect.DeepEqual(data, wantRoleData(project, role)) {
+				t.Errorf("role %s-%s = %v, want %v", project, role, data, wantRoleData(project, role))
+			}
+			text, ok := bao.policy(policyNameOf(project, role))
+			if !ok || text != wantPolicyText(project, role) {
+				t.Errorf("policy %s = %q, want %q", policyNameOf(project, role), text, wantPolicyText(project, role))
+			}
+		}
+	}
+}
+
+func countRequests(requests []recorded, method, path string) int {
+	n := 0
+	for _, req := range requests {
+		if req.method == method && req.path == path {
+			n++
+		}
+	}
+	return n
+}
+
+func TestReconcileCreatesTheMountTheRolesAndThePolicies(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	fake.addProject("p-beta", nil)
+	setup := newOpenBaoSetup(t, fake)
+
+	setup.syncer.reconcile(context.Background())
+
+	requests := setup.bao.all()
+	mountPath := "/v1/sys/mounts/kubernetes/c-1"
+	mountIndex, configIndex := -1, -1
+	for i, req := range requests {
+		if req.method == http.MethodPost && req.path == mountPath && mountIndex == -1 {
+			mountIndex = i
+			if got := decodeMap(t, req.body); !reflect.DeepEqual(got, map[string]any{"type": "kubernetes"}) {
+				t.Errorf("mount body = %v, want the type kubernetes", got)
+			}
+		}
+		if req.method == http.MethodPost && req.path == "/v1/kubernetes/c-1/config" {
+			configIndex = i
+		}
+	}
+	if mountIndex == -1 || configIndex < mountIndex {
+		t.Errorf("mount create at request %d, config write at %d; want the mount first", mountIndex, configIndex)
+	}
+	assertCredentials(t, setup.bao, "p-alpha", "p-beta")
+	if !strings.Contains(setup.logs.String(), "errors=0") {
+		t.Errorf("the run has errors:\n%s", setup.logs.String())
+	}
+
+	setup.bao.reset()
+	setup.clock.advance(time.Minute)
+	setup.syncer.reconcile(context.Background())
+
+	if got := setup.bao.changes(); len(got) != 0 {
+		t.Errorf("OpenBao writes of the second run = %d, want 0:\n%v", len(got), got)
+	}
+	for _, req := range setup.bao.all() {
+		if req.method == http.MethodGet && req.query.Get("list") == "" && req.path != mountPath {
+			t.Errorf("read %s inside the read interval", req.path)
+		}
+	}
+	if got := setup.bao.logins(); len(got) != 0 {
+		t.Errorf("OpenBao logins of the second run = %d, want 0, because the client token is still valid", len(got))
+	}
+}
+
+func TestReconcileCorrectsAChangedRoleAndPolicyAfterTheReadInterval(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	setup := newOpenBaoSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+
+	changed := wantRoleData("p-alpha", "project-owner")
+	changed["allowed_kubernetes_namespaces"] = []any{"*"}
+	setup.bao.setRole(acctCluster, "p-alpha-project-owner", changed)
+	setup.bao.setPolicy(policyNameOf("p-alpha", "read-only"), "path \"*\" {\n  capabilities = [\"sudo\"]\n}\n")
+
+	setup.clock.advance(9 * time.Minute)
+	setup.syncer.reconcile(context.Background())
+	if data, _ := setup.bao.role(acctCluster, "p-alpha-project-owner"); reflect.DeepEqual(data, wantRoleData("p-alpha", "project-owner")) {
+		t.Error("the role is corrected inside the read interval, want a read only after 10 minutes")
+	}
+
+	setup.bao.reset()
+	setup.clock.advance(time.Minute)
+	setup.syncer.reconcile(context.Background())
+
+	assertCredentials(t, setup.bao, "p-alpha")
+	requests := setup.bao.all()
+	for _, role := range []string{"project-owner", "project-member", "read-only"} {
+		if got := countRequests(requests, http.MethodGet, "/v1/kubernetes/c-1/roles/p-alpha-"+role); got != 1 {
+			t.Errorf("reads of the role p-alpha-%s = %d, want 1", role, got)
+		}
+		if got := countRequests(requests, http.MethodGet, "/v1/sys/policies/acl/"+policyNameOf("p-alpha", role)); got != 1 {
+			t.Errorf("reads of the policy of %s = %d, want 1", role, got)
+		}
+	}
+	if got := setup.bao.changes(); len(got) != 2 {
+		t.Errorf("OpenBao writes = %d, want the role and the policy:\n%v", len(got), got)
+	}
+}
+
+func TestReconcileDeletesTheRolesAndPoliciesOfAGoneProject(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	fake.addProject("p-beta", nil)
+	setup := newOpenBaoSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+	// A role of a project that the list does not have, but that Rancher still
+	// knows.
+	setup.bao.setRole(acctCluster, "p-new-read-only", wantRoleData("p-new", "read-only"))
+	fake.addUnlistedProject("p-new", nil)
+
+	fake.removeProject("p-beta")
+	setup.bao.reset()
+	setup.syncer.reconcile(context.Background())
+
+	requests := setup.bao.all()
+	for _, role := range []string{"project-owner", "project-member", "read-only"} {
+		policyPath := "/v1/sys/policies/acl/" + policyNameOf("p-beta", role)
+		rolePath := "/v1/kubernetes/c-1/roles/p-beta-" + role
+		policyAt, roleAt := -1, -1
+		for i, req := range requests {
+			if req.method == http.MethodDelete && req.path == policyPath {
+				policyAt = i
+			}
+			if req.method == http.MethodDelete && req.path == rolePath {
+				roleAt = i
+			}
+		}
+		if policyAt == -1 || roleAt == -1 || policyAt > roleAt {
+			t.Errorf("deletes of %s: policy at %d, role at %d; want both, the policy first", role, policyAt, roleAt)
+		}
+	}
+	if _, ok := setup.bao.role(acctCluster, "p-new-read-only"); !ok {
+		t.Error("the role of a project that Rancher still knows is deleted")
+	}
+	assertCredentials(t, setup.bao, "p-alpha")
+}
+
+func TestReconcileDeletesNoCredentialWithoutTheFullProjectList(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	fake.addProject("p-beta", nil)
+	setup := newOpenBaoSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+
+	fake.removeProject("p-beta")
+	fake.setListStatus(http.StatusInternalServerError)
+	setup.bao.reset()
+	setup.syncer.reconcile(context.Background())
+
+	for _, req := range setup.bao.all() {
+		if req.method == http.MethodDelete {
+			t.Errorf("DELETE %s without the full project list", req.path)
+		}
+	}
+	assertCredentials(t, setup.bao, "p-alpha", "p-beta")
+}
+
+func TestListProjectWritesTheRolesAndPoliciesOfANewProject(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	setup := newOpenBaoSetup(t, fake)
+	setup.bao.addMount("kubernetes/c-1")
+
+	listNewProject(t, setup, "uid-bao")
+
+	assertCredentials(t, setup.bao, "p-new")
+	for _, req := range setup.bao.all() {
+		if req.method == http.MethodGet {
+			t.Errorf("read %s in the watch path", req.path)
+		}
+	}
+	if got := fake.requestsOfPath(projectsPath); len(got) != 0 {
+		t.Errorf("project list requests = %d, want 0, because no reconcile run ran", len(got))
+	}
+
+	setup.bao.reset()
+	setup.syncer.listProject(context.Background(), acctCluster, "p-new", newClusterWatch(10).patches)
+	if got := setup.bao.all(); len(got) != 0 {
+		t.Errorf("OpenBao requests of a second event inside the read interval = %d, want 0", len(got))
+	}
+}
+
+func TestOpenBaoLogsInAgainOnceAfterA403(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	setup := newOpenBaoSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+
+	setup.bao.revokeTokens()
+	setup.bao.reset()
+	setup.syncer.reconcile(context.Background())
+	if got := setup.bao.logins(); len(got) != 1 {
+		t.Errorf("logins after a revoked token = %d, want 1", len(got))
+	}
+	if strings.Count(setup.logs.String(), "errors=0") != 2 {
+		t.Errorf("a run after a revoked token has errors:\n%s", setup.logs.String())
+	}
+
+	setup.bao.deny("sys/policies/acl")
+	setup.bao.reset()
+	setup.syncer.reconcile(context.Background())
+	if got := countRequests(setup.bao.all(), http.MethodGet, "/v1/sys/policies/acl"); got != 2 {
+		t.Errorf("policy list requests with a denied path = %d, want 2", got)
+	}
+	if got := setup.bao.logins(); len(got) != 1 {
+		t.Errorf("logins with a denied path = %d, want 1", len(got))
+	}
+	if !strings.Contains(setup.logs.String(), `level=ERROR msg="the OpenBao policy list request failed"`) {
+		t.Errorf("no error line for the denied policy list:\n%s", setup.logs.String())
 	}
 }

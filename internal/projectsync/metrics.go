@@ -45,6 +45,7 @@ type metrics struct {
 	changed    metric.Int64Counter
 	accounts   metric.Int64Counter
 	openbao    metric.Int64Counter
+	openbaoSet metric.Int64Counter
 }
 
 // newMetrics creates the instruments of the syncer, on the meter that
@@ -107,6 +108,12 @@ func newMetrics(provider metric.MeterProvider) (*metrics, error) {
 	if err != nil {
 		return nil, err
 	}
+	openbaoSet, err := meter.Int64Counter("drover.sync.openbao.changes",
+		metric.WithDescription("Writes of the OpenBao mounts, roles, and policies."),
+		metric.WithUnit("1"))
+	if err != nil {
+		return nil, err
+	}
 
 	return &metrics{
 		reconciles: reconciles,
@@ -118,6 +125,7 @@ func newMetrics(provider metric.MeterProvider) (*metrics, error) {
 		changed:    changed,
 		accounts:   accounts,
 		openbao:    openbao,
+		openbaoSet: openbaoSet,
 	}, nil
 }
 
@@ -182,4 +190,12 @@ func (m *metrics) openbaoWritten(ctx context.Context, cluster, outcome string) {
 	m.openbao.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("cluster", cluster),
 		attribute.String("outcome", outcome)))
+}
+
+// openbaoChanged records one write of the OpenBao state. kind is mount, role,
+// or policy, and action is create, update, write, or delete.
+func (m *metrics) openbaoChanged(ctx context.Context, kind, action string) {
+	m.openbaoSet.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("kind", kind),
+		attribute.String("action", action)))
 }

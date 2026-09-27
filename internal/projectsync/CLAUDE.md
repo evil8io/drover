@@ -40,7 +40,9 @@ Verified live against Rancher 2.14.5, and against the source of Rancher 2.14.6 a
 
 ## OpenBao
 
-The answer to a missing mount comes from the source of OpenBao 2.7.0. No part of this section has a live check yet.
+The answer to a missing mount comes from the source of OpenBao 2.7.0, and the mount, role, policy, and ACL facts from OpenBao 2.6.3. No part of this section has a live check yet.
+
+- project-sync writes every OpenBao object that follows from a Rancher object: the mounts, their config, the roles, and the ACL policies. Do not move this back to an operator. The token refresh already puts project-sync in OpenBao. The operator added a delay to each new project, it did not correct drift, and an uninstall hung.
 
 - Refresh the config of a cluster when less than half of the lifetime of its token remains. OpenBao keeps a written `service_account_jwt` and never renews it, and EKS limits a TokenRequest to 24 h. The other half is the time for the retries of a failed write.
 - Take the expiry from `status.expirationTimestamp` of the TokenRequest answer, never from `--openbao-token-ttl`. The API server can shorten the lifetime.
@@ -53,6 +55,12 @@ The answer to a missing mount comes from the source of OpenBao 2.7.0. No part of
 - Use `drover-openbao` only in an account project. Move it out of no project only with the proof of an OpenBao RoleBinding in a trusted account namespace, because only the service and an admin write there. Never take a binding in another namespace as proof: a tenant can write one with that owner reference in its own namespace.
 - The RoleBinding `drover-openbao` names `drover-openbao/openbao` by namespace and name. Let the namespace `drover-openbao` own it by uid, and delete every such RoleBinding when the namespace is not trusted. Otherwise a tenant who creates `drover-openbao` and a ServiceAccount `openbao` gets the tokens of every project role.
 - The lister writes the OpenBao Role and RoleBinding of a project with the uid of `drover-openbao` that the last reconcile run trusted. Keep that uid only after a trusted check, and clear it on every other outcome, because the RoleBinding would otherwise name the ServiceAccount of a namespace that the service does not own. The lister creates each object first and reads it only after a 409, so it needs no list call. A stale uid costs one garbage collection of the RoleBinding, and the next run writes it again.
+- A missing mount answers `GET sys/mounts/<path>` with 400 `No secret engine mount at <path>/` (`vault/logical_system.go`, `handleReadMount`). That read also matches a parent mount, so check the `type` of the answer.
+- `sys/mounts/*` and `sys/policies/acl/*` are not root paths, so the policy of the service needs no `sudo` (`vault/logical_system.go`, `PathsSpecial.Root`). A LIST adds a trailing slash to the path (`http/logical.go`), and the ACL also matches the path without it (`vault/policy/acl.go`), so `list` on `kubernetes/+/roles` and on `sys/policies/acl` is enough.
+- A role write keeps every field that the request does not send (`builtin/logical/kubernetes/path_roles.go`). Send every field that can widen a credential, also empty, or a changed role keeps the change. Only one of `service_account_name`, `kubernetes_role_name`, and `generated_role_rules` may have a value.
+- Find the objects to delete from the role names in the mount of a cluster, never from the policy names. A cluster id and a project name both have dashes, so a policy name does not split into the two. Delete the policy before the role, so that the role stays as the key for a retry.
+- Read a role or a policy at most once per 10 minutes. The list of each run finds a missing object, so the read only finds a changed one. The project watch writes without a read, and it skips an object that the service read or wrote in those 10 minutes.
+- Keep the client token until a fifth of its lifetime remains, and log in again once after a 403. A login role can give batch tokens, for example with a lifetime of 5 minutes, and a batch token cannot be renewed.
 - Skip `drover-openbao` in the sweep of the account namespaces. It has the account prefix and no project, so the 404 check of the sweep deletes it. For the same name, a project called `openbao` gets no accounts.
 - Keep the `resourceNames` of the Role inside the `serviceaccounts/token` grant of the service user. The user creates and binds the Role without `escalate` and `bind`, because it holds every rule of the Role.
 - OpenBao reaches a cluster through the Rancher proxy with a ServiceAccount token. Rancher needs a `ClusterProxyConfig` per cluster for that, see `internal/filter/CLAUDE.md`.

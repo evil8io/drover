@@ -4,7 +4,7 @@ This service copies labels and annotations of a Rancher project to every namespa
 
 With `--service-accounts`, the service also keeps three ServiceAccounts per Rancher project, one per project role. A CI job of a project authenticates with a token of such a ServiceAccount, through the Rancher proxy. See [Service accounts](#service-accounts).
 
-With `--openbao-address` as well, the service writes the Kubernetes secrets engine config of every cluster into OpenBao, so that OpenBao creates short-lived tokens of these ServiceAccounts. See [OpenBao config](#openbao-config).
+With `--openbao-address` as well, the service writes the OpenBao state that follows from the Rancher objects: a Kubernetes secrets engine mount per cluster with its config, and a role and an ACL policy per project role. OpenBao then creates short-lived tokens of these ServiceAccounts. See [OpenBao config](#openbao-config).
 
 ## Requirements
 
@@ -23,10 +23,28 @@ With `--openbao-address` as well, the service writes the Kubernetes secrets engi
    - `get`, `list`, `watch`, `create`, `update`, and `delete` on `roles`.
 
    With these rights and the `get` on `serviceaccounts`, the user holds every rule of the Role `drover-openbao`, so it creates and binds that Role without `escalate` and without `bind`. The user also needs `get` on `settings` of `management.cattle.io`, to read the Rancher setting `cacerts`. The GlobalRole `user-base` gives this right.
-6. With `--openbao-address`, OpenBao needs:
-   - a Kubernetes auth mount at `--openbao-auth-path`, with the role `--openbao-role` for the ServiceAccount of the pod of the service.
-   - a policy on that role with `update` on `<prefix>/<cluster id>/config` of every cluster. Without it, a write answers 403.
-   - a Kubernetes secrets engine mount at `<prefix>/<cluster id>` per cluster. Another component creates the mount and its roles.
+6. With `--openbao-address`, OpenBao needs a Kubernetes auth mount at `--openbao-auth-path`, with the role `--openbao-role` for the ServiceAccount of the pod of the service. That role needs this ACL policy, here for the default prefix `kubernetes`. None of the paths needs `sudo`, and a LIST also matches a path without its trailing slash.
+
+   ```hcl
+   path "sys/mounts/kubernetes/+" {
+     capabilities = ["read", "update"]
+   }
+   path "kubernetes/+/config" {
+     capabilities = ["update"]
+   }
+   path "kubernetes/+/roles" {
+     capabilities = ["list"]
+   }
+   path "kubernetes/+/roles/*" {
+     capabilities = ["create", "read", "update", "delete"]
+   }
+   path "sys/policies/acl" {
+     capabilities = ["list"]
+   }
+   path "sys/policies/acl/kubernetes-*" {
+     capabilities = ["read", "update", "delete"]
+   }
+   ```
 
    OpenBao reaches each cluster through the Rancher proxy, with a ServiceAccount token of that cluster. Rancher accepts such a token only for a cluster with a `ClusterProxyConfig` that has `enabled: true`. See [the API filter document](api-filter.md).
 
@@ -52,6 +70,8 @@ With `--openbao-address` as well, the service writes the Kubernetes secrets engi
 | `--openbao-mount-prefix` | `kubernetes` | Path prefix of the secrets engine mounts. The config of a cluster is at `<prefix>/<cluster id>/config`. |
 | `--openbao-rancher-url` | | URL of Rancher that OpenBao uses. Use `https://`. The path must be empty or `/`. Required with `--openbao-address`. |
 | `--openbao-token-ttl` | `24h` | Requested lifetime of the token of a cluster. The minimum is `10m`. The API server can shorten it. |
+| `--openbao-credential-ttl` | `10m` | Default lifetime of a credential of a project role, the `token_default_ttl` of its role. The minimum is `1s`. |
+| `--openbao-credential-max-ttl` | `1h` | Longest lifetime of a credential of a project role, the `token_max_ttl` of its role. It must not be shorter than `--openbao-credential-ttl`. |
 | `--interval` | `60s` | Time between two runs. |
 | `--patch-rate` | `10` | Namespace patches and project namespace lists per second that the watches of one cluster send, together. |
 | `--listen` | `:8080` | Address the service listens on. |
@@ -153,14 +173,30 @@ The Role and the RoleBinding have the labels `drover-project: <project>` and `dr
 For each cluster, the service writes the config in three steps:
 
 1. It requests a token of `drover-openbao/openbao` with the TokenRequest API, through the Rancher proxy: `POST /k8s/clusters/<cluster id>/api/v1/namespaces/drover-openbao/serviceaccounts/openbao/token`. The request has `spec.expirationSeconds` from `--openbao-token-ttl`, and no audiences. The API server can shorten the lifetime, for example to 24 hours on EKS, so the service uses `status.expirationTimestamp` of the answer.
-2. It logs in with `POST <address>/v1/auth/<auth path>/login`, with the role and the content of `--openbao-jwt-file`. It reads the file at every login, because the kubelet replaces the token. The service logs in once per run, and only when a cluster needs a write. It does not keep the client token after the run.
+2. It logs in with `POST <address>/v1/auth/<auth path>/login`, with the role and the content of `--openbao-jwt-file`. It reads the file at every login, because the kubelet replaces the token. The service keeps the client token for the reconcile run and the project watch, until a fifth of its lifetime remains. A 403 answer makes the service log in again once, and repeat the request.
 3. It writes `POST <address>/v1/<prefix>/<cluster id>/config`, with the client token in the header `X-Vault-Token`, and the body `{"kubernetes_host": "<openbao rancher url>/k8s/clusters/<cluster id>", "kubernetes_ca_cert": "<rancher ca>", "service_account_jwt": "<token>", "disable_local_ca_jwt": true}`.
 
 The Kubernetes secrets engine of OpenBao cannot skip the TLS verification of `kubernetes_host`. It verifies Rancher only with `kubernetes_ca_cert` when that field has a value, and with the system roots otherwise. The service therefore reads the Rancher setting `cacerts` with `GET /v3/settings/cacerts`, once per run that has a cluster to keep, and sends its value as `kubernetes_ca_cert`. Rancher puts the CA chain of a private certificate into that setting, and leaves it empty for a public certificate. The service always sends the field, so an empty value removes a CA that an earlier write stored. A failed read gives an error line, and the run writes nothing, so that no write removes the CA of a private certificate.
 
 OpenBao keeps a written token and never renews it. The service therefore keeps in memory, per cluster, the expiry of the token of the last successful write. The reconcile run writes the config of a cluster again when less than half of the lifetime of that token remains, when the ServiceAccount has a new uid, or when the Rancher CA differs from the CA of that write. A new Rancher CA thus reaches OpenBao in the next run. After a restart, the service has no expiry, so the first run writes the config of every cluster. A failed write keeps the old expiry, and the next run tries again.
 
-OpenBao checks the policy before the mount. With `update` on the path, OpenBao answers 404 with the message `no handler for route` to a write under a mount that does not exist, and an older server answers 400 with the same message. The service then writes an info line with the cluster id, counts the write with the outcome `missing_mount`, and tries again in the next run. Every other failure gives an error line, and the next run tries again. The service logs no token and no JWT.
+OpenBao checks the policy before the mount. With `update` on the path, OpenBao answers 404 with the message `no handler for route` to a write under a mount that does not exist, and an older server answers 400 with the same message. The service creates the mount before the config, so this answer is only a fallback. The service then writes an info line with the cluster id, counts the write with the outcome `missing_mount`, and tries again in the next run. Every other failure gives an error line, and the next run tries again. The service logs no token and no JWT.
+
+### Mounts, roles, and policies
+
+Before the config of a cluster, the reconcile run reads `GET <address>/v1/sys/mounts/<prefix>/<cluster id>`. OpenBao answers 400 with `No secret engine mount at` for a missing mount, and the service then enables it with `POST <address>/v1/sys/mounts/<prefix>/<cluster id>` and `{"type": "kubernetes"}`. A mount of another type is an error. The service keeps the mount of a removed cluster.
+
+For every tenant project with a trusted account namespace, and for each project role, the service keeps these objects:
+
+1. The role `<prefix>/<cluster id>/roles/<project>-<role>`, with `service_account_name` set to the role, `allowed_kubernetes_namespaces` set to `drover-<project>`, and `token_default_ttl` and `token_max_ttl` from the two credential flags. The service also sends `allowed_kubernetes_namespace_selector`, `kubernetes_role_name`, `generated_role_rules`, and `token_default_audiences` as empty values, because OpenBao keeps a field that a write does not send.
+2. The ACL policy `<prefix>-<cluster id>-<project>-<role>`, with every slash of the prefix as a dash. Its text is `path "<prefix>/<cluster id>/creds/<project>-<role>" { capabilities = ["update"] }`, on three lines.
+
+The names are those of the earlier operator objects, so a client keeps its paths and policies. The service applies these rules:
+
+- The project watch writes the roles and the policies of a new or changed project within seconds, together with its ServiceAccounts and its Role `drover-openbao`. It writes without a read. It skips an object that the service read or wrote in the last 10 minutes, so a storm of project events causes no requests.
+- Each reconcile run lists the roles of every mount and the ACL policies. It creates a missing role or policy. It reads an existing one at most once per 10 minutes, and corrects it when it differs. The compare of a policy ignores the space around its text.
+- The reconcile run deletes the policies and the roles of a project that the cluster no longer has. It does this only after it read the full project list, and after Rancher answers 404 for that project, because the project list of a run can be older than a new project. The policy goes before the role. The service finds these objects from the role names in the mount of the cluster, so it never deletes a policy without a role of the service.
+- A failed list of the roles of a mount skips the roles and the deletes of that cluster. A failed list of the policies skips the policies and every delete.
 
 ## Telemetry
 
@@ -177,5 +213,6 @@ With `--otlp-endpoint` set, one reconcile run produces a span named `reconcile`,
 | `drover.sync.projects.changed` | Counter | `1` | `cluster` |
 | `drover.sync.accounts.changes` | Counter | `1` | `kind`, `action` |
 | `drover.sync.openbao.writes` | Counter | `1` | `cluster`, `outcome` |
+| `drover.sync.openbao.changes` | Counter | `1` | `kind`, `action` |
 
-The `kind` attribute of the watch metrics is `namespace` or `project`. For the project watch, `cluster` is always `local`. The `kind` attribute of `drover.sync.accounts.changes` is `project`, `namespace`, `serviceaccount`, `role`, `rolebinding`, or `clusterrolebinding`, and `action` is `create`, `update`, `move`, or `delete`. With `--service-accounts`, the summary line of a run has the field `accounts_changed`, and every write has a line `account object changed`. The `outcome` attribute of `drover.sync.openbao.writes` is `ok`, `missing_mount`, or `error`. A failed login counts one `error` per cluster that needed a write. A successful write has the line `the OpenBao config is written`, with the fields `cluster` and `expires`.
+The `kind` attribute of the watch metrics is `namespace` or `project`. For the project watch, `cluster` is always `local`. The `kind` attribute of `drover.sync.accounts.changes` is `project`, `namespace`, `serviceaccount`, `role`, `rolebinding`, or `clusterrolebinding`, and `action` is `create`, `update`, `move`, or `delete`. With `--service-accounts`, the summary line of a run has the field `accounts_changed`, and every write has a line `account object changed`. The `outcome` attribute of `drover.sync.openbao.writes` is `ok`, `missing_mount`, or `error`. A failed login counts one `error` per cluster that needed a write. A successful write has the line `the OpenBao config is written`, with the fields `cluster` and `expires`. The `kind` attribute of `drover.sync.openbao.changes` is `mount`, `role`, or `policy`, and `action` is `create`, `update`, `delete`, or `write`. A `write` is a write of the project watch, without a read. Every change has a line `OpenBao object changed`.

@@ -210,7 +210,7 @@ func New(cfg Config) (*Syncer, error) {
 	userAgent := "drover/" + version
 	var openbao *openbaoWriter
 	if cfg.OpenBao != nil {
-		if openbao, err = newOpenBaoWriter(*cfg.OpenBao, timeout, userAgent, meterProvider); err != nil {
+		if openbao, err = newOpenBaoWriter(*cfg.OpenBao, timeout, userAgent, meterProvider, tracerProvider.Tracer(tracerName)); err != nil {
 			return nil, err
 		}
 	}
@@ -328,20 +328,20 @@ func (s *Syncer) reconcile(ctx context.Context) {
 	s.watches.resetNames()
 
 	var mu sync.Mutex
-	ready := make(map[string]string)
+	ready := make(map[string]openbaoTarget)
 	eachCluster(names, func(cluster string) {
 		one := counters{projects: len(clusters[cluster])}
-		account := s.syncCluster(ctx, token, cluster, clusters[cluster], &one)
+		target := s.syncCluster(ctx, token, cluster, clusters[cluster], &one)
 
 		mu.Lock()
 		defer mu.Unlock()
 		run.add(one)
-		if account != "" {
-			ready[cluster] = account
+		if target != nil {
+			ready[cluster] = *target
 		}
 	})
 	if s.openbao != nil {
-		s.refreshOpenBao(ctx, token, names, ready, &run)
+		s.refreshOpenBao(ctx, token, names, ready, clusters, &run)
 	}
 
 	s.finishReconcile(ctx, span, run, start)
@@ -459,14 +459,14 @@ func (s *Syncer) byCluster(ctx context.Context, projects []project) map[string]m
 }
 
 // syncCluster syncs the namespaces and the accounts of one cluster. It returns
-// the uid of the OpenBao ServiceAccount of the cluster when the run keeps the
-// OpenBao objects, and "" otherwise.
-func (s *Syncer) syncCluster(ctx context.Context, token, cluster string, projects map[string]project, run *counters) string {
+// the OpenBao target of the cluster when the run keeps the OpenBao objects,
+// and nil otherwise.
+func (s *Syncer) syncCluster(ctx context.Context, token, cluster string, projects map[string]project, run *counters) *openbaoTarget {
 	items, err := s.namespaces(ctx, token, cluster, "")
 	if err != nil {
 		run.errors++
 		s.logListFailure(ctx, err, cluster)
-		return ""
+		return nil
 	}
 	run.namespaces += len(items)
 
@@ -496,7 +496,7 @@ func (s *Syncer) syncCluster(ctx context.Context, token, cluster string, project
 	if s.serviceAccounts {
 		return s.syncAccounts(ctx, token, cluster, projects, items, run)
 	}
-	return ""
+	return nil
 }
 
 // sourceOf returns the project that the keys of a namespace of project name

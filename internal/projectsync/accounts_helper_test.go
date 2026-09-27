@@ -86,6 +86,9 @@ type accountsFake struct {
 	// a read of it answers instead, zero for none.
 	ca       string
 	caStatus int
+	// listStatus is the status that the project list answers instead, zero
+	// for none.
+	listStatus int
 }
 
 func newAccountsFake(t *testing.T) *accountsFake {
@@ -450,8 +453,20 @@ func (f *accountsFake) toProject(name string, p storedProject) project {
 	return project{ID: acctCluster + ":" + name, ClusterID: acctCluster, Name: name, CreatorID: p.creatorID, Created: p.created, Labels: p.labels}
 }
 
+func (f *accountsFake) setListStatus(status int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listStatus = status
+}
+
 func (f *accountsFake) serveProjectList(w http.ResponseWriter) {
 	f.mu.Lock()
+	if f.listStatus != 0 {
+		status := f.listStatus
+		f.mu.Unlock()
+		writeStatus(w, status, "ServerError", "the project list failed")
+		return
+	}
 	items := make([]project, 0, len(f.projects))
 	for _, name := range sortedKeys(f.projects) {
 		items = append(items, f.toProject(name, f.projects[name]))
