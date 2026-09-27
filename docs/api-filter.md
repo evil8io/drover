@@ -142,7 +142,7 @@ With these routes, the service becomes the data path for most reads of a tenant.
 | `--otlp-endpoint` | `$OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint, `host:port` or a URL. Empty turns telemetry off. |
 | `--otlp-traces` | `true` | Send traces to the OTLP endpoint. |
 | `--otlp-metrics` | `true` | Send metrics to the OTLP endpoint. |
-| `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | `service.name` resource attribute. |
+| `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | `service.name` resource attribute. An empty value, `--service-name=`, sets no `service.name`, so that a collector can derive it. The SDK still takes a `service.name` from `OTEL_SERVICE_NAME` or `OTEL_RESOURCE_ATTRIBUTES`. |
 
 `--upstream-insecure-skip-verify` is for an upstream inside the cluster whose certificate comes from a private CA that the deployment does not copy. A network policy must then limit the path to Rancher.
 

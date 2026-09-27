@@ -12,6 +12,7 @@ import (
 
 	"go.opentelemetry.io/contrib/instrumentation/runtime"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
@@ -35,7 +36,8 @@ type Config struct {
 	Traces bool
 	// Metrics sends metrics to Endpoint, and starts the Go runtime metrics.
 	Metrics bool
-	// ServiceName is the service.name resource attribute.
+	// ServiceName is the service.name resource attribute. An empty value sets
+	// no service.name, so that a collector can derive one.
 	ServiceName string
 	// Version is the service.version resource attribute.
 	Version string
@@ -73,10 +75,7 @@ func Setup(ctx context.Context, cfg Config) (*Telemetry, error) {
 		return nil, fmt.Errorf("the OTLP endpoint: %w", err)
 	}
 
-	res, err := resource.Merge(resource.Default(), resource.NewSchemaless(
-		semconv.ServiceName(cfg.ServiceName),
-		semconv.ServiceVersion(cfg.Version),
-	))
+	res, err := newResource(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("build the telemetry resource: %w", err)
 	}
@@ -102,6 +101,27 @@ func Setup(ctx context.Context, cfg Config) (*Telemetry, error) {
 	}
 
 	return tel, nil
+}
+
+// newResource returns the resource of the providers: the SDK attributes, the
+// attributes of OTEL_RESOURCE_ATTRIBUTES and OTEL_SERVICE_NAME,
+// service.version, and service.name when Config.ServiceName is not empty. It
+// has no detector of resource.Default, because that one adds
+// unknown_service:<executable> as service.name, and a collector derives
+// service.name only for a resource without one. An invalid
+// OTEL_RESOURCE_ATTRIBUTES goes to the error handler of otel, as it does for
+// resource.Default.
+func newResource(ctx context.Context, cfg Config) (*resource.Resource, error) {
+	attrs := []attribute.KeyValue{semconv.ServiceVersion(cfg.Version)}
+	if cfg.ServiceName != "" {
+		attrs = append(attrs, semconv.ServiceName(cfg.ServiceName))
+	}
+	res, err := resource.New(ctx, resource.WithTelemetrySDK(), resource.WithFromEnv(), resource.WithAttributes(attrs...))
+	if errors.Is(err, resource.ErrPartialResource) {
+		otel.Handle(err)
+		err = nil
+	}
+	return res, err
 }
 
 func setupTraces(ctx context.Context, target string, secure bool, res *resource.Resource) (*sdktrace.TracerProvider, error) {

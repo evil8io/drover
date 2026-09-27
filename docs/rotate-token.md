@@ -37,7 +37,7 @@ A CronJob is the normal caller, because most runs find a valid token and exit 0.
 | `--otlp-endpoint` | `$OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint, `host:port` or a URL. Empty turns telemetry off. |
 | `--otlp-traces` | `true` | Send traces to the OTLP endpoint. |
 | `--otlp-metrics` | `true` | Send metrics to the OTLP endpoint. |
-| `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | `service.name` resource attribute. |
+| `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | `service.name` resource attribute. An empty value, `--service-name=`, sets no `service.name`, so that a collector can derive it. The SDK still takes a `service.name` from `OTEL_SERVICE_NAME` or `OTEL_RESOURCE_ATTRIBUTES`. |
 
 The exit code is 0 after a valid token and after a rotation, 1 after a failure, and 2 after a flag error.
 

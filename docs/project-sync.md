@@ -59,7 +59,7 @@ With `--openbao-address` as well, the service writes the Kubernetes secrets engi
 | `--otlp-endpoint` | `$OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint, `host:port` or a URL. Empty turns telemetry off. |
 | `--otlp-traces` | `true` | Send traces to the OTLP endpoint. |
 | `--otlp-metrics` | `true` | Send metrics to the OTLP endpoint. |
-| `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | `service.name` resource attribute. |
+| `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | `service.name` resource attribute. An empty value, `--service-name=`, sets no `service.name`, so that a collector can derive it. The SDK still takes a `service.name` from `OTEL_SERVICE_NAME` or `OTEL_RESOURCE_ATTRIBUTES`. |
 
 The flags need at least one label key, annotation key, name label key, or name annotation key, or `--service-accounts`. Every `--openbao-` flag needs `--service-accounts`. A key must be a valid Kubernetes label or annotation key. A key whose prefix is `cattle.io`, `kubernetes.io`, or `k8s.io`, or a subdomain of one of them, is not valid, because Rancher and Kubernetes own those domains.
 

@@ -82,7 +82,9 @@ type telemetryFlags struct {
 // registerTelemetryFlags adds otlp-endpoint, otlp-traces, otlp-metrics and
 // service-name to flags. getenv resolves the environment defaults of
 // otlp-endpoint (OTEL_EXPORTER_OTLP_ENDPOINT) and service-name
-// (OTEL_SERVICE_NAME, or drover when that is also empty).
+// (OTEL_SERVICE_NAME, or drover when that is also empty). The default of
+// service-name is never empty, so an empty value comes only from an explicit
+// -service-name=, which sets no service.name.
 func registerTelemetryFlags(flags *flag.FlagSet, getenv func(string) string) *telemetryFlags {
 	tf := &telemetryFlags{}
 	flags.StringVar(&tf.endpoint, "otlp-endpoint", getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
@@ -93,7 +95,8 @@ func registerTelemetryFlags(flags *flag.FlagSet, getenv func(string) string) *te
 	if serviceName == "" {
 		serviceName = "drover"
 	}
-	flags.StringVar(&tf.serviceName, "service-name", serviceName, "service.name resource attribute")
+	flags.StringVar(&tf.serviceName, "service-name", serviceName,
+		"service.name resource attribute; an empty value sets none, so that a collector can derive it")
 	return tf
 }
 
