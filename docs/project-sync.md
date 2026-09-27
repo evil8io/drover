@@ -32,11 +32,8 @@ With `--openbao-address` as well, the service writes the OpenBao state that foll
    path "kubernetes/+/config" {
      capabilities = ["update"]
    }
-   path "kubernetes/+/roles" {
-     capabilities = ["list"]
-   }
    path "kubernetes/+/roles/*" {
-     capabilities = ["create", "read", "update", "delete"]
+     capabilities = ["create", "read", "update", "delete", "list"]
    }
    path "sys/policies/acl" {
      capabilities = ["list"]
