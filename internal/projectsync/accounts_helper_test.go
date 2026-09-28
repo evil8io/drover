@@ -89,6 +89,9 @@ type accountsFake struct {
 	// listStatus is the status that the project list answers instead, zero
 	// for none.
 	listStatus int
+	// clusters is the status that the read of a management Cluster object
+	// answers, by cluster id. Another id answers 404. See serveCluster.
+	clusters map[string]int
 }
 
 func newAccountsFake(t *testing.T) *accountsFake {
@@ -321,6 +324,8 @@ func (f *accountsFake) serve(w http.ResponseWriter, r *http.Request) {
 		f.serveProjectList(w)
 	case r.Method == http.MethodGet && strings.HasPrefix(path, projectsPath+"/"):
 		f.serveProjectItem(w, strings.TrimPrefix(path, projectsPath+"/"))
+	case r.Method == http.MethodGet && strings.HasPrefix(path, clustersPath):
+		f.serveCluster(w, strings.TrimPrefix(path, clustersPath))
 	case r.Method == http.MethodPost && path == clusterPath(rancherCluster)+managementProjects+acctCluster+"/projects":
 		f.createProject(w, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(path, "/k8s/clusters/") && strings.HasSuffix(path, "/token"):

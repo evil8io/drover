@@ -21,6 +21,16 @@ const (
 	openbaoEngineType = "kubernetes"
 	openbaoMountsPath = "sys/mounts/"
 	openbaoACLPath    = "sys/policies/acl"
+
+	// openbaoConfigKey is the key of the config of a cluster in verified.
+	openbaoConfigKey = "config"
+
+	managementClusters = "/apis/management.cattle.io/v3/clusters/"
+
+	// credsParameters restricts a credential request to the namespace and
+	// the lifetime. The endpoint also accepts audiences, and a token with
+	// another audience is valid for other services than the API server.
+	credsParameters = "  allowed_parameters = {\n    \"kubernetes_namespace\" = []\n    \"ttl\" = []\n  }\n"
 )
 
 // credentialRole is a role of the Kubernetes secrets engine. The service
@@ -48,10 +58,12 @@ func roleName(project string, role accountRole) string {
 }
 
 // parseRoleName returns the project and the role of a role name of the
-// service, and false for another name.
+// service, and false for another name. The project must be a label value,
+// because it goes into the path of a Rancher request.
 func parseRoleName(name string) (string, accountRole, bool) {
 	for _, role := range accountRoles {
-		if project, ok := strings.CutSuffix(name, "-"+role.name); ok && project != "" {
+		project, ok := strings.CutSuffix(name, "-"+role.name)
+		if ok && len(project) <= maxLabelValueLength && qualifiedName.MatchString(project) {
 			return project, role, true
 		}
 	}
@@ -67,7 +79,21 @@ func (w *openbaoWriter) policyName(cluster, project string, role accountRole) st
 // policyText returns the ACL policy that grants the credentials of project
 // and role in cluster.
 func (w *openbaoWriter) policyText(cluster, project string, role accountRole) string {
-	return "path \"" + w.mount(cluster) + "/creds/" + roleName(project, role) + "\" {\n  capabilities = [\"update\"]\n}\n"
+	return w.policyHead(cluster, project, role) + credsParameters + "}\n"
+}
+
+func (w *openbaoWriter) policyHead(cluster, project string, role accountRole) string {
+	return "path \"" + w.mount(cluster) + "/creds/" + roleName(project, role) + "\" {\n  capabilities = [\"update\"]\n"
+}
+
+// ownPolicy reports whether text is the policy of project and role in
+// cluster. It also accepts that policy without credsParameters, as releases
+// before the restriction wrote it. The compare ignores the space around the
+// text.
+func (w *openbaoWriter) ownPolicy(text, cluster, project string, role accountRole) bool {
+	text = strings.TrimSpace(text)
+	head := w.policyHead(cluster, project, role)
+	return text == strings.TrimSpace(head+credsParameters+"}") || text == strings.TrimSpace(head+"}")
 }
 
 func (w *openbaoWriter) wantRole(project string, role accountRole) credentialRole {
@@ -279,8 +305,25 @@ func (s *Syncer) keepOpenBaoCluster(ctx context.Context, token, cluster string, 
 	if listed && policies != nil {
 		errs += s.dropGoneCredentials(ctx, token, cluster, roles, known, policies)
 	}
+	wanted[openbaoConfigKey] = true
 	w.keepVerified(cluster, wanted)
 
+	if created {
+		due = true
+	}
+	if !due && w.verifyDue(cluster, openbaoConfigKey) {
+		stale, err := s.configStale(ctx, cluster, ca)
+		switch {
+		case err != nil:
+			errs++
+			s.openbaoObjectFailure(ctx, cluster, "config", "read", w.mount(cluster), err)
+		case stale:
+			due = true
+			s.logger.InfoContext(ctx, "the OpenBao config is missing or differs", "cluster", cluster)
+		default:
+			w.markVerified(cluster, openbaoConfigKey)
+		}
+	}
 	if due && !s.writeOpenBao(ctx, token, cluster, target.account, ca) {
 		errs++
 	}
@@ -384,12 +427,15 @@ func (s *Syncer) dropGoneCredentials(ctx context.Context, token, cluster string,
 
 		policy := w.policyName(cluster, project, role)
 		if policies[policy] {
-			if err := w.call(ctx, http.MethodDelete, openbaoACLPath+"/"+policy, nil, nil, nil); err != nil {
+			own, err := s.isOwnPolicy(ctx, cluster, policy, project, role)
+			if err != nil {
 				errs++
-				s.openbaoObjectFailure(ctx, cluster, "policy", "delete", policy, err)
 				continue
 			}
-			s.openbaoChanged(ctx, cluster, "policy", "delete", policy)
+			if own && !s.deletePolicy(ctx, cluster, policy) {
+				errs++
+				continue
+			}
 		}
 		if err := w.call(ctx, http.MethodDelete, w.mount(cluster)+"/roles/"+name, nil, nil, nil); err != nil {
 			errs++
@@ -438,7 +484,7 @@ func (s *Syncer) dropOrphanPolicies(ctx context.Context, token string, names []s
 	errs := 0
 	gone := make(map[string]bool)
 	for _, name := range slices.Sorted(maps.Keys(policies)) {
-		cluster, project, _, ok := w.parsePolicyName(name, names)
+		cluster, project, role, ok := w.parsePolicyName(name, names)
 		if !ok {
 			continue
 		}
@@ -446,6 +492,14 @@ func (s *Syncer) dropOrphanPolicies(ctx context.Context, token string, names []s
 			continue
 		}
 		if _, live := s.projectsOf(cluster)[project]; live {
+			continue
+		}
+		own, err := s.isOwnPolicy(ctx, cluster, name, project, role)
+		if err != nil {
+			errs++
+			continue
+		}
+		if !own {
 			continue
 		}
 		key := cluster + ":" + project
@@ -462,13 +516,143 @@ func (s *Syncer) dropOrphanPolicies(ctx context.Context, token string, names []s
 		if !isGone {
 			continue
 		}
-		if err := w.call(ctx, http.MethodDelete, openbaoACLPath+"/"+name, nil, nil, nil); err != nil {
+		if !s.deletePolicy(ctx, cluster, name) {
 			errs++
-			s.openbaoObjectFailure(ctx, cluster, "policy", "delete", name, err)
 			continue
 		}
 		delete(policies, name)
-		s.openbaoChanged(ctx, cluster, "policy", "delete", name)
+	}
+	return errs
+}
+
+// isOwnPolicy reads the ACL policy name, and reports whether its text is the
+// policy of project and role in cluster. A name alone does not prove the
+// writer, because another writer can use a name of the same form. A policy
+// that OpenBao does not have is not own. isOwnPolicy logs a failed read.
+func (s *Syncer) isOwnPolicy(ctx context.Context, cluster, name, project string, role accountRole) (bool, error) {
+	text, err := s.openbao.readPolicy(ctx, name)
+	if hasOpenBaoStatus(err, http.StatusNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		s.openbaoObjectFailure(ctx, cluster, "policy", "read", name, err)
+		return false, err
+	}
+	if !s.openbao.ownPolicy(text, cluster, project, role) {
+		s.logger.DebugContext(ctx, "the OpenBao policy has another text, so the service keeps it", "cluster", cluster, "name", name)
+		return false, nil
+	}
+	return true, nil
+}
+
+// deletePolicy deletes the ACL policy name of cluster, and logs the result.
+// It returns false on an error.
+func (s *Syncer) deletePolicy(ctx context.Context, cluster, name string) bool {
+	if err := s.openbao.call(ctx, http.MethodDelete, openbaoACLPath+"/"+name, nil, nil, nil); err != nil {
+		s.openbaoObjectFailure(ctx, cluster, "policy", "delete", name, err)
+		return false
+	}
+	s.openbaoChanged(ctx, cluster, "policy", "delete", name)
+	return true
+}
+
+// listMounts returns the cluster ids of the mounts of the Kubernetes secrets
+// engine under the mount prefix, sorted. It skips an id that is not a label
+// value, because the id goes into the path of a Rancher request.
+func (w *openbaoWriter) listMounts(ctx context.Context) ([]string, error) {
+	var answer struct {
+		Data map[string]struct {
+			Type string `json:"type"`
+		} `json:"data"`
+	}
+	if err := w.call(ctx, http.MethodGet, strings.TrimSuffix(openbaoMountsPath, "/"), nil, nil, &answer); err != nil {
+		return nil, err
+	}
+	var out []string
+	for path, mount := range answer.Data {
+		id, ok := strings.CutPrefix(strings.TrimSuffix(path, "/"), w.mountPrefix+"/")
+		if ok && mount.Type == openbaoEngineType && len(id) <= maxLabelValueLength && qualifiedName.MatchString(id) {
+			out = append(out, id)
+		}
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
+// clusterGone reports whether the Rancher cluster has no Cluster object with
+// the id cluster. The Kubernetes API checks the right before it looks for the
+// object, so a missing right gives an error, never a gone cluster.
+func (s *Syncer) clusterGone(ctx context.Context, token, cluster string) (bool, error) {
+	var item object
+	found, err := s.getObject(ctx, token, clusterPath(rancherCluster)+managementClusters+cluster, &item)
+	return !found && err == nil, err
+}
+
+// dropGoneClusters deletes the mount and the ACL policies of each cluster
+// outside names after Rancher answers 404 for that cluster. names are the
+// clusters of the run. A mount counts only when its config has the Rancher
+// URL of that cluster, so that the service deletes no mount of another
+// writer. The policies go first, so that the mount stays as the key for a
+// retry. The mount delete also deletes the roles and the config of the mount.
+// dropGoneClusters removes each deleted name from policies, and returns the
+// count of errors.
+func (s *Syncer) dropGoneClusters(ctx context.Context, token string, names []string, policies map[string]bool) int {
+	w := s.openbao
+	mounts, err := w.listMounts(ctx)
+	if err != nil {
+		s.logFailure(ctx, slog.LevelError, "the OpenBao mount list request failed", err)
+		return 1
+	}
+	errs := 0
+	for _, cluster := range mounts {
+		if slices.Contains(names, cluster) {
+			continue
+		}
+		have, found, err := w.readConfig(ctx, cluster)
+		if err != nil {
+			errs++
+			s.openbaoObjectFailure(ctx, cluster, "config", "read", w.mount(cluster), err)
+			continue
+		}
+		if !found || have.Host != w.wantConfig(cluster, "").Host {
+			s.logger.DebugContext(ctx, "the OpenBao mount has no config of the service, so the service keeps it", "cluster", cluster, "mount", w.mount(cluster))
+			continue
+		}
+		gone, err := s.clusterGone(ctx, token, cluster)
+		if err != nil {
+			errs++
+			s.logFailure(ctx, slog.LevelError, "the cluster request failed", err, "cluster", cluster)
+			continue
+		}
+		if !gone {
+			continue
+		}
+
+		failed := false
+		clusters := append(slices.Clone(names), cluster)
+		for _, name := range slices.Sorted(maps.Keys(policies)) {
+			owner, project, role, ok := w.parsePolicyName(name, clusters)
+			if !ok || owner != cluster {
+				continue
+			}
+			own, err := s.isOwnPolicy(ctx, cluster, name, project, role)
+			switch {
+			case err != nil || (own && !s.deletePolicy(ctx, cluster, name)):
+				errs++
+				failed = true
+			case own:
+				delete(policies, name)
+			}
+		}
+		if failed {
+			continue
+		}
+		if err := w.call(ctx, http.MethodDelete, openbaoMountsPath+w.mount(cluster), nil, nil, nil); err != nil {
+			errs++
+			s.openbaoObjectFailure(ctx, cluster, "mount", "delete", w.mount(cluster), err)
+			continue
+		}
+		s.openbaoChanged(ctx, cluster, "mount", "delete", w.mount(cluster))
 	}
 	return errs
 }

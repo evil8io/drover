@@ -275,8 +275,8 @@ func parseOpenBao(flags *flag.FlagSet, serviceAccounts bool, address, rancherURL
 	if cfg.TokenTTL < 10*time.Minute {
 		return nil, fmt.Errorf("-openbao-token-ttl %s is shorter than 10m0s, the minimum of a token request", cfg.TokenTTL)
 	}
-	if cfg.CredentialTTL < time.Second {
-		return nil, fmt.Errorf("-openbao-credential-ttl %s is shorter than 1s", cfg.CredentialTTL)
+	if cfg.CredentialTTL < 10*time.Minute {
+		return nil, fmt.Errorf("-openbao-credential-ttl %s is shorter than 10m0s, the minimum of a token request", cfg.CredentialTTL)
 	}
 	if cfg.CredentialMaxTTL < cfg.CredentialTTL {
 		return nil, fmt.Errorf("-openbao-credential-max-ttl %s is shorter than -openbao-credential-ttl %s", cfg.CredentialMaxTTL, cfg.CredentialTTL)
