@@ -411,7 +411,7 @@ func newFakeKube(t *testing.T, data map[string]string) *fakeKube {
 		},
 		tokenFile: tokenFile,
 	}
-	k.server = httptest.NewServer(http.HandlerFunc(k.serve))
+	k.server = httptest.NewTLSServer(http.HandlerFunc(k.serve))
 	t.Cleanup(k.server.Close)
 	return k
 }

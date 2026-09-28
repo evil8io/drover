@@ -130,6 +130,11 @@ func (r *rotator) tokenIsValid(ctx context.Context, token string) (_ bool, err e
 		return false, expiryErr
 	}
 	if !forever && !at.After(r.now().Add(r.cfg.RenewBefore)) {
+		if created := item.createdAt(); !created.IsZero() && r.now().Sub(created) < minRotateAge {
+			return false, fmt.Errorf("the token %s expires inside the renew window, and it is younger than %s, "+
+				"so the run does not rotate it: raise auth-token-max-ttl-minutes or lower -renew-before",
+				name, minRotateAge)
+		}
 		r.logger.InfoContext(ctx, "the token expires inside the renew window",
 			"step", stepTokenCheck, "outcome", outcomeRotate, "reason", "window",
 			"token_name", name, "expires_at", at.UTC().Format(time.RFC3339))
@@ -236,7 +241,8 @@ func (r *rotator) createToken(ctx context.Context, s session) (_ createdToken, e
 
 // prune deletes the tokens of the service user that this command created before.
 // It keeps the new token, the token named secretName, and the newest other
-// tokens up to Keep in total. It also deletes a login token of an earlier run.
+// tokens up to Keep in total. It also deletes a login token of an earlier run,
+// unless secretName names it.
 func (r *rotator) prune(ctx context.Context, created createdToken, secretName string, s session) (err error) {
 	ctx, end := r.step(ctx, stepTokenPrune)
 	outcome := outcomeOK
@@ -263,18 +269,24 @@ func (r *rotator) prune(ctx context.Context, created createdToken, secretName st
 	// kubelet updates the mounted Secret.
 	protected := 1
 	secretKept := ""
+	keepSecret := func(item tokenItem) bool {
+		if secretName == "" || item.itemName() != secretName {
+			return false
+		}
+		secretKept = secretName
+		return true
+	}
 	mine = slices.DeleteFunc(mine, func(item tokenItem) bool {
-		name := item.itemName()
 		switch {
-		case name == created.name:
+		case item.itemName() == created.name:
 			return true
-		case secretName != "" && name == secretName:
+		case keepSecret(item):
 			protected++
-			secretKept = name
 			return true
 		}
 		return false
 	})
+	sessions = slices.DeleteFunc(sessions, keepSecret)
 	keep := min(len(mine), max(0, r.cfg.Keep-protected))
 	var errs []error
 	deleted := 0

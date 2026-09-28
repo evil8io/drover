@@ -133,7 +133,8 @@ func parseRotateConfig(args []string, output io.Writer, getenv func(string) stri
 	)
 	flags.StringVar(&rancherURL, "rancher-url", "", "Rancher URL, https:// only")
 	flags.StringVar(&cfg.rancherCAFile, "rancher-ca-file", "", "PEM bundle that verifies an https Rancher URL")
-	flags.BoolVar(&cfg.rancherInsecureSkipVerify, "rancher-insecure-skip-verify", false, "skip the certificate verification of an https Rancher URL")
+	flags.BoolVar(&cfg.rancherInsecureSkipVerify, "rancher-insecure-skip-verify", false,
+		"skip the certificate verification of an https Rancher URL, and send the password to an unverified server")
 	flags.StringVar(&credentialsDir, "credentials-dir", "", "directory with the files username and password")
 	flags.StringVar(&tokenSecret, "token-secret", "", "namespace/name of the Secret with the API token")
 	flags.StringVar(&cfg.key, "token-key", "token", "key of the token inside the Secret")
@@ -143,7 +144,7 @@ func parseRotateConfig(args []string, output io.Writer, getenv func(string) stri
 	flags.DurationVar(&cfg.renewBefore, "renew-before", 24*time.Hour, "remaining lifetime that starts a rotation")
 	flags.IntVar(&cfg.keep, "keep", 2, "number of tokens to keep, the new token included, at least 2")
 	flags.StringVar(&cfg.description, "description", "drover rotate-token", "description of the tokens of this command")
-	flags.StringVar(&kubeURL, "kube-url", "", "Kubernetes API URL, default from the in-cluster environment")
+	flags.StringVar(&kubeURL, "kube-url", "", "Kubernetes API URL, https:// only, default from the in-cluster environment")
 	flags.StringVar(&serviceAccount, "kube-service-account-dir", defaultServiceAccountDir,
 		"directory with the ServiceAccount token and ca.crt")
 	flags.StringVar(&logLevel, "log-level", "info", "debug, info, warn or error")
@@ -166,6 +167,10 @@ func parseRotateConfig(args []string, output io.Writer, getenv func(string) stri
 	if cfg.rancher, err = parseServiceURL("-rancher-url", rancherURL, true); err != nil {
 		return rotateConfig{}, err
 	}
+	if cfg.rancherCAFile != "" && cfg.rancherInsecureSkipVerify {
+		return rotateConfig{}, errors.New("-rancher-ca-file and -rancher-insecure-skip-verify exclude each other, " +
+			"because the skip ignores the CA file")
+	}
 
 	if kubeURL == "" {
 		host, port := getenv("KUBERNETES_SERVICE_HOST"), getenv("KUBERNETES_SERVICE_PORT")
@@ -174,7 +179,7 @@ func parseRotateConfig(args []string, output io.Writer, getenv func(string) stri
 		}
 		kubeURL = "https://" + net.JoinHostPort(host, port)
 	}
-	if cfg.kube, err = parseServiceURL("-kube-url", kubeURL, false); err != nil {
+	if cfg.kube, err = parseServiceURL("-kube-url", kubeURL, true); err != nil {
 		return rotateConfig{}, err
 	}
 
@@ -207,6 +212,11 @@ func parseRotateConfig(args []string, output io.Writer, getenv func(string) stri
 	if cfg.password, err = readCredential(credentialsDir, "password"); err != nil {
 		return rotateConfig{}, err
 	}
+	if cfg.passwordSecret != "" {
+		if err = rotate.CheckPasswordLength(cfg.password); err != nil {
+			return rotateConfig{}, fmt.Errorf("-password-secret: %w", err)
+		}
+	}
 
 	if cfg.ttl <= 0 {
 		return rotateConfig{}, errors.New("-ttl must be longer than zero")
@@ -218,8 +228,8 @@ func parseRotateConfig(args []string, output io.Writer, getenv func(string) stri
 		return rotateConfig{}, fmt.Errorf("-renew-before %s is not shorter than -ttl %s, so every run rotates",
 			cfg.renewBefore, cfg.ttl)
 	}
-	if cfg.keep < 1 {
-		return rotateConfig{}, errors.New("-keep must be 1 or more, because the new token counts")
+	if cfg.keep < 2 {
+		return rotateConfig{}, errors.New("-keep must be 2 or more, because a pod reads a mounted Secret with a delay after the patch")
 	}
 	if cfg.description == "" {
 		return rotateConfig{}, errors.New("-description is required, because it selects the tokens to delete")
