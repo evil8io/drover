@@ -188,8 +188,8 @@ func (s *Service) fetchAllowed(ctx context.Context, cluster, auth, cookie string
 	ctx, cancel := context.WithTimeout(ctx, steveTimeout)
 	defer cancel()
 
-	if subject, namespace, ok := serviceAccountSubject(auth); ok {
-		return s.fetchRules(ctx, cluster, auth, subject, namespace)
+	if subject, ok := serviceAccountSubject(auth); ok {
+		return s.fetchRules(ctx, cluster, auth, subject)
 	}
 
 	names, projectOf, denied, err := s.fetchNamespaceNames(ctx, cluster, auth, cookie)

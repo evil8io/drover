@@ -357,22 +357,14 @@ func (f *frameFilter) drain() error {
 	return nil
 }
 
-// emit applies the event filter to one event, and writes the event when it
-// passes, in the form of the last message. An ADDED, a MODIFIED, and a
-// DELETED event needs a namespace that allow accepts. Every other event
-// passes, and so does a value that is no watch event.
+// emit applies the event filter of filterEvent to one event, and writes the
+// event when it passes, in the form of the last message.
 func (f *frameFilter) emit(raw json.RawMessage) error {
-	var event watchEvent
-	if json.Unmarshal(raw, &event) == nil {
-		switch event.Type {
-		case watchAdded, watchModified, watchDeleted:
-			if !eventAllowed(event, f.allow) {
-				f.metrics.eventDropped(f.ctx, f.cluster)
-				f.logger.DebugContext(f.ctx, "dropped a watch event",
-					"kind", event.Object.Kind, "namespace", event.Object.Metadata.Name)
-				return nil
-			}
-		}
+	if event, pass := filterEvent(raw, f.allow); !pass {
+		f.metrics.eventDropped(f.ctx, f.cluster)
+		f.logger.DebugContext(f.ctx, "dropped a watch event",
+			"kind", event.Object.Kind, "namespace", event.Object.Metadata.Name)
+		return nil
 	}
 
 	line := make([]byte, 0, len(raw)+1)

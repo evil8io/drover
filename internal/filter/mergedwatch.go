@@ -150,7 +150,7 @@ func (s *Service) mergedWatch(req *http.Request, target collectionTarget, set al
 		go merge.endInitialEventsWithout(kind, apiVersion)
 	}
 	go merge.finishOnEnd(ctx)
-	go s.trackAllowedSet(ctx, req.Clone(ctx), target, names, merge)
+	go s.trackAllowedSet(ctx, req.Clone(ctx), target, names, streams, merge)
 
 	result.outcome, result.status = outcomeFannedOut, resp.StatusCode
 	s.logList(ctx, start, result)
@@ -599,18 +599,27 @@ func controlFrame(opcode byte, payload []byte) []byte {
 	return append(frame, payload...)
 }
 
+// watchOpenTries is the count of tries to open the upstream watch of one
+// namespace of a merged watch.
+const watchOpenTries = 3
+
 // trackAllowedSet re-reads the allowed namespaces of the caller once per cache
 // TTL, through the cache of a plain list, so it adds no request beyond the one
 // fetch per cache TTL. A gained namespace joins the running merge through
 // addWatch. A lost namespace ends the stream, and so does a gain above the
 // fan-out watch limit. Both ends send the ERROR event of expire first.
 //
-// A name of the first set whose watch did not open stays out, as in
-// openWatches. A gained name that does not open gets a new try on the next
-// tick, because Rancher creates the role bindings of a new namespace some
-// seconds after the namespace.
-func (s *Service) trackAllowedSet(ctx context.Context, req *http.Request, target collectionTarget, names []string, merge *watchMerge) {
+// A namespace whose upstream watch does not open gets a new try on each next
+// tick, up to watchOpenTries tries in total. This applies to a name of the
+// first set that has no stream in streams, and to a gained name.
+func (s *Service) trackAllowedSet(ctx context.Context, req *http.Request, target collectionTarget, names []string, streams []upstreamWatch, merge *watchMerge) {
 	watched := slices.Clone(names)
+	failedOpens := make(map[string]int)
+	for _, name := range names {
+		if !slices.ContainsFunc(streams, func(stream upstreamWatch) bool { return stream.namespace == name }) {
+			failedOpens[name] = 1
+		}
+	}
 	ticker := time.NewTicker(s.cache.ttl)
 	defer ticker.Stop()
 
@@ -623,11 +632,8 @@ func (s *Service) trackAllowedSet(ctx context.Context, req *http.Request, target
 		case <-ticker.C:
 		}
 
-		set, denied, err := s.allowed(ctx, target.cluster, req.Header)
-		if denied != nil {
-			_ = denied.Body.Close()
-		}
-		if denied != nil || err != nil {
+		set, ok := s.trackedSet(ctx, target.cluster, req.Header)
+		if !ok {
 			continue
 		}
 		if slices.ContainsFunc(watched, func(name string) bool { return !slices.Contains(set.names, name) }) {
@@ -635,7 +641,7 @@ func (s *Service) trackAllowedSet(ctx context.Context, req *http.Request, target
 				"ended a merged watch, because the allowed namespaces of the caller changed")
 			return
 		}
-		gained := slices.DeleteFunc(slices.Clone(set.names), func(name string) bool { return slices.Contains(watched, name) })
+		gained := subtract(set.names, watched)
 		if count := len(watched) + len(gained); count > s.fanoutMaxWatchNamespaces {
 			merge.expire(s.watchCapMessage(count),
 				"ended a merged watch, because the allowed namespaces of the caller are above the fan-out watch limit",
@@ -643,9 +649,19 @@ func (s *Service) trackAllowedSet(ctx context.Context, req *http.Request, target
 			return
 		}
 		for _, name := range gained {
-			if s.addWatch(ctx, req, target, name, merge) {
-				watched = append(watched, name)
+			watched = append(watched, name)
+			failedOpens[name] = 0
+		}
+		for _, name := range watched {
+			failed, pending := failedOpens[name]
+			if !pending {
+				continue
 			}
+			if s.addWatch(ctx, req, target, name, merge) || failed+1 >= watchOpenTries {
+				delete(failedOpens, name)
+				continue
+			}
+			failedOpens[name] = failed + 1
 		}
 	}
 }

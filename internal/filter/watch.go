@@ -18,6 +18,10 @@ const (
 	watchAdded    = "ADDED"
 	watchModified = "MODIFIED"
 	watchDeleted  = "DELETED"
+	watchError    = "ERROR"
+
+	// statusKind is the kind of the object of an ERROR event.
+	statusKind = "Status"
 
 	// tableKind is the kind of a server-side table response, for example the
 	// response to the Accept that kubectl sends.
@@ -60,6 +64,29 @@ func eventAllowed(event watchEvent, allow func(name string, labels map[string]st
 		}
 	}
 	return true
+}
+
+// filterEvent decodes raw, and reports whether the event filter passes it to
+// the client. An ERROR event passes with a Status only, because the client
+// needs the Status of the upstream, for example the 410 that asks for a new
+// list. An event of an unknown type and a value that does not decode are
+// dropped, because the filter cannot check what they contain.
+func filterEvent(raw json.RawMessage, allow func(name string, labels map[string]string) bool) (watchEvent, bool) {
+	var event watchEvent
+	if json.Unmarshal(raw, &event) != nil {
+		return event, false
+	}
+	switch event.Type {
+	case watchAdded, watchModified, watchDeleted:
+		return event, eventAllowed(event, allow)
+	case watchBookmark:
+		return event, eventAllowed(event, func(name string, labels map[string]string) bool {
+			return name == "" || allow(name, labels)
+		})
+	case watchError:
+		return event, event.Object.Kind == statusKind
+	}
+	return event, false
 }
 
 // watchStream is one open watch stream. upgraded marks a stream of a
@@ -358,16 +385,16 @@ func (r *watchRelay) swap(resp *http.Response) error {
 }
 
 // filterWatchBody reads a namespace watch stream from upstream, and returns a
-// stream with only the events that allow lets through, plus the relay of that
-// stream. A BOOKMARK, an ERROR, and any event the filter cannot parse always
-// pass. It registers the write side in registry with slot while the goroutine
-// runs, so a drain and the tracker of the allowed set can end the stream. A
-// read of upstream that fails after a swap of the relay goes on with the new
-// upstream. The goroutine ends, and closes the current upstream, in two cases:
-// a read of upstream fails without a swap, for example because ctx cancels,
-// or a write to the pipe fails because the reader closed it or the registry
-// ended it. It raises drover.filter.watches.open while the stream is open, and
-// counts a dropped event on cluster in drover.filter.events.dropped.
+// stream with only the events that filterEvent passes with allow, plus the
+// relay of that stream. It registers the write side in registry with slot
+// while the goroutine runs, so a drain and the tracker of the allowed set can
+// end the stream. A read of upstream that fails after a swap of the relay goes
+// on with the new upstream. The goroutine ends, and closes the current
+// upstream, in two cases: a read of upstream fails without a swap, for
+// example because ctx cancels, or a write to the pipe fails because the
+// reader closed it or the registry ended it. It raises
+// drover.filter.watches.open while the stream is open, and counts a dropped
+// event on cluster in drover.filter.events.dropped.
 func filterWatchBody(ctx context.Context, upstream io.ReadCloser, allow func(name string, labels map[string]string) bool, logger *slog.Logger, registry *watchRegistry, slot *watchSlot, metrics *metrics, cluster string) (io.ReadCloser, *watchRelay) {
 	reader, writer := io.Pipe()
 	registry.add(writer, false, slot)
@@ -396,19 +423,9 @@ func filterWatchBody(ctx context.Context, upstream io.ReadCloser, allow func(nam
 				continue
 			}
 
-			var event watchEvent
-			pass := true
-			if json.Unmarshal(raw, &event) == nil {
-				switch event.Type {
-				case watchAdded, watchModified, watchDeleted:
-					pass = eventAllowed(event, allow)
-					if !pass {
-						metrics.eventDropped(ctx, cluster)
-						logger.DebugContext(ctx, "dropped a watch event", "kind", event.Object.Kind, "namespace", event.Object.Metadata.Name)
-					}
-				}
-			}
-			if !pass {
+			if event, pass := filterEvent(raw, allow); !pass {
+				metrics.eventDropped(ctx, cluster)
+				logger.DebugContext(ctx, "dropped a watch event", "kind", event.Object.Kind, "namespace", event.Object.Metadata.Name)
 				continue
 			}
 

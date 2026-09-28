@@ -407,23 +407,6 @@ func TestUpgradeForwardsPingWhileBuffering(t *testing.T) {
 	h.wantEnd(t)
 }
 
-// TestUpgradePassesEventWithoutADecision checks that a BOOKMARK event and a
-// value that is no watch event reach the caller.
-func TestUpgradePassesEventWithoutADecision(t *testing.T) {
-	t.Parallel()
-	bookmark := `{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"7"}}}`
-	other := `["not an event"]`
-	stream := []byte(bookmark + "\n" + other + "\n")
-	h := newUpgradeHarness(t, bytes.NewReader(wsStream("", stream)), allowNames(), testMetrics(t), "")
-
-	for _, want := range []string{bookmark, other} {
-		if got := h.nextMessage(t, ""); got != want+"\n" {
-			t.Errorf("message = %q, want %q", got, want+"\n")
-		}
-	}
-	h.wantEnd(t)
-}
-
 // TestUpgradeAssemblesContinuationFrame checks that the filter reads a
 // message that arrives as a first frame plus a continuation frame.
 func TestUpgradeAssemblesContinuationFrame(t *testing.T) {
