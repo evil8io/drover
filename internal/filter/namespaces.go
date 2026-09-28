@@ -270,17 +270,27 @@ func (s *Service) trackNamespaceWatch(ctx context.Context, w *namespaceWatch) {
 		case <-ticker.C:
 		}
 
-		set, denied, err := s.allowed(ctx, w.cluster, w.req.Header)
-		if denied != nil {
-			_ = denied.Body.Close()
-		}
-		if denied != nil || err != nil {
+		set, ok := s.trackedSet(ctx, w.cluster, w.req.Header)
+		if !ok {
 			continue
 		}
 		if !s.followAllowedSet(ctx, w, set) {
 			return
 		}
 	}
+}
+
+// trackedSet returns the allowed set of the caller for the ticker of an open
+// watch. A 401 or a 403 of the fetch gives the empty set, because the caller
+// then lost its last namespace or its credential. It reports false on a 429
+// and on an error, and the ticker then tries again on its next tick.
+func (s *Service) trackedSet(ctx context.Context, cluster string, header http.Header) (allowedSet, bool) {
+	set, denied, err := s.allowed(ctx, cluster, header)
+	if denied == nil {
+		return set, err == nil
+	}
+	_ = denied.Body.Close()
+	return allowedSet{}, denied.StatusCode == http.StatusUnauthorized || denied.StatusCode == http.StatusForbidden
 }
 
 // followAllowedSet brings the stream of w to set, and reports false once the

@@ -20,6 +20,10 @@ const (
 	bearerScheme         = "bearer "
 
 	rulesReviewPath = "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews"
+	// clusterRulesNamespace is the namespace of the rules review. No
+	// namespace can have a name with a colon, so no RoleBinding is in it, and
+	// the review returns the rules of the ClusterRoleBindings only.
+	clusterRulesNamespace = "drover:cluster-rules"
 )
 
 // resourceRule is the part of a ResourceRule of a SelfSubjectRulesReview that
@@ -43,53 +47,54 @@ type rulesReview struct {
 
 // serviceAccountSubject reports whether auth is a bearer JWT of a Kubernetes
 // ServiceAccount: a token of three segments whose payload has a sub with the
-// ServiceAccount prefix. It returns the subject and the namespace of the
-// ServiceAccount. The API server verifies the token. The filter reads the
-// claim only to pick the leg of the allowed-set fetch, and it trusts the
-// subject only after the API server answered a review for that token.
-func serviceAccountSubject(auth string) (subject, namespace string, ok bool) {
+// ServiceAccount prefix, a namespace, and a name. It returns the subject. The
+// API server verifies the token. The filter reads the claim only to pick the
+// leg of the allowed-set fetch, and it trusts the subject only after the API
+// server answered a review for that token.
+func serviceAccountSubject(auth string) (string, bool) {
 	if len(auth) < len(bearerScheme) || !strings.EqualFold(auth[:len(bearerScheme)], bearerScheme) {
-		return "", "", false
+		return "", false
 	}
 	segments := strings.Split(strings.TrimSpace(auth[len(bearerScheme):]), ".")
 	if len(segments) != 3 {
-		return "", "", false
+		return "", false
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(segments[1], "="))
 	if err != nil {
-		return "", "", false
+		return "", false
 	}
 	var claims struct {
 		Subject string `json:"sub"`
 	}
 	if err := json.Unmarshal(payload, &claims); err != nil {
-		return "", "", false
+		return "", false
 	}
 	rest, found := strings.CutPrefix(claims.Subject, serviceAccountPrefix)
 	if !found {
-		return "", "", false
+		return "", false
 	}
 	namespace, name, found := strings.Cut(rest, ":")
 	if !found || namespace == "" || name == "" {
-		return "", "", false
+		return "", false
 	}
-	return claims.Subject, namespace, true
+	return claims.Subject, true
 }
 
 // fetchRules reads the namespace names that a ServiceAccount caller may get,
 // from a SelfSubjectRulesReview with the credentials of the caller. The review
-// runs in the namespace of the ServiceAccount, because no tenant binds a role
-// there, and a RoleBinding to a broad role in the review namespace shows a
-// get on namespaces without names. The name set is the union of the
+// runs in clusterRulesNamespace, so it has the rules of the ClusterRoleBindings
+// of the caller only. A Role grants its rules in its own namespace only, so a
+// get on namespaces from a RoleBinding does not let the caller get a
+// namespace with another name. The name set is the union of the
 // resourceNames of the rules that grant get on namespaces. A rule without
 // names grants get on every namespace and separates no tenant, and no rule
 // grants nothing. Both give a denied set, which the cache keeps for one TTL.
 // A non-nil response is the 401 or 403 answer of the API server.
-func (s *Service) fetchRules(ctx context.Context, cluster, auth, subject, namespace string) (allowedSet, *http.Response, error) {
+func (s *Service) fetchRules(ctx context.Context, cluster, auth, subject string) (allowedSet, *http.Response, error) {
 	body, err := json.Marshal(map[string]any{
 		"apiVersion": "authorization.k8s.io/v1",
 		"kind":       "SelfSubjectRulesReview",
-		"spec":       map[string]string{"namespace": namespace},
+		"spec":       map[string]string{"namespace": clusterRulesNamespace},
 	})
 	if err != nil {
 		return allowedSet{}, nil, err

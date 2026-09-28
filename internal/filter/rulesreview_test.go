@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -14,6 +16,52 @@ import (
 // namespaceRule grants get on the named namespaces.
 func namespaceRule(names ...string) resourceRule {
 	return resourceRule{Verbs: []string{"get"}, APIGroups: []string{""}, Resources: []string{"namespaces"}, ResourceNames: names}
+}
+
+// ruleSet is the rules that a rules review answers. A test changes them while
+// a watch runs.
+type ruleSet struct {
+	mu    sync.Mutex
+	rules []resourceRule
+}
+
+func newRuleSet(rules ...resourceRule) *ruleSet {
+	return &ruleSet{rules: rules}
+}
+
+func (r *ruleSet) set(rules ...resourceRule) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rules = rules
+}
+
+func (r *ruleSet) handler() http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		r.mu.Lock()
+		rules := slices.Clone(r.rules)
+		r.mu.Unlock()
+		rulesReviewHandler(rules...)(w, req)
+	}
+}
+
+// rulesReviewResolver answers a SelfSubjectRulesReview as the RBAC authorizer
+// of the API server does: with the rules of the ClusterRoleBindings, plus the
+// rules of the RoleBindings in the namespace of the review. An empty
+// namespace gets 400.
+func rulesReviewResolver(cluster []resourceRule, roleBindings map[string][]resourceRule) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var review struct {
+			Spec struct {
+				Namespace string `json:"namespace"`
+			} `json:"spec"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&review); err != nil || review.Spec.Namespace == "" {
+			http.Error(w, "no namespace on request", http.StatusBadRequest)
+			return
+		}
+		rules := append(slices.Clone(cluster), roleBindings[review.Spec.Namespace]...)
+		rulesReviewHandler(rules...)(w, r)
+	}
 }
 
 // wantNoServiceToken checks that no upstream request used the service token.
@@ -47,6 +95,9 @@ func privilegedCount(up *upstream) int {
 	}
 	return count
 }
+
+// namespaceName matches a valid namespace name, an RFC 1123 label.
+var namespaceName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
 
 func TestListServiceAccountUsesRulesReview(t *testing.T) {
 	t.Parallel()
@@ -85,8 +136,8 @@ func TestListServiceAccountUsesRulesReview(t *testing.T) {
 		t.Errorf("rules review kind = %q and apiVersion = %q, want SelfSubjectRulesReview and authorization.k8s.io/v1",
 			sent.Kind, sent.APIVersion)
 	}
-	if sent.Spec.Namespace != "tenant-system" {
-		t.Errorf("rules review namespace = %q, want tenant-system", sent.Spec.Namespace)
+	if sent.Spec.Namespace == "" || namespaceName.MatchString(sent.Spec.Namespace) {
+		t.Errorf("rules review namespace = %q, want a name that no namespace can have", sent.Spec.Namespace)
 	}
 
 	privileged := h.upstream.privileged(t)
@@ -108,6 +159,48 @@ func TestListServiceAccountUsesRulesReview(t *testing.T) {
 	if !strings.Contains(h.logs.String(), "user="+serviceAccountSubjectValue) {
 		t.Errorf("logs have no user=%s line: %s", serviceAccountSubjectValue, h.logs.String())
 	}
+}
+
+// TestServiceAccountRoleBindingAddsNoNamespace checks that a RoleBinding in
+// the namespace of a ServiceAccount adds no name to its allowed set. A Role
+// grants its rules in its own namespace only, so the API server denies the
+// ServiceAccount the get of a namespace that such a Role names.
+func TestServiceAccountRoleBindingAddsNoNamespace(t *testing.T) {
+	t.Parallel()
+	resolver := rulesReviewResolver([]resourceRule{namespaceRule("a")},
+		map[string][]resourceRule{"tenant-system": {namespaceRule("victim-a")}})
+
+	t.Run("list", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t, rulesUpstream(resolver, namespaceListHandler))
+
+		resp, body := h.do(t, h.request(t, http.MethodGet, listPath, nil, serviceAccountHeader()))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200: %q", resp.StatusCode, body)
+		}
+		if got, want := h.upstream.privileged(t).query.Get("labelSelector"), "kubernetes.io/metadata.name in (a)"; got != want {
+			t.Errorf("labelSelector = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("watch", func(t *testing.T) {
+		t.Parallel()
+		const allowed = `{"type":"ADDED","object":{"metadata":{"name":"a"}}}` + "\n"
+		h := newHarness(t, rulesUpstream(resolver, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", jsonContentType)
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, allowed)
+			_, _ = io.WriteString(w, `{"type":"ADDED","object":{"metadata":{"name":"victim-a"}}}`+"\n")
+		}))
+
+		resp, body := h.do(t, h.request(t, http.MethodGet, listPath+"?watch=true", nil, serviceAccountHeader()))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		if string(body) != allowed {
+			t.Errorf("body = %q, want the allowed event %q", body, allowed)
+		}
+	})
 }
 
 func TestListServiceAccountUnboundedRuleGetsNative403(t *testing.T) {
@@ -312,33 +405,32 @@ func TestServiceAccountSubject(t *testing.T) {
 	}
 
 	tests := []struct {
-		name          string
-		auth          string
-		wantSubject   string
-		wantNamespace string
-		wantOK        bool
+		name        string
+		auth        string
+		wantSubject string
+		wantOK      bool
 	}{
-		{"raw payload", serviceAccountToken, serviceAccountSubjectValue, "tenant-system", true},
-		{"padded payload", "Bearer " + token(paddedPayload), padded, "tenant-system", true},
-		{"scheme in upper case", "BEARER " + token(payload(serviceAccountSubjectValue)), serviceAccountSubjectValue, "tenant-system", true},
-		{"basic scheme", "Basic " + token(payload(serviceAccountSubjectValue)), "", "", false},
-		{"rancher token", "Bearer token-abc:xyz", "", "", false},
-		{"two segments", "Bearer " + header + "." + payload(serviceAccountSubjectValue), "", "", false},
-		{"payload not base64", "Bearer " + token("!!!"), "", "", false},
-		{"payload not json", "Bearer " + token(base64.RawURLEncoding.EncodeToString([]byte("not json"))), "", "", false},
-		{"sub not a string", "Bearer " + token(base64.RawURLEncoding.EncodeToString([]byte(`{"sub":1}`))), "", "", false},
-		{"user subject", "Bearer " + token(payload("user@example.com")), "", "", false},
-		{"no name", "Bearer " + token(payload("system:serviceaccount:ns")), "", "", false},
-		{"empty namespace", "Bearer " + token(payload("system:serviceaccount::name")), "", "", false},
-		{"empty name", "Bearer " + token(payload("system:serviceaccount:ns:")), "", "", false},
+		{"raw payload", serviceAccountToken, serviceAccountSubjectValue, true},
+		{"padded payload", "Bearer " + token(paddedPayload), padded, true},
+		{"scheme in upper case", "BEARER " + token(payload(serviceAccountSubjectValue)), serviceAccountSubjectValue, true},
+		{"basic scheme", "Basic " + token(payload(serviceAccountSubjectValue)), "", false},
+		{"rancher token", "Bearer token-abc:xyz", "", false},
+		{"two segments", "Bearer " + header + "." + payload(serviceAccountSubjectValue), "", false},
+		{"payload not base64", "Bearer " + token("!!!"), "", false},
+		{"payload not json", "Bearer " + token(base64.RawURLEncoding.EncodeToString([]byte("not json"))), "", false},
+		{"sub not a string", "Bearer " + token(base64.RawURLEncoding.EncodeToString([]byte(`{"sub":1}`))), "", false},
+		{"user subject", "Bearer " + token(payload("user@example.com")), "", false},
+		{"no name", "Bearer " + token(payload("system:serviceaccount:ns")), "", false},
+		{"empty namespace", "Bearer " + token(payload("system:serviceaccount::name")), "", false},
+		{"empty name", "Bearer " + token(payload("system:serviceaccount:ns:")), "", false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			subject, namespace, ok := serviceAccountSubject(test.auth)
-			if subject != test.wantSubject || namespace != test.wantNamespace || ok != test.wantOK {
-				t.Errorf("serviceAccountSubject(%q) = (%q, %q, %v), want (%q, %q, %v)",
-					test.auth, subject, namespace, ok, test.wantSubject, test.wantNamespace, test.wantOK)
+			subject, ok := serviceAccountSubject(test.auth)
+			if subject != test.wantSubject || ok != test.wantOK {
+				t.Errorf("serviceAccountSubject(%q) = (%q, %v), want (%q, %v)",
+					test.auth, subject, ok, test.wantSubject, test.wantOK)
 			}
 		})
 	}

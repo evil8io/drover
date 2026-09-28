@@ -2,6 +2,8 @@ package filter
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -256,6 +258,95 @@ func TestWatchPassesBookmark(t *testing.T) {
 	if string(body) != want {
 		t.Errorf("body = %q, want %q", body, want)
 	}
+}
+
+// filteredOnEveryTransport runs events through the event filter of a chunked
+// watch and of an upgraded watch, with allow. It returns the events that reach
+// the client on each transport, each with the newline of the stream.
+func filteredOnEveryTransport(t *testing.T, allow func(string, map[string]string) bool, events ...string) map[string][]string {
+	t.Helper()
+	stream := []byte(strings.Join(events, "\n") + "\n")
+
+	registry, slot := newTestRegistry(t)
+	body, _ := filterWatchBody(context.Background(), io.NopCloser(bytes.NewReader(stream)), allow, testLogger(), registry, slot, testMetrics(t), "c-1")
+	chunked, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("read the chunked stream: %v", err)
+	}
+	lines := strings.SplitAfter(string(chunked), "\n")
+
+	h := newUpgradeHarness(t, bytes.NewReader(wsStream("", stream)), allow, testMetrics(t), "")
+	var upgraded []string
+	for {
+		if _, err := h.reader.Peek(1); err != nil {
+			break
+		}
+		upgraded = append(upgraded, h.nextMessage(t, ""))
+	}
+	return map[string][]string{"chunked": lines[:len(lines)-1], "upgraded": upgraded}
+}
+
+// wantFiltered checks that exactly want, in order, reach the client of each
+// transport when the upstream sends events.
+func wantFiltered(t *testing.T, allow func(string, map[string]string) bool, events, want []string) {
+	t.Helper()
+	lines := make([]string, 0, len(want))
+	for _, event := range want {
+		lines = append(lines, event+"\n")
+	}
+	for transport, got := range filteredOnEveryTransport(t, allow, events...) {
+		if !slices.Equal(got, lines) {
+			t.Errorf("%s events = %q, want %q", transport, got, lines)
+		}
+	}
+}
+
+// TestEventFilterChecksTheNameOfABookmark checks that a BOOKMARK event without
+// a name passes, and that a BOOKMARK event with a name passes only for an
+// allowed namespace.
+func TestEventFilterChecksTheNameOfABookmark(t *testing.T) {
+	t.Parallel()
+	plain := `{"type":"BOOKMARK","object":{"kind":"Namespace","apiVersion":"v1","metadata":{"resourceVersion":"7"}}}`
+	allowed := `{"type":"BOOKMARK","object":{"metadata":{"name":"a","resourceVersion":"8"}}}`
+	denied := `{"type":"BOOKMARK","object":{"metadata":{"name":"z","resourceVersion":"9"}}}`
+	wantFiltered(t, allowNames("a"), []string{plain, denied, allowed}, []string{plain, allowed})
+}
+
+// TestEventFilterPassesOnlyAStatusInAnErrorEvent checks that an ERROR event of
+// the upstream passes with a Status, for example the 410 that asks the client
+// for a new list, and that an ERROR event with any other object is dropped.
+func TestEventFilterPassesOnlyAStatusInAnErrorEvent(t *testing.T) {
+	t.Parallel()
+	status := `{"type":"ERROR","object":{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure",` +
+		`"message":"too old resource version: 1 (2)","reason":"Expired","code":410}}`
+	namespace := `{"type":"ERROR","object":{"kind":"Namespace","apiVersion":"v1","metadata":{"name":"z"}}}`
+	wantFiltered(t, allowNames("a"), []string{namespace, status}, []string{status})
+}
+
+// TestEventFilterDropsAnEventOfAnUnknownType checks that an event whose type
+// is not a watch event type is dropped, also with an allowed namespace.
+func TestEventFilterDropsAnEventOfAnUnknownType(t *testing.T) {
+	t.Parallel()
+	added := `{"type":"ADDED","object":{"metadata":{"name":"a"}}}`
+	wantFiltered(t, allowNames("a"), []string{
+		`{"type":"SNAPSHOT","object":{"metadata":{"name":"z"}}}`,
+		`{"type":"SNAPSHOT","object":{"metadata":{"name":"a"}}}`,
+		`{"object":{"metadata":{"name":"z"}}}`,
+		added,
+	}, []string{added})
+}
+
+// TestEventFilterDropsAValueThatIsNoWatchEvent checks that a JSON value that
+// does not decode as a watch event is dropped.
+func TestEventFilterDropsAValueThatIsNoWatchEvent(t *testing.T) {
+	t.Parallel()
+	added := `{"type":"ADDED","object":{"metadata":{"name":"a"}}}`
+	wantFiltered(t, allowNames("a"), []string{
+		`{"type":"ADDED","object":{"metadata":{"name":"z","labels":{"team":1}}}}`,
+		`["not an event"]`,
+		`"z"`,
+		added,
+	}, []string{added})
 }
 
 func TestWatchAllowsTableRow(t *testing.T) {
@@ -1113,6 +1204,43 @@ func TestWatchWithoutSelectorDeletesALostNamespace(t *testing.T) {
 	}
 	wantNamespaceReads(t, h.upstream, "b", 0)
 	wantOpenAfterTick(t, h, reader)
+}
+
+// TestWatchDeletesEveryNamespaceWhenTheAllowedSetFetchIsDenied checks that the
+// ticker of a namespace watch takes a 401 or a 403 of the allowed-set fetch as
+// an empty allowed set, so the client gets the DELETED event of every
+// namespace. Any other failure keeps the stream as it is until the next tick.
+func TestWatchDeletesEveryNamespaceWhenTheAllowedSetFetchIsDenied(t *testing.T) {
+	t.Parallel()
+	for _, test := range deniedFetches {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			release := make(chan struct{})
+			defer close(release)
+
+			header, fetchPath, fetch, deny := deniedFetchCaller(test)
+			upstream := listUpstream(fetch, openWatch(release))
+			if test.serviceAccount {
+				upstream = rulesUpstream(fetch, openWatch(release))
+			}
+			h := newHarnessOpt(t, upstream, shortTTL)
+
+			reader := startWatchWith(t, h, listPath+"?watch=true", header)
+			deny()
+			before := h.upstream.countPath(fetchPath)
+			h.clock.advance(time.Minute)
+			if !test.ends {
+				if !waitFor(func() bool { return h.upstream.countPath(fetchPath) > before }) {
+					t.Fatal("the ticker did not re-read the allowed set of the caller")
+				}
+				wantNoEvent(t, reader)
+				return
+			}
+			if got := nextEvent(t, reader); got != deletedLine("a") {
+				t.Fatalf("event = %q, want the DELETED event %q", got, deletedLine("a"))
+			}
+		})
+	}
 }
 
 // TestWatchEndsWhenTheSwapFails checks that a stream ends after the ERROR

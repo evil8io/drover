@@ -62,7 +62,13 @@ func namespaceWatches(release <-chan struct{}, lines map[string][]string) http.H
 // the answer with a reader of the merged stream.
 func startMergedWatch(t *testing.T, h *harness, target string) (*http.Response, *bufio.Reader) {
 	t.Helper()
-	resp, err := h.proxy.Client().Do(h.request(t, http.MethodGet, target, nil, callerHeader()))
+	return startMergedWatchWith(t, h, target, callerHeader())
+}
+
+// startMergedWatchWith is startMergedWatch with the headers of the request.
+func startMergedWatchWith(t *testing.T, h *harness, target string, header http.Header) (*http.Response, *bufio.Reader) {
+	t.Helper()
+	resp, err := h.proxy.Client().Do(h.request(t, http.MethodGet, target, nil, header))
 	if err != nil {
 		t.Fatalf("do request: %v", err)
 	}
@@ -699,6 +705,161 @@ func TestMergedWatchRetriesAGainedNamespace(t *testing.T) {
 	wantLog(t, h, `msg="the namespaced watch returned no stream"`, "namespace=b", "status=403")
 	wantLog(t, h, `msg="added a namespace to a merged watch"`, "namespace=b")
 	wantOpenAfterTick(t, h, reader)
+}
+
+// TestMergedWatchRetriesANamespaceOfTheFirstSet checks that a namespace of
+// the first set whose watch answers 403 gets a new try on the next tick, as a
+// gained namespace does.
+func TestMergedWatchRetriesANamespaceOfTheFirstSet(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	var opensOfB atomic.Int32
+	watches := namespaceWatches(release, map[string][]string{"a": {podEvent("a")}, "b": {podEvent("b")}})
+	h := newHarnessOpt(t, collectionUpstream(steveHandler("a", "b"), func(w http.ResponseWriter, r *http.Request) {
+		if namespace, _, _ := splitNamespaced(r.URL.Path); namespace == "b" && opensOfB.Add(1) == 1 {
+			writeForbidden(w, namespacedForbidden)
+			return
+		}
+		watches(w, r)
+	}), withFanout, shortTTL)
+
+	_, reader := startMergedWatch(t, h, podsPath+"?watch=true")
+	if got := nextEvent(t, reader); got != podEvent("a") {
+		t.Fatalf("event = %q, want %q", got, podEvent("a"))
+	}
+	if got := nextEvent(t, reader); got != podEvent("b") {
+		t.Fatalf("event = %q, want the ADDED event %q after a new try", got, podEvent("b"))
+	}
+	if got := opensOfB.Load(); got != 2 {
+		t.Errorf("watch requests of namespace b = %d, want 2", got)
+	}
+	wantLog(t, h, `msg="added a namespace to a merged watch"`, "namespace=b")
+}
+
+// TestMergedWatchStopsTheTriesOfANamespace checks that a namespace whose
+// watch never opens gets three tries per stream, in the first set and as a
+// gained namespace alike.
+func TestMergedWatchStopsTheTriesOfANamespace(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name  string
+		first []steveNamespace
+	}{
+		{"first set", []steveNamespace{{name: "a"}, {name: "b"}}},
+		{"gained", []steveNamespace{{name: "a"}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			release := make(chan struct{})
+			defer close(release)
+
+			var opensOfB atomic.Int32
+			watches := namespaceWatches(release, map[string][]string{"a": {podEvent("a")}})
+			namespaces := newNamespaceSet(test.first...)
+			h := newHarnessOpt(t, collectionUpstream(namespaces.handler(), func(w http.ResponseWriter, r *http.Request) {
+				if namespace, _, _ := splitNamespaced(r.URL.Path); namespace == "b" {
+					opensOfB.Add(1)
+				}
+				watches(w, r)
+			}), withFanout, shortTTL)
+
+			_, reader := startMergedWatch(t, h, podsPath+"?watch=true")
+			if got := nextEvent(t, reader); got != podEvent("a") {
+				t.Fatalf("event = %q, want %q", got, podEvent("a"))
+			}
+			namespaces.set(steveNamespace{name: "a"}, steveNamespace{name: "b"})
+			h.clock.advance(time.Minute)
+
+			if !waitFor(func() bool { return opensOfB.Load() >= 3 }) {
+				t.Fatalf("watch requests of namespace b = %d, want 3", opensOfB.Load())
+			}
+			wantOpenAfterTick(t, h, reader)
+			if got := opensOfB.Load(); got != 3 {
+				t.Errorf("watch requests of namespace b = %d, want 3", got)
+			}
+		})
+	}
+}
+
+// deniedFetch is one case of an allowed-set fetch that fails on a tick. A
+// ServiceAccount caller whose rules name no namespace gets a 403 from the
+// fetch. A Rancher caller gets the status of Steve, for example the 401 of a
+// deleted token. ends reports whether the tick takes the answer as an empty
+// allowed set.
+type deniedFetch struct {
+	name           string
+	serviceAccount bool
+	status         int
+	ends           bool
+}
+
+var deniedFetches = []deniedFetch{
+	{"the rules name no namespace", true, 0, true},
+	{"steve answers 401", false, http.StatusUnauthorized, true},
+	{"steve answers 403", false, http.StatusForbidden, true},
+	{"steve answers 500", false, http.StatusInternalServerError, false},
+}
+
+// deniedFetchCaller returns the headers of the caller of test, the path of
+// its allowed-set fetch, the handler of that fetch, and a function that makes
+// the next fetch fail. The allowed set of the caller is the namespace a.
+func deniedFetchCaller(test deniedFetch) (header http.Header, fetchPath string, fetch http.HandlerFunc, deny func()) {
+	if test.serviceAccount {
+		rules := newRuleSet(namespaceRule("a"))
+		return serviceAccountHeader(), rulesReviewTestPath, rules.handler(), func() { rules.set() }
+	}
+	var failed atomic.Bool
+	steve := func(w http.ResponseWriter, r *http.Request) {
+		if failed.Load() {
+			http.Error(w, http.StatusText(test.status), test.status)
+			return
+		}
+		steveHandler("a")(w, r)
+	}
+	return callerHeader(), stevePath, steve, func() { failed.Store(true) }
+}
+
+// TestMergedWatchEndsWhenTheAllowedSetFetchIsDenied checks that the ticker
+// takes a 401 or a 403 of the allowed-set fetch as an empty allowed set, so
+// the stream ends after the ERROR event with the Status 410 Expired. Any other
+// failure keeps the stream as it is until the next tick.
+func TestMergedWatchEndsWhenTheAllowedSetFetchIsDenied(t *testing.T) {
+	t.Parallel()
+	for _, test := range deniedFetches {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			release := make(chan struct{})
+			defer close(release)
+
+			watches := namespaceWatches(release, map[string][]string{"a": {podEvent("a"), modifiedEvent("a")}})
+			header, fetchPath, fetch, deny := deniedFetchCaller(test)
+			upstream := collectionUpstream(fetch, watches)
+			if test.serviceAccount {
+				upstream = rulesCollectionUpstream(fetch, watches)
+			}
+			h := newHarnessOpt(t, upstream, withFanout, shortTTL)
+
+			_, reader := startMergedWatchWith(t, h, podsPath+"?watch=true", header)
+			if got := mergedEvents(t, reader, 2); !slices.Equal(got, []string{podEvent("a"), modifiedEvent("a")}) {
+				t.Fatalf("events = %q, want the events of namespace a", got)
+			}
+
+			deny()
+			before := h.upstream.countPath(fetchPath)
+			h.clock.advance(time.Minute)
+			if !test.ends {
+				if !waitFor(func() bool { return h.upstream.countPath(fetchPath) > before }) {
+					t.Fatal("the ticker did not re-read the allowed set of the caller")
+				}
+				wantNoEvent(t, reader)
+				return
+			}
+			wantExpiredEvent(t, nextEvent(t, reader), "lost a namespace")
+			wantCleanEnd(t, reader, "the stream stayed open after the allowed-set fetch denied the caller")
+		})
+	}
 }
 
 // TestMergedWatchStaysOpenWithTheSameAllowedSet checks that the ticker
