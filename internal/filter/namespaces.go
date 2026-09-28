@@ -71,7 +71,7 @@ func (s *Service) roundTripNamespaces(req *http.Request, cluster string) (*http.
 	handedOver := false
 	if watch {
 		var limit string
-		if slot, limit = s.watches.reserve(watchCaller(req.Header)); slot == nil {
+		if slot, limit = s.watches.reserve(slotCaller(cluster, set, req.Header)); slot == nil {
 			return s.tooManyWatches(req, start, result, limit), nil
 		}
 		defer func() {

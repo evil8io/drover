@@ -53,6 +53,7 @@ type watchMerge struct {
 	svc      *Service
 	cluster  string
 	resource string
+	caller   string
 
 	writer   *io.PipeWriter
 	upgraded bool
@@ -90,7 +91,8 @@ func (s *Service) mergedWatch(req *http.Request, target collectionTarget, set al
 	names := set.names
 	result.count = len(names)
 
-	slot, limit := s.watches.reserve(watchCaller(req.Header))
+	caller := slotCaller(target.cluster, set, req.Header)
+	slot, limit := s.watches.reserve(caller)
 	if slot == nil {
 		_ = denied.Body.Close()
 		return s.tooManyWatches(req, start, result, limit)
@@ -123,7 +125,7 @@ func (s *Service) mergedWatch(req *http.Request, target collectionTarget, set al
 		}
 	}
 
-	streams, clusterScoped := s.openWatches(req, target, names)
+	streams, clusterScoped := s.openWatches(req, target, names, caller)
 	// A namespaced path of a kind that has no namespace scope, for example
 	// nodes, answers 404 in every namespace.
 	if clusterScoped || (len(names) > 0 && len(streams) == 0) {
@@ -158,12 +160,13 @@ func (s *Service) mergedWatch(req *http.Request, target collectionTarget, set al
 	return resp
 }
 
-// openWatches opens one upstream watch per namespace, at the same time. A
+// openWatches opens one upstream watch per namespace, at the same time. Each
+// open holds an in-flight slot of caller until its upstream answers. A
 // namespace that answers anything but 200 drops out of the merge, because the
 // caller may hold the watch permission in some of its namespaces only. It
 // reports whether a namespace answered 404, which says that the kind has no
 // namespace scope.
-func (s *Service) openWatches(req *http.Request, target collectionTarget, names []string) (streams []upstreamWatch, clusterScoped bool) {
+func (s *Service) openWatches(req *http.Request, target collectionTarget, names []string, caller string) (streams []upstreamWatch, clusterScoped bool) {
 	ctx := req.Context()
 	var mu sync.Mutex
 	var group sync.WaitGroup
@@ -172,7 +175,12 @@ func (s *Service) openWatches(req *http.Request, target collectionTarget, names 
 		group.Add(1)
 		go func(name string) {
 			defer group.Done()
-			body, status := s.openWatch(ctx, namespacedWatchRequest(req, target, name), target, name)
+			var body io.ReadCloser
+			var status int
+			if s.inflight.acquire(ctx, caller) {
+				body, status = s.openWatch(ctx, namespacedWatchRequest(req, target, name), target, name)
+				s.inflight.release(caller)
+			}
 			if body == nil {
 				s.metrics.fanoutSkipped(ctx, target.cluster)
 			}
@@ -269,6 +277,7 @@ func (s *Service) newMerge(req *http.Request, target collectionTarget, slot *wat
 		svc:      s,
 		cluster:  target.cluster,
 		resource: target.resource,
+		caller:   slot.caller,
 		writer:   writer,
 		stop:     make(chan struct{}),
 	}
@@ -667,9 +676,10 @@ func (s *Service) trackAllowedSet(ctx context.Context, req *http.Request, target
 }
 
 // addWatch opens the upstream watch of a gained namespace, and adds it to the
-// running merge. The request has no resourceVersion, so the upstream sends an
-// ADDED event for every object that exists, then the live events. It reports
-// whether the namespace joined the merge.
+// running merge. The open holds an in-flight slot of the caller until its
+// upstream answers. The request has no resourceVersion, so the upstream sends
+// an ADDED event for every object that exists, then the live events. It
+// reports whether the namespace joined the merge.
 func (s *Service) addWatch(ctx context.Context, req *http.Request, target collectionTarget, name string, merge *watchMerge) bool {
 	out := namespacedWatchRequest(req, target, name)
 	query := out.URL.Query()
@@ -680,7 +690,11 @@ func (s *Service) addWatch(ctx context.Context, req *http.Request, target collec
 	}
 	out.URL.RawQuery = query.Encode()
 
+	if !s.inflight.acquire(ctx, merge.caller) {
+		return false
+	}
 	body, _ := s.openWatch(ctx, out, target, name)
+	s.inflight.release(merge.caller)
 	if body == nil {
 		return false
 	}

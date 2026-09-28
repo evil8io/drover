@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -1787,5 +1788,65 @@ func TestNamespaceWatchReleasesTheSlotOnAFailure(t *testing.T) {
 			writeToken(t, tokenFile, "service")
 			startWatch(t, h)
 		})
+	}
+}
+
+// TestMaxWatchesPerCallerJoinsTheSpellingsOfOneToken checks that the
+// spellings of one token share the watch slots of one caller, when the name
+// lookup gives no user.
+func TestMaxWatchesPerCallerJoinsTheSpellingsOfOneToken(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	notFound := func(w http.ResponseWriter, r *http.Request) { http.Error(w, "not found", http.StatusNotFound) }
+	h := newHarnessOpt(t, listUpstreamFull(steveHandler("a"), projectsHandler(), notFound, openWatch(release)),
+		func(cfg *Config) { cfg.MaxWatchesPerCaller = 1 })
+
+	startWatch(t, h)
+	for _, spelling := range []string{
+		"bearer caller",
+		"BEARER   caller",
+		"Basic " + base64.URLEncoding.EncodeToString([]byte("caller")),
+	} {
+		header := http.Header{"Authorization": []string{spelling}}
+		if got := watchStatus(t, h, listPath+"?watch=true", header); got != http.StatusServiceUnavailable {
+			t.Errorf("watch status with %q = %d, want 503", spelling, got)
+		}
+	}
+}
+
+// TestMaxWatchesPerCallerJoinsTheTokensOfOneUser checks that two tokens of one
+// user share the watch slots of one caller.
+func TestMaxWatchesPerCallerJoinsTheTokensOfOneUser(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	h := newHarnessOpt(t, listUpstreamFull(steveHandler("a"), projectsHandler(),
+		selfSubjectReviewHandler(callerUsername), openWatch(release)),
+		func(cfg *Config) { cfg.MaxWatchesPerCaller = 1 })
+
+	startWatch(t, h)
+	if got := watchStatus(t, h, listPath+"?watch=true", otherCallerHeader()); got != http.StatusServiceUnavailable {
+		t.Errorf("watch status of a second token of the user = %d, want 503", got)
+	}
+}
+
+// TestSlotCallerKeysAServiceAccountPerCluster checks that a ServiceAccount
+// subject is one caller per cluster, and that a user is one caller across
+// clusters and tokens.
+func TestSlotCallerKeysAServiceAccountPerCluster(t *testing.T) {
+	t.Parallel()
+	account := allowedSet{user: serviceAccountSubjectValue}
+	if slotCaller("c-1", account, serviceAccountHeader()) == slotCaller("c-2", account, serviceAccountHeader()) {
+		t.Error("a ServiceAccount of two clusters has one key, want one key per cluster")
+	}
+	user := allowedSet{user: callerUsername}
+	if slotCaller("c-1", user, callerHeader()) != slotCaller("c-2", user, otherCallerHeader()) {
+		t.Error("one user with two tokens in two clusters has two keys, want one")
+	}
+	if slotCaller("c-1", allowedSet{}, callerHeader()) != callerHash(callerHeader()) {
+		t.Error("a caller without a user has no credential key")
 	}
 }

@@ -46,7 +46,7 @@ func testMetrics(t *testing.T) *metrics {
 func newTestRegistry(t *testing.T) (*watchRegistry, *watchSlot) {
 	t.Helper()
 	registry := newWatchRegistry(defaultMaxWatches, defaultMaxWatchesPerCaller)
-	slot, limit := registry.reserve(watchCaller(callerHeader()))
+	slot, limit := registry.reserve(callerHash(callerHeader()))
 	if slot == nil {
 		t.Fatalf("reserve a watch slot: the %s limit refused it", limit)
 	}
@@ -64,8 +64,8 @@ const (
 
 	serviceAccountSubjectValue = "system:serviceaccount:tenant-system:ci"
 
-	// callerUsername is the identity that selfSubjectReviewHandler answers by
-	// default, for a test that does not care about a specific user id.
+	// callerUsername is the identity that tokenUserHandler answers for
+	// callerToken, for a test that does not care about a specific user id.
 	callerUsername = "u-caller"
 )
 
@@ -78,10 +78,16 @@ type recorded struct {
 	host   string
 }
 
+// upstream is the fake Rancher of a test. It answers the privileged list of
+// completeProjects itself, from projectNamespaces, and it records that list
+// in projectLists, apart from the other requests. The routers of the tests
+// then need no case for it.
 type upstream struct {
-	server   *httptest.Server
-	mu       sync.Mutex
-	requests []recorded
+	server            *httptest.Server
+	mu                sync.Mutex
+	requests          []recorded
+	projectLists      []recorded
+	projectNamespaces []steveNamespace
 }
 
 func newUpstream(t *testing.T, handler http.HandlerFunc) *upstream {
@@ -89,21 +95,71 @@ func newUpstream(t *testing.T, handler http.HandlerFunc) *upstream {
 	up := &upstream{}
 	up.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		up.mu.Lock()
-		up.requests = append(up.requests, recorded{
+		request := recorded{
 			method: r.Method,
 			path:   r.URL.Path,
 			query:  r.URL.Query(),
 			header: r.Header.Clone(),
 			body:   body,
 			host:   r.Host,
-		})
+		}
+		if isProjectNamespaceList(r) {
+			up.mu.Lock()
+			up.projectLists = append(up.projectLists, request)
+			namespaces := slices.Clone(up.projectNamespaces)
+			up.mu.Unlock()
+			namespaceMetadataHandler(namespaces...)(w, r)
+			return
+		}
+		up.mu.Lock()
+		up.requests = append(up.requests, request)
 		up.mu.Unlock()
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		handler(w, r)
 	}))
 	t.Cleanup(up.server.Close)
 	return up
+}
+
+// isProjectNamespaceList reports whether r is the privileged list of
+// completeProjects: a metadata list with the service token, and no watch.
+func isProjectNamespaceList(r *http.Request) bool {
+	return r.Header.Get("Authorization") == serviceAuth && !r.URL.Query().Has("watch") &&
+		strings.Contains(r.Header.Get("Accept"), "as=PartialObjectMetadataList")
+}
+
+// setProjectNamespaces sets the namespaces that the privileged list of
+// completeProjects gets. A test calls it before its first request.
+func (u *upstream) setProjectNamespaces(namespaces ...steveNamespace) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.projectNamespaces = namespaces
+}
+
+// projectListRequests returns the recorded privileged lists of
+// completeProjects.
+func (u *upstream) projectListRequests() []recorded {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return slices.Clone(u.projectLists)
+}
+
+// namespaceMetadataHandler answers a PartialObjectMetadataList of the
+// namespaces, with their project labels.
+func namespaceMetadataHandler(namespaces ...steveNamespace) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		items := make([]string, 0, len(namespaces))
+		for _, ns := range namespaces {
+			labels := ""
+			if ns.project != "" {
+				labels = fmt.Sprintf(`,"labels":{%q:%q}`, projectLabel, ns.project)
+			}
+			items = append(items, fmt.Sprintf(`{"kind":"PartialObjectMetadata","apiVersion":"meta.k8s.io/v1","metadata":{"name":%q%s}}`, ns.name, labels))
+		}
+		w.Header().Set("Content-Type", jsonContentType)
+		_, _ = io.WriteString(w, fmt.Sprintf(`{"kind":"PartialObjectMetadataList","apiVersion":"meta.k8s.io/v1","metadata":{},"items":[%s]}`,
+			strings.Join(items, ",")))
+	}
 }
 
 func (u *upstream) all() []recorded {
@@ -424,7 +480,7 @@ func listUpstream(steve, privileged http.HandlerFunc) http.HandlerFunc {
 
 // listUpstreamWithProjects is listUpstream with the given project ids of the caller.
 func listUpstreamWithProjects(steve, projects, privileged http.HandlerFunc) http.HandlerFunc {
-	return listUpstreamFull(steve, projects, selfSubjectReviewHandler(callerUsername), privileged)
+	return listUpstreamFull(steve, projects, tokenUserHandler(), privileged)
 }
 
 // listUpstreamFull is listUpstreamWithProjects with the given handler for the
@@ -470,6 +526,14 @@ func selfSubjectReviewHandler(username string) http.HandlerFunc {
 		}
 		_, _ = io.WriteString(w, fmt.Sprintf(
 			`{"apiVersion":"authentication.k8s.io/v1","kind":"SelfSubjectReview","status":{"userInfo":%s}}`, userInfo))
+	}
+}
+
+// tokenUserHandler answers a SelfSubjectReview with the user u-<token> for a
+// bearer token, so two tokens are two users.
+func tokenUserHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		selfSubjectReviewHandler("u-"+strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))(w, r)
 	}
 }
 

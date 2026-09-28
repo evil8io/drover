@@ -8,14 +8,16 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 const (
-	defaultFanoutMaxNamespaces = 200
-	defaultFanoutConcurrency   = 16
-	defaultFanoutMaxInflight   = 64
+	defaultFanoutMaxNamespaces        = 200
+	defaultFanoutConcurrency          = 16
+	defaultFanoutMaxInflight          = 64
+	defaultFanoutMaxInflightPerCaller = 16
 )
 
 // collectionTarget names one cluster-wide collection of a namespaced kind.
@@ -97,40 +99,118 @@ func (s *Service) roundTripCollection(req *http.Request, target collectionTarget
 		return statusResponse(req, http.StatusForbidden, reasonForbidden, message), nil
 	}
 
-	return s.fanout(req, target, set.names, denied, start, result), nil
+	return s.fanout(req, target, set.names, slotCaller(target.cluster, set, req.Header), denied, start, result), nil
 }
 
-// fanoutSlots has the local slots of one fan-out, and the global slots of
-// every fan-out on the Service.
-type fanoutSlots struct {
-	local  chan struct{}
-	global chan struct{}
+// inflightSlots bounds the namespaced requests of all fan-outs and merged
+// watch opens together, and the part of them that one caller holds. A client
+// that stops reading keeps the slots of its answers, so without the part per
+// caller, one caller can hold every global slot.
+type inflightSlots struct {
+	global    chan struct{}
+	perCaller int
+
+	mu      sync.Mutex
+	callers map[string]*callerInflight
 }
 
-func newFanoutSlots(concurrency int, global chan struct{}) *fanoutSlots {
-	return &fanoutSlots{local: make(chan struct{}, concurrency), global: global}
+// callerInflight is the slots of one caller. users counts the requests that
+// hold or wait for a slot, so the entry goes once no request needs it.
+type callerInflight struct {
+	slots chan struct{}
+	users int
 }
 
-// acquire takes the local slot, then the global slot, both against
+func newInflightSlots(global, perCaller int) *inflightSlots {
+	return &inflightSlots{
+		global:    make(chan struct{}, global),
+		perCaller: perCaller,
+		callers:   make(map[string]*callerInflight),
+	}
+}
+
+// acquire takes a slot of caller, then a global slot, both against
 // ctx.Done(). It reports whether it got both slots.
+func (s *inflightSlots) acquire(ctx context.Context, caller string) bool {
+	entry := s.join(caller)
+	select {
+	case entry.slots <- struct{}{}:
+	case <-ctx.Done():
+		s.leave(caller)
+		return false
+	}
+	select {
+	case s.global <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		<-entry.slots
+		s.leave(caller)
+		return false
+	}
+}
+
+// release returns the global slot, then the slot of caller.
+func (s *inflightSlots) release(caller string) {
+	<-s.global
+	s.mu.Lock()
+	entry := s.callers[caller]
+	s.mu.Unlock()
+	<-entry.slots
+	s.leave(caller)
+}
+
+func (s *inflightSlots) join(caller string) *callerInflight {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.callers[caller]
+	if !ok {
+		entry = &callerInflight{slots: make(chan struct{}, s.perCaller)}
+		s.callers[caller] = entry
+	}
+	entry.users++
+	return entry
+}
+
+func (s *inflightSlots) leave(caller string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := s.callers[caller]
+	entry.users--
+	if entry.users == 0 {
+		delete(s.callers, caller)
+	}
+}
+
+// fanoutSlots has the local slots of one fan-out, and the in-flight slots of
+// the Service for the caller of the fan-out.
+type fanoutSlots struct {
+	local    chan struct{}
+	inflight *inflightSlots
+	caller   string
+}
+
+func newFanoutSlots(concurrency int, inflight *inflightSlots, caller string) *fanoutSlots {
+	return &fanoutSlots{local: make(chan struct{}, concurrency), inflight: inflight, caller: caller}
+}
+
+// acquire takes the local slot, then the in-flight slots, all against
+// ctx.Done(). It reports whether it got every slot.
 func (f *fanoutSlots) acquire(ctx context.Context) bool {
 	select {
 	case f.local <- struct{}{}:
 	case <-ctx.Done():
 		return false
 	}
-	select {
-	case f.global <- struct{}{}:
-		return true
-	case <-ctx.Done():
+	if !f.inflight.acquire(ctx, f.caller) {
 		<-f.local
 		return false
 	}
+	return true
 }
 
-// release returns the global slot, then the local slot.
+// release returns the in-flight slots, then the local slot.
 func (f *fanoutSlots) release() {
-	<-f.global
+	f.inflight.release(f.caller)
 	<-f.local
 }
 
@@ -140,19 +220,19 @@ func (f *fanoutSlots) release() {
 // anything but 200 drops out of the merge, because the caller may hold the
 // list permission in some of its namespaces only. The native 403 stands when
 // no namespace answers 200.
-func (s *Service) fanout(req *http.Request, target collectionTarget, names []string, denied *http.Response, start time.Time, result listResult) *http.Response {
+func (s *Service) fanout(req *http.Request, target collectionTarget, names []string, caller string, denied *http.Response, start time.Time, result listResult) *http.Response {
 	ctx := req.Context()
-	slots := newFanoutSlots(s.fanoutConcurrency, s.fanoutGlobal)
+	slots := newFanoutSlots(s.fanoutConcurrency, s.inflight, caller)
 	stopped := &atomic.Bool{}
 	answers := make([]chan *http.Response, len(names))
 	for i := range answers {
 		answers[i] = make(chan *http.Response, 1)
 	}
 
-	// The dispatcher takes the local slot before the global slot, and it
+	// The dispatcher takes the local slot before the in-flight slots, and it
 	// starts the requests in the order of names. The reader needs the
 	// answers in that same order, so a request it waits for always runs
-	// already. The global wait blocks the dispatcher only. It never blocks
+	// already. The in-flight wait blocks the dispatcher only. It never blocks
 	// the reader, so no deadlock exists.
 	go func() {
 		for i, name := range names {

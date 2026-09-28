@@ -2,14 +2,13 @@ package filter
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -127,11 +126,19 @@ func newWatchRegistry(maxWatches, maxWatchesPerCaller int) *watchRegistry {
 	}
 }
 
-// watchCaller returns the key of the watch limit of one caller: the SHA-256 of
-// the credential that Rancher reads, so the registry has no credential.
-func watchCaller(header http.Header) string {
-	sum := sha256.Sum256([]byte(credentialKey(header)))
-	return hex.EncodeToString(sum[:])
+// slotCaller returns the key of the slot limits of one caller: the user of
+// set, when the name lookup gave one, and else the hash of the credential, so
+// the registry has no credential. A user with more than one token is one
+// caller. A ServiceAccount subject names a user of one cluster only, so its
+// key includes the cluster.
+func slotCaller(cluster string, set allowedSet, header http.Header) string {
+	switch {
+	case set.user == "":
+		return callerHash(header)
+	case strings.HasPrefix(set.user, serviceAccountPrefix):
+		return hashKey("user\n" + cluster + "\n" + set.user)
+	}
+	return hashKey("user\n" + set.user)
 }
 
 // reserve takes one watch slot for caller. It returns nil and the limit that

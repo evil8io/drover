@@ -110,20 +110,44 @@ func queryBool(query url.Values, name string) bool {
 }
 
 // publicMessage is the text of an error that a client may read. A transport
-// error names an internal address, and a file error names a path, so those
-// go to the log line only.
+// error names an internal address or the names of a certificate, and a file
+// error names a path, so those go to the log line only.
 func publicMessage(err error) string {
 	var pathErr *fs.PathError
 	var urlErr *url.Error
 	var opErr *net.OpError
+	var upstreamErr *upstreamError
 	switch {
 	case errors.Is(err, rancherclient.ErrTokenUnavailable):
 		return rancherclient.ErrTokenUnavailable.Error()
-	case errors.As(err, &pathErr), errors.As(err, &urlErr), errors.As(err, &opErr):
+	case errors.As(err, &upstreamErr), errors.As(err, &pathErr), errors.As(err, &urlErr), errors.As(err, &opErr):
 		return "the upstream request failed"
 	}
 	return err.Error()
 }
+
+// upstreamTransport marks every error of the transport to the upstream as an
+// upstreamError.
+type upstreamTransport struct {
+	next http.RoundTripper
+}
+
+func (t upstreamTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.next.RoundTrip(req)
+	if err != nil {
+		return nil, &upstreamError{err: err}
+	}
+	return resp, nil
+}
+
+// upstreamError is an error of the transport to the upstream.
+type upstreamError struct {
+	err error
+}
+
+func (e *upstreamError) Error() string { return e.err.Error() }
+
+func (e *upstreamError) Unwrap() error { return e.err }
 
 func hasImpersonation(header http.Header) bool {
 	for name := range header {
