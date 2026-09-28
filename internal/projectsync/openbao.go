@@ -34,6 +34,8 @@ const (
 	openbaoLabel = "openbao"
 
 	// minTokenTTL is the shortest lifetime that the TokenRequest API accepts.
+	// It is also the minimum of a credential, because OpenBao creates each
+	// credential with a TokenRequest.
 	minTokenTTL = 10 * time.Minute
 
 	// maxOpenBaoBody bounds the answer of OpenBao that the service reads.
@@ -92,11 +94,13 @@ type openbaoWriter struct {
 	tracer           trace.Tracer
 	now              func() time.Time
 
-	// loginMu guards session, the kept client token, and sessionUntil, the
-	// time after which the service logs in again.
+	// loginMu guards session, the kept client token, sessionUntil, the time
+	// after which the service logs in again, and retried, which is true after
+	// a login for a refused token in this reconcile run.
 	loginMu      sync.Mutex
 	session      string
 	sessionUntil time.Time
+	retried      bool
 
 	// mu guards written, and verified, the time of the last read or write of
 	// each role and policy, by cluster and object key.
@@ -137,8 +141,8 @@ func newOpenBaoWriter(cfg OpenBaoConfig, timeout time.Duration, userAgent string
 	if cfg.TokenTTL < minTokenTTL {
 		return nil, fmt.Errorf("the token lifetime %s is shorter than %s", cfg.TokenTTL, minTokenTTL)
 	}
-	if cfg.CredentialTTL < time.Second || cfg.CredentialMaxTTL < cfg.CredentialTTL {
-		return nil, fmt.Errorf("the credential lifetime %s is shorter than 1s, or longer than the maximum %s", cfg.CredentialTTL, cfg.CredentialMaxTTL)
+	if cfg.CredentialTTL < minTokenTTL || cfg.CredentialMaxTTL < cfg.CredentialTTL {
+		return nil, fmt.Errorf("the credential lifetime %s is shorter than %s, or longer than the maximum %s", cfg.CredentialTTL, minTokenTTL, cfg.CredentialMaxTTL)
 	}
 	authPath, err := cleanPath("auth path", cfg.AuthPath)
 	if err != nil {
@@ -147,6 +151,9 @@ func newOpenBaoWriter(cfg OpenBaoConfig, timeout time.Duration, userAgent string
 	mountPrefix, err := cleanPath("mount prefix", cfg.MountPrefix)
 	if err != nil {
 		return nil, err
+	}
+	if mountPrefix != strings.ToLower(mountPrefix) {
+		return nil, fmt.Errorf("the OpenBao mount prefix %q has an uppercase letter, and OpenBao stores a policy name in lowercase", mountPrefix)
 	}
 	if cfg.Role == "" {
 		return nil, errors.New("the OpenBao role is empty")
@@ -372,6 +379,7 @@ type openbaoTarget struct {
 func (s *Syncer) refreshOpenBao(ctx context.Context, token string, names []string, ready map[string]openbaoTarget, projects map[string]map[string]project, run *counters) {
 	w := s.openbao
 	w.keep(names)
+	w.startRun()
 	if len(ready) == 0 {
 		return
 	}
@@ -398,6 +406,7 @@ func (s *Syncer) refreshOpenBao(ctx context.Context, token string, names []strin
 	}
 	if policies != nil {
 		run.errors += s.dropOrphanPolicies(ctx, token, names, projects, policies)
+		run.errors += s.dropGoneClusters(ctx, token, names, policies)
 	}
 
 	var mu sync.Mutex
@@ -442,6 +451,7 @@ func (s *Syncer) writeOpenBao(ctx context.Context, token, cluster, account, ca s
 	}
 
 	w.remember(cluster, openbaoEntry{account: account, ca: ca, issued: issued, expiry: expiry})
+	w.markVerified(cluster, openbaoConfigKey)
 	s.metrics.openbaoWritten(ctx, cluster, outcomeOK)
 	s.logger.InfoContext(ctx, "the OpenBao config is written",
 		"cluster", cluster, "expires", expiry.UTC().Format(time.RFC3339))
@@ -540,14 +550,34 @@ func (w *openbaoWriter) remember(cluster string, entry openbaoEntry) {
 	w.written[cluster] = entry
 }
 
+// errRetried is the answer of token for a refused token after a login for a
+// refused token in the same reconcile run.
+var errRetried = errors.New("the service logged in again after a 403 in this run already")
+
+// startRun lets the next refused token of the reconcile run start a login.
+func (w *openbaoWriter) startRun() {
+	w.loginMu.Lock()
+	defer w.loginMu.Unlock()
+	w.retried = false
+}
+
 // token returns a client token of OpenBao. It keeps the token of a login
 // until a fifth of its lifetime remains, and then logs in again. stale is a
-// token that OpenBao refused, and the service never returns it again.
+// token that OpenBao refused, and the service never returns it again. For a
+// stale token inside its lifetime, token logs in again at most once per
+// reconcile run, and returns errRetried after that.
 func (w *openbaoWriter) token(ctx context.Context, stale string) (string, error) {
 	w.loginMu.Lock()
 	defer w.loginMu.Unlock()
-	if w.session != "" && w.session != stale && w.now().Before(w.sessionUntil) {
+	valid := w.session != "" && w.now().Before(w.sessionUntil)
+	if valid && w.session != stale {
 		return w.session, nil
+	}
+	if valid {
+		if w.retried {
+			return "", errRetried
+		}
+		w.retried = true
 	}
 	w.session = ""
 	token, lease, err := w.login(ctx)
@@ -593,8 +623,9 @@ func (w *openbaoWriter) loginOnce(ctx context.Context) (string, time.Duration, e
 }
 
 // call sends one request to OpenBao with the kept client token. A 403 answer
-// logs in again once and repeats the request, because a kept token can
-// expire.
+// logs in again and repeats the request, because a kept token can expire.
+// After one such login in a reconcile run, a 403 is the answer of the
+// request, because the next login gets the same rights.
 func (w *openbaoWriter) call(ctx context.Context, method, path string, query url.Values, body, out any) error {
 	// A login error keeps only its text, so that no caller reads its status
 	// as the status of the request.
@@ -606,26 +637,65 @@ func (w *openbaoWriter) call(ctx context.Context, method, path string, query url
 	if !hasOpenBaoStatus(err, http.StatusForbidden) {
 		return err
 	}
-	if token, err = w.token(ctx, token); err != nil {
-		return fmt.Errorf("log in to OpenBao: %v", err)
+	retry, loginErr := w.token(ctx, token)
+	if errors.Is(loginErr, errRetried) {
+		return err
 	}
-	return w.send(ctx, method, path, query, token, body, out)
+	if loginErr != nil {
+		return fmt.Errorf("log in to OpenBao: %v", loginErr)
+	}
+	return w.send(ctx, method, path, query, retry, body, out)
 }
 
-// writeConfig writes the config of the secrets engine mount of cluster. The
-// engine reaches the cluster through the Rancher proxy, with jwt, and verifies
-// Rancher with ca. An empty ca clears the stored CA, so that OpenBao verifies
-// with the system roots.
-func (w *openbaoWriter) writeConfig(ctx context.Context, cluster, jwt, ca string) error {
+// openbaoConfig is the part of the config of a mount that a read returns.
+// OpenBao never returns service_account_jwt.
+type openbaoConfig struct {
+	Host              string `json:"kubernetes_host"`
+	CACert            string `json:"kubernetes_ca_cert"`
+	DisableLocalCAJWT bool   `json:"disable_local_ca_jwt"`
+}
+
+// wantConfig returns the config of the mount of cluster: the engine reaches
+// the cluster through the Rancher proxy, and verifies Rancher with ca. An
+// empty ca clears the stored CA, so that OpenBao verifies with the system
+// roots.
+func (w *openbaoWriter) wantConfig(cluster, ca string) openbaoConfig {
 	host := w.rancher
 	host.Path = clusterPath(cluster)
+	return openbaoConfig{Host: host.String(), CACert: ca, DisableLocalCAJWT: true}
+}
+
+// writeConfig writes the config of the secrets engine mount of cluster, with
+// jwt for the requests of the engine to the cluster.
+func (w *openbaoWriter) writeConfig(ctx context.Context, cluster, jwt, ca string) error {
 	body := struct {
-		Host              string `json:"kubernetes_host"`
-		CACert            string `json:"kubernetes_ca_cert"`
-		JWT               string `json:"service_account_jwt"`
-		DisableLocalCAJWT bool   `json:"disable_local_ca_jwt"`
-	}{Host: host.String(), CACert: ca, JWT: jwt, DisableLocalCAJWT: true}
+		openbaoConfig
+		JWT string `json:"service_account_jwt"`
+	}{openbaoConfig: w.wantConfig(cluster, ca), JWT: jwt}
 	return w.call(ctx, http.MethodPost, w.mount(cluster)+"/config", nil, body, nil)
+}
+
+// readConfig reads the config of the mount of cluster. It returns false and
+// no error when OpenBao answers 404, as it does for a mount without config.
+func (w *openbaoWriter) readConfig(ctx context.Context, cluster string) (openbaoConfig, bool, error) {
+	var answer struct {
+		Data openbaoConfig `json:"data"`
+	}
+	err := w.call(ctx, http.MethodGet, w.mount(cluster)+"/config", nil, nil, &answer)
+	if hasOpenBaoStatus(err, http.StatusNotFound) {
+		return openbaoConfig{}, false, nil
+	}
+	return answer.Data, err == nil, err
+}
+
+// configStale reports whether the mount of cluster has no config, or a config
+// that differs from the config with ca.
+func (s *Syncer) configStale(ctx context.Context, cluster, ca string) (bool, error) {
+	have, found, err := s.openbao.readConfig(ctx, cluster)
+	if err != nil {
+		return false, err
+	}
+	return !found || have != s.openbao.wantConfig(cluster, ca), nil
 }
 
 // send sends a request with method to the API path of OpenBao, with the

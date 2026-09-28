@@ -19,12 +19,16 @@ const (
 	// baoRancher is the Rancher URL that OpenBao uses in the tests.
 	baoRancher = "https://rancher.example.com"
 	baoRole    = "project-sync"
+
+	// clustersPath is the collection of the management Cluster objects in
+	// the Rancher cluster.
+	clustersPath = "/k8s/clusters/local/apis/management.cattle.io/v3/clusters/"
 )
 
 // fakeOpenBao answers the login of the Kubernetes auth mount at
-// auth/kubernetes, the mounts of the Kubernetes secrets engine, their config,
-// their roles, and the ACL policies. It keeps them in memory, and records
-// every request.
+// auth/kubernetes, the mount table, the mounts of the Kubernetes secrets
+// engine, their config, their roles, and the ACL policies. It keeps them in
+// memory, and records every request.
 type fakeOpenBao struct {
 	server *httptest.Server
 
@@ -37,6 +41,7 @@ type fakeOpenBao struct {
 	// a mount that does not exist: 404, or 400 as an older server answers.
 	missing  map[string]int
 	mounts   map[string]string
+	configs  map[string]map[string]any
 	roles    map[string]map[string]map[string]any
 	policies map[string]string
 	// denied are the routes that answer 403 to every client token.
@@ -48,6 +53,7 @@ func newFakeOpenBao(t *testing.T) *fakeOpenBao {
 	f := &fakeOpenBao{
 		missing:  make(map[string]int),
 		mounts:   make(map[string]string),
+		configs:  make(map[string]map[string]any),
 		roles:    make(map[string]map[string]map[string]any),
 		policies: map[string]string{"default": "# default", "root": ""},
 		denied:   make(map[string]bool),
@@ -85,6 +91,8 @@ func (f *fakeOpenBao) serve(w http.ResponseWriter, r *http.Request) {
 	list := r.URL.Query().Get("list") == "true"
 
 	switch {
+	case route == "sys/mounts" && r.Method == http.MethodGet:
+		f.serveMountTable(w)
 	case strings.HasPrefix(route, "sys/mounts/"):
 		f.serveMount(w, r, strings.TrimPrefix(route, "sys/mounts/"), body)
 	case route == "sys/policies/acl" && list:
@@ -111,6 +119,15 @@ func (f *fakeOpenBao) writeKeys(w http.ResponseWriter, keys []string) {
 	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{"keys": keys}})
 }
 
+func (f *fakeOpenBao) serveMountTable(w http.ResponseWriter) {
+	data := make(map[string]any, len(f.mounts)+1)
+	data["secret/"] = map[string]any{"type": "kv"}
+	for path, kind := range f.mounts {
+		data[path+"/"] = map[string]any{"type": kind}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": data})
+}
+
 func (f *fakeOpenBao) serveMount(w http.ResponseWriter, r *http.Request, path string, body []byte) {
 	switch r.Method {
 	case http.MethodGet:
@@ -127,9 +144,21 @@ func (f *fakeOpenBao) serveMount(w http.ResponseWriter, r *http.Request, path st
 		_ = json.Unmarshal(body, &request)
 		f.mounts[path] = request.Type
 		w.WriteHeader(http.StatusNoContent)
+	case http.MethodDelete:
+		f.dropMount(path)
+		w.WriteHeader(http.StatusNoContent)
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, map[string][]string{"errors": {}})
 	}
+}
+
+// dropMount deletes the mount at path with its config and its roles, as a
+// disable of a secrets engine does. The caller holds the lock.
+func (f *fakeOpenBao) dropMount(path string) {
+	delete(f.mounts, path)
+	cluster := strings.TrimPrefix(path, "kubernetes/")
+	delete(f.configs, cluster)
+	delete(f.roles, cluster)
 }
 
 func (f *fakeOpenBao) servePolicy(w http.ResponseWriter, r *http.Request, name string, body []byte) {
@@ -171,8 +200,23 @@ func (f *fakeOpenBao) serveEngine(w http.ResponseWriter, r *http.Request, rest s
 			writeJSON(w, http.StatusBadRequest, map[string][]string{"errors": {
 				fmt.Sprintf("no handler for route '%s'", "kubernetes/"+rest)}})
 		default:
+			var data map[string]any
+			_ = json.Unmarshal(body, &data)
+			f.configs[cluster] = data
 			w.WriteHeader(http.StatusNoContent)
 		}
+	case sub == "config" && r.Method == http.MethodGet:
+		data, ok := f.configs[cluster]
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string][]string{"errors": {}})
+			return
+		}
+		// OpenBao never returns the token of the config.
+		writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{
+			"kubernetes_host":      data["kubernetes_host"],
+			"kubernetes_ca_cert":   data["kubernetes_ca_cert"],
+			"disable_local_ca_jwt": data["disable_local_ca_jwt"],
+		}})
 	case sub == "roles" && list:
 		f.writeKeys(w, sortedKeys(f.roles[cluster]))
 	case strings.HasPrefix(sub, "roles/"):
@@ -250,6 +294,31 @@ func (f *fakeOpenBao) addMount(path string) {
 	f.mounts[path] = "kubernetes"
 }
 
+func (f *fakeOpenBao) hasMount(path string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.mounts[path]
+	return ok
+}
+
+// removeMount disables the mount at path, as an admin can.
+func (f *fakeOpenBao) removeMount(path string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dropMount(path)
+}
+
+// setConfig stores the config of the mount of cluster, or deletes it for nil.
+func (f *fakeOpenBao) setConfig(cluster string, data map[string]any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if data == nil {
+		delete(f.configs, cluster)
+		return
+	}
+	f.configs[cluster] = data
+}
+
 // changes returns every request that writes: a POST, PUT, or DELETE, but the
 // login.
 func (f *fakeOpenBao) changes() []recorded {
@@ -288,8 +357,15 @@ func (f *fakeOpenBao) logins() []recorded {
 	return f.ofPath("/v1/auth/kubernetes/login")
 }
 
+// writes returns the config writes of cluster.
 func (f *fakeOpenBao) writes(cluster string) []recorded {
-	return f.ofPath("/v1/kubernetes/" + cluster + "/config")
+	var out []recorded
+	for _, req := range f.ofPath("/v1/kubernetes/" + cluster + "/config") {
+		if req.method == http.MethodPost {
+			out = append(out, req)
+		}
+	}
+	return out
 }
 
 func (f *fakeOpenBao) ofPath(path string) []recorded {
@@ -306,6 +382,31 @@ func (f *fakeOpenBao) reset() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.requests = nil
+}
+
+// setCluster sets the status that the read of the Cluster object id answers
+// in the accounts fake.
+func (f *accountsFake) setCluster(id string, status int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.clusters == nil {
+		f.clusters = make(map[string]int)
+	}
+	f.clusters[id] = status
+}
+
+func (f *accountsFake) serveCluster(w http.ResponseWriter, id string) {
+	f.mu.Lock()
+	status, ok := f.clusters[id]
+	f.mu.Unlock()
+	switch {
+	case !ok:
+		writeStatus(w, http.StatusNotFound, "NotFound", "clusters.management.cattle.io \""+id+"\" not found")
+	case status == http.StatusOK:
+		writeJSON(w, http.StatusOK, object{APIVersion: "management.cattle.io/v3", Kind: "Cluster", Metadata: objectMeta{Name: id}})
+	default:
+		writeStatus(w, status, "Forbidden", "the read of the cluster failed")
+	}
 }
 
 // testClock is a clock that a test moves by hand.

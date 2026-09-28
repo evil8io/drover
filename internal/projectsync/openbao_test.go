@@ -2,6 +2,7 @@ package projectsync
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -739,7 +740,9 @@ func TestNewChecksTheOpenBaoConfig(t *testing.T) {
 		{name: "an empty auth path", edit: func(c *OpenBaoConfig) { c.AuthPath = "/" }, serviceAccounts: true},
 		{name: "a mount prefix with an empty segment", edit: func(c *OpenBaoConfig) { c.MountPrefix = "a//b" }, serviceAccounts: true},
 		{name: "an empty role", edit: func(c *OpenBaoConfig) { c.Role = "" }, serviceAccounts: true},
+		{name: "a mount prefix with an uppercase letter", edit: func(c *OpenBaoConfig) { c.MountPrefix = "Kubernetes" }, serviceAccounts: true},
 		{name: "a zero credential lifetime", edit: func(c *OpenBaoConfig) { c.CredentialTTL = 0 }, serviceAccounts: true},
+		{name: "a credential lifetime below 10 minutes", edit: func(c *OpenBaoConfig) { c.CredentialTTL = 9 * time.Minute }, serviceAccounts: true},
 		{name: "a credential lifetime over its maximum", edit: func(c *OpenBaoConfig) { c.CredentialMaxTTL = time.Minute }, serviceAccounts: true},
 	}
 	for _, tc := range cases {
@@ -907,6 +910,17 @@ func wantRoleData(project, role string) map[string]any {
 }
 
 func wantPolicyText(project, role string) string {
+	return policyTextOf(acctCluster, project, role)
+}
+
+func policyTextOf(cluster, project, role string) string {
+	return "path \"kubernetes/" + cluster + "/creds/" + project + "-" + role + "\" {\n  capabilities = [\"update\"]\n" +
+		"  allowed_parameters = {\n    \"kubernetes_namespace\" = []\n    \"ttl\" = []\n  }\n}\n"
+}
+
+// legacyPolicyText is the policy text of the releases before the restriction
+// of the parameters.
+func legacyPolicyText(project, role string) string {
 	return "path \"kubernetes/c-1/creds/" + project + "-" + role + "\" {\n  capabilities = [\"update\"]\n}\n"
 }
 
@@ -981,7 +995,7 @@ func TestReconcileCreatesTheMountTheRolesAndThePolicies(t *testing.T) {
 		t.Errorf("OpenBao writes of the second run = %d, want 0:\n%v", len(got), got)
 	}
 	for _, req := range setup.bao.all() {
-		if req.method == http.MethodGet && req.query.Get("list") == "" && req.path != mountPath {
+		if req.method == http.MethodGet && req.query.Get("list") == "" && req.path != mountPath && req.path != "/v1/sys/mounts" {
 			t.Errorf("read %s inside the read interval", req.path)
 		}
 	}
@@ -1184,22 +1198,28 @@ func TestReconcileDeletesAnOrphanPolicyOfAGoneProject(t *testing.T) {
 		"kubernetes-c-1",
 	}
 	orphan := policyNameOf("p-gone", "project-owner")
-	for _, name := range append([]string{orphan}, kept...) {
+	legacy := policyNameOf("p-gone", "read-only")
+	setup.bao.setPolicy(orphan, wantPolicyText("p-gone", "project-owner"))
+	setup.bao.setPolicy(legacy, legacyPolicyText("p-gone", "read-only"))
+	for _, name := range kept {
 		setup.bao.setPolicy(name, "# test")
 	}
+	setup.bao.setPolicy(kept[0], wantPolicyText("p-known", "read-only"))
 	setup.bao.reset()
 	setup.syncer.reconcile(context.Background())
 
-	if _, ok := setup.bao.policy(orphan); ok {
-		t.Errorf("the orphan policy %s stays", orphan)
+	for _, name := range []string{orphan, legacy} {
+		if _, ok := setup.bao.policy(name); ok {
+			t.Errorf("the orphan policy %s stays", name)
+		}
+		if got := countRequests(setup.bao.all(), http.MethodDelete, "/v1/sys/policies/acl/"+name); got != 1 {
+			t.Errorf("deletes of the orphan policy %s = %d, want 1", name, got)
+		}
 	}
 	for _, name := range kept {
 		if _, ok := setup.bao.policy(name); !ok {
 			t.Errorf("the policy %s is deleted", name)
 		}
-	}
-	if got := countRequests(setup.bao.all(), http.MethodDelete, "/v1/sys/policies/acl/"+orphan); got != 1 {
-		t.Errorf("deletes of the orphan policy = %d, want 1", got)
 	}
 	if got := fake.requestsOfPath(projectsPath + "/c-9:p-gone"); len(got) != 0 {
 		t.Errorf("project requests of a cluster outside the run = %d, want 0", len(got))
@@ -1215,11 +1235,304 @@ func TestReconcileDeletesNoOrphanPolicyWithoutTheFullProjectList(t *testing.T) {
 	setup.syncer.reconcile(context.Background())
 
 	orphan := policyNameOf("p-gone", "project-owner")
-	setup.bao.setPolicy(orphan, "# test")
+	setup.bao.setPolicy(orphan, wantPolicyText("p-gone", "project-owner"))
 	fake.setListStatus(http.StatusInternalServerError)
 	setup.syncer.reconcile(context.Background())
 
 	if _, ok := setup.bao.policy(orphan); !ok {
 		t.Error("the orphan policy is deleted without the full project list")
+	}
+}
+
+func TestParsePolicyNameRejectsAProjectThatIsNotALabelValue(t *testing.T) {
+	t.Parallel()
+	w := &openbaoWriter{mountPrefix: "kubernetes"}
+	for _, name := range []string{
+		"kubernetes-c-1-a/b-read-only",
+		"kubernetes-c-1-a?b-read-only",
+		"kubernetes-c-1--p-a-read-only",
+		"kubernetes-c-1-" + strings.Repeat("p", 64) + "-read-only",
+	} {
+		if cluster, project, role, ok := w.parsePolicyName(name, []string{acctCluster}); ok {
+			t.Errorf("parsePolicyName(%q) = %q, %q, %q, true; want false", name, cluster, project, role.name)
+		}
+	}
+}
+
+func TestReconcileKeepsAPolicyWithAnotherText(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	setup := newOpenBaoSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+
+	// Two policies of another writer whose names have the form of a policy of
+	// the service, for the project grafana that Rancher does not have. The
+	// mount has a role for the second one.
+	orphan, paired := policyNameOf("grafana", "read-only"), policyNameOf("grafana", "project-owner")
+	foreign := "path \"secret/grafana/*\" {\n  capabilities = [\"read\"]\n}\n"
+	setup.bao.setPolicy(orphan, foreign)
+	setup.bao.setPolicy(paired, foreign)
+	setup.bao.setRole(acctCluster, "grafana-project-owner", wantRoleData("grafana", "project-owner"))
+	setup.bao.reset()
+	before := len(setup.logs.String())
+	setup.syncer.reconcile(context.Background())
+
+	for _, name := range []string{orphan, paired} {
+		if text, ok := setup.bao.policy(name); !ok || text != foreign {
+			t.Errorf("policy %s = %q, present %v; want the text of the other writer", name, text, ok)
+		}
+	}
+	if got := countRequests(setup.bao.all(), http.MethodDelete, "/v1/sys/policies/acl/"+orphan); got != 0 {
+		t.Errorf("deletes of %s = %d, want 0", orphan, got)
+	}
+	if _, ok := setup.bao.role(acctCluster, "grafana-project-owner"); ok {
+		t.Error("the role of the gone project stays")
+	}
+	if logs := setup.logs.String()[before:]; !strings.Contains(logs, "errors=0") {
+		t.Errorf("the run has errors:\n%s", logs)
+	}
+}
+
+func TestReconcileKeepsAPolicyOfAClusterOutsideTheRun(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	setup := newOpenBaoSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+
+	// The name parses as the project x-p-a of c-1, which Rancher does not
+	// have, but the text is the policy of p-a in the cluster c-1-x.
+	name := "kubernetes-c-1-x-p-a-read-only"
+	setup.bao.setPolicy(name, policyTextOf("c-1-x", "p-a", "read-only"))
+	setup.bao.reset()
+	setup.syncer.reconcile(context.Background())
+
+	if _, ok := setup.bao.policy(name); !ok {
+		t.Errorf("the policy %s of a cluster outside the run is deleted", name)
+	}
+}
+
+func TestReconcileWritesTheConfigOfAMountThatItCreatesAgain(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	setup := newOpenBaoSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+
+	setup.bao.removeMount("kubernetes/c-1")
+	setup.bao.reset()
+	setup.clock.advance(time.Minute)
+	setup.syncer.reconcile(context.Background())
+
+	if got := countRequests(setup.bao.all(), http.MethodPost, "/v1/sys/mounts/kubernetes/c-1"); got != 1 {
+		t.Fatalf("mount creates = %d, want 1", got)
+	}
+	if got := setup.bao.writes(acctCluster); len(got) != 1 {
+		t.Errorf("OpenBao config writes after the mount create = %d, want 1", len(got))
+	}
+	assertCredentials(t, setup.bao, "p-alpha")
+}
+
+func TestReconcileWritesAMissingOrChangedConfigAfterTheReadInterval(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		config map[string]any
+	}{
+		{name: "a missing config"},
+		{name: "another host", config: map[string]any{
+			"kubernetes_host": "https://old.example.com/k8s/clusters/c-1", "kubernetes_ca_cert": "", "disable_local_ca_jwt": true,
+		}},
+		{name: "another CA", config: map[string]any{
+			"kubernetes_host": baoRancher + "/k8s/clusters/c-1", "kubernetes_ca_cert": testCA, "disable_local_ca_jwt": true,
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fake := newAccountsFake(t)
+			fake.addProject("p-alpha", nil)
+			setup := newOpenBaoSetup(t, fake)
+			setup.syncer.reconcile(context.Background())
+
+			setup.bao.setConfig(acctCluster, tc.config)
+			setup.bao.reset()
+			setup.clock.advance(9 * time.Minute)
+			setup.syncer.reconcile(context.Background())
+			if got := countRequests(setup.bao.all(), http.MethodGet, "/v1/kubernetes/c-1/config"); got != 0 {
+				t.Errorf("config reads inside the read interval = %d, want 0", got)
+			}
+
+			setup.clock.advance(time.Minute)
+			setup.syncer.reconcile(context.Background())
+			if got := countRequests(setup.bao.all(), http.MethodGet, "/v1/kubernetes/c-1/config"); got != 1 {
+				t.Errorf("config reads after the read interval = %d, want 1", got)
+			}
+			if got := setup.bao.writes(acctCluster); len(got) != 1 {
+				t.Fatalf("OpenBao config writes after the read interval = %d, want 1", len(got))
+			}
+			if !strings.Contains(setup.logs.String(), `level=INFO msg="the OpenBao config is missing or differs" cluster=c-1`) {
+				t.Errorf("no info line for the config:\n%s", setup.logs.String())
+			}
+
+			setup.bao.reset()
+			setup.clock.advance(10 * time.Minute)
+			setup.syncer.reconcile(context.Background())
+			if got := setup.bao.writes(acctCluster); len(got) != 0 {
+				t.Errorf("OpenBao config writes for a config without change = %d, want 0", len(got))
+			}
+		})
+	}
+}
+
+func TestOpenBaoLogsInAgainAtMostOncePerRun(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	setup := newOpenBaoSetup(t, fake)
+	for _, role := range []string{"project-owner", "project-member", "read-only"} {
+		setup.bao.deny("sys/policies/acl/" + policyNameOf("p-alpha", role))
+	}
+
+	setup.syncer.reconcile(context.Background())
+	if got := setup.bao.logins(); len(got) != 2 {
+		t.Errorf("logins of the first run = %d, want 2: one at the start, one after the first 403", len(got))
+	}
+
+	setup.bao.reset()
+	setup.clock.advance(time.Minute)
+	setup.syncer.reconcile(context.Background())
+	if got := setup.bao.logins(); len(got) != 1 {
+		t.Errorf("logins of the second run = %d, want 1", len(got))
+	}
+	if got := countRequests(setup.bao.all(), http.MethodPut, "/v1/sys/policies/acl/"+policyNameOf("p-alpha", "read-only")); got != 1 {
+		t.Errorf("writes of a denied policy after the login of the run = %d, want 1", got)
+	}
+}
+
+// addGoneCluster gives the OpenBao fake the mount, the config, a role, and the
+// policies of project p-old in cluster, as the service writes them.
+func addGoneCluster(setup *openbaoSetup, cluster string) []string {
+	setup.bao.addMount("kubernetes/" + cluster)
+	setup.bao.setConfig(cluster, map[string]any{
+		"kubernetes_host": baoRancher + "/k8s/clusters/" + cluster, "kubernetes_ca_cert": "", "disable_local_ca_jwt": true,
+	})
+	setup.bao.setRole(cluster, "p-old-read-only", wantRoleData("p-old", "read-only"))
+	var names []string
+	for _, role := range []string{"project-owner", "project-member", "read-only"} {
+		name := "kubernetes-" + cluster + "-p-old-" + role
+		setup.bao.setPolicy(name, policyTextOf(cluster, "p-old", role))
+		names = append(names, name)
+	}
+	return names
+}
+
+func TestReconcileDeletesTheOpenBaoStateOfARemovedCluster(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	setup := newOpenBaoSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+
+	policies := addGoneCluster(setup, "c-2")
+	foreign := "kubernetes-c-2-p-other-read-only"
+	setup.bao.setPolicy(foreign, "# test")
+	setup.bao.reset()
+	setup.syncer.reconcile(context.Background())
+
+	if setup.bao.hasMount("kubernetes/c-2") {
+		t.Error("the mount of the removed cluster stays")
+	}
+	requests := setup.bao.all()
+	mountAt := -1
+	for i, req := range requests {
+		if req.method == http.MethodDelete && req.path == "/v1/sys/mounts/kubernetes/c-2" {
+			mountAt = i
+		}
+	}
+	for _, name := range policies {
+		if _, ok := setup.bao.policy(name); ok {
+			t.Errorf("the policy %s of the removed cluster stays", name)
+		}
+		for i, req := range requests {
+			if req.method == http.MethodDelete && req.path == "/v1/sys/policies/acl/"+name && i > mountAt {
+				t.Errorf("the policy %s is deleted after the mount", name)
+			}
+		}
+	}
+	if _, ok := setup.bao.policy(foreign); !ok {
+		t.Errorf("the policy %s of another writer is deleted", foreign)
+	}
+	if got := fake.requestsOfPath(clustersPath + "c-2"); len(got) != 1 {
+		t.Errorf("cluster requests of c-2 = %d, want 1", len(got))
+	}
+	assertCredentials(t, setup.bao, "p-alpha")
+	if !setup.bao.hasMount("kubernetes/c-1") {
+		t.Error("the mount of the cluster of the run is deleted")
+	}
+	if strings.Count(setup.logs.String(), "errors=0") != 2 {
+		t.Errorf("a run has errors:\n%s", setup.logs.String())
+	}
+}
+
+func TestReconcileKeepsTheMountOfAClusterOutsideTheRunWithoutProof(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		// status is the answer to the read of the Cluster object, zero for
+		// 404.
+		status int
+		config map[string]any
+		// reads is the count of the reads of the Cluster object.
+		reads  int
+		errors int
+	}{
+		{name: "a cluster that exists", status: http.StatusOK, reads: 1},
+		{name: "a denied cluster read", status: http.StatusForbidden, reads: 1, errors: 1},
+		{name: "a mount without config", config: map[string]any{}},
+		{name: "a config of another writer", config: map[string]any{
+			"kubernetes_host": "https://other.example.com", "kubernetes_ca_cert": "", "disable_local_ca_jwt": false,
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fake := newAccountsFake(t)
+			fake.addProject("p-alpha", nil)
+			setup := newOpenBaoSetup(t, fake)
+			setup.syncer.reconcile(context.Background())
+
+			policies := addGoneCluster(setup, "c-2")
+			if tc.status != 0 {
+				fake.setCluster("c-2", tc.status)
+			}
+			switch {
+			case tc.config == nil:
+			case len(tc.config) == 0:
+				setup.bao.setConfig("c-2", nil)
+			default:
+				setup.bao.setConfig("c-2", tc.config)
+			}
+			setup.bao.reset()
+			before := len(setup.logs.String())
+			setup.syncer.reconcile(context.Background())
+
+			if !setup.bao.hasMount("kubernetes/c-2") {
+				t.Error("the mount is deleted")
+			}
+			for _, name := range policies {
+				if _, ok := setup.bao.policy(name); !ok {
+					t.Errorf("the policy %s is deleted", name)
+				}
+			}
+			if got := fake.requestsOfPath(clustersPath + "c-2"); len(got) != tc.reads {
+				t.Errorf("reads of the Cluster object = %d, want %d", len(got), tc.reads)
+			}
+			logs := setup.logs.String()[before:]
+			if want := fmt.Sprintf("errors=%d", tc.errors); !strings.Contains(logs, want) {
+				t.Errorf("the summary line of the second run does not have %s:\n%s", want, logs)
+			}
+		})
 	}
 }
