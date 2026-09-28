@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.22.1](https://github.com/evil8io/drover/compare/v0.22.0...v0.22.1) (2026-09-28)
+
+
+### Bug Fixes
+
+* **project-sync:** delete an OpenBao policy without a role of a gone project ([#111](https://github.com/evil8io/drover/issues/111)) ([41d7c34](https://github.com/evil8io/drover/commit/41d7c34dc266b8986014f3c71080cd63873b28e6))
+
 ## [0.22.0](https://github.com/evil8io/drover/compare/v0.21.0...v0.22.0) (2026-09-27)
 
 
