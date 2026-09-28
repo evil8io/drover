@@ -179,9 +179,9 @@ func parseProjectSyncConfig(args []string, output io.Writer, getenv func(string)
 	flags.StringVar(&openbaoRancherURL, "openbao-rancher-url", "", "Rancher URL that OpenBao uses, https:// only")
 	flags.DurationVar(&openbao.TokenTTL, "openbao-token-ttl", 24*time.Hour,
 		"requested lifetime of the cluster token that OpenBao gets; the API server can shorten it")
-	flags.DurationVar(&openbao.CredentialTTL, "openbao-credential-ttl", 10*time.Minute,
+	flags.DurationVar(&openbao.CredentialTTL, "openbao-credential-ttl", 15*time.Minute,
 		"default lifetime of a credential of a project role that OpenBao creates")
-	flags.DurationVar(&openbao.CredentialMaxTTL, "openbao-credential-max-ttl", time.Hour,
+	flags.DurationVar(&openbao.CredentialMaxTTL, "openbao-credential-max-ttl", 2*time.Hour,
 		"longest lifetime of a credential of a project role that OpenBao creates")
 	flags.DurationVar(&cfg.interval, "interval", 60*time.Second, "time between two runs")
 	flags.Float64Var(&cfg.patchRate, "patch-rate", 10,

@@ -154,16 +154,16 @@ func TestParseProjectSyncConfigOpenBao(t *testing.T) {
 		t.Errorf("defaults = auth path %q, role %q, mount prefix %q, ttl %s; want kubernetes, project-sync, kubernetes, 24h0m0s",
 			bao.AuthPath, bao.Role, bao.MountPrefix, bao.TokenTTL)
 	}
-	if bao.CredentialTTL != 10*time.Minute || bao.CredentialMaxTTL != time.Hour {
-		t.Errorf("credential lifetimes = %s and %s, want 10m0s and 1h0m0s", bao.CredentialTTL, bao.CredentialMaxTTL)
+	if bao.CredentialTTL != 15*time.Minute || bao.CredentialMaxTTL != 2*time.Hour {
+		t.Errorf("credential lifetimes = %s and %s, want 15m0s and 2h0m0s", bao.CredentialTTL, bao.CredentialMaxTTL)
 	}
 
-	cfg, err = parseProjectSyncConfig(openbaoArgs("--openbao-credential-ttl", "5m", "--openbao-credential-max-ttl", "2h"), io.Discard, noEnvironment)
+	cfg, err = parseProjectSyncConfig(openbaoArgs("--openbao-credential-ttl", "5m", "--openbao-credential-max-ttl", "3h"), io.Discard, noEnvironment)
 	if err != nil {
 		t.Fatalf("parseProjectSyncConfig with credential lifetimes: %v", err)
 	}
-	if cfg.openbao.CredentialTTL != 5*time.Minute || cfg.openbao.CredentialMaxTTL != 2*time.Hour {
-		t.Errorf("credential lifetimes = %s and %s, want 5m0s and 2h0m0s", cfg.openbao.CredentialTTL, cfg.openbao.CredentialMaxTTL)
+	if cfg.openbao.CredentialTTL != 5*time.Minute || cfg.openbao.CredentialMaxTTL != 3*time.Hour {
+		t.Errorf("credential lifetimes = %s and %s, want 5m0s and 3h0m0s", cfg.openbao.CredentialTTL, cfg.openbao.CredentialMaxTTL)
 	}
 
 	cfg, err = parseProjectSyncConfig([]string{
@@ -207,7 +207,7 @@ func TestParseProjectSyncConfigOpenBaoErrors(t *testing.T) {
 		{"empty mount prefix", openbaoArgs("--openbao-mount-prefix", ""), "-openbao-mount-prefix is empty"},
 		{"short token lifetime", openbaoArgs("--openbao-token-ttl", "5m"), "-openbao-token-ttl 5m0s is shorter"},
 		{"zero credential lifetime", openbaoArgs("--openbao-credential-ttl", "0s"), "-openbao-credential-ttl 0s is shorter than 1s"},
-		{"credential lifetime over its maximum", openbaoArgs("--openbao-credential-ttl", "2h"), "-openbao-credential-max-ttl 1h0m0s is shorter than -openbao-credential-ttl 2h0m0s"},
+		{"credential lifetime over its maximum", openbaoArgs("--openbao-credential-ttl", "3h"), "-openbao-credential-max-ttl 2h0m0s is shorter than -openbao-credential-ttl 3h0m0s"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
