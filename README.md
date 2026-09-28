@@ -21,24 +21,26 @@
 
 # What's the problem with Rancher?
 
-Rancher excels at centralised authentication, authorization, project management, and granting self-service capabilities. However, it lacks certain quality-of-life features that make it a complete multi-tenant Kubernetes platform. For example, Rancher lacks a robust set of policies that sufficiently isolate tenants from each other. Similarly, engineers' native client applications, such as kubectl, k9s, openlens, etc, do not work well, because Rancher lists project namespaces through its own UI and rancher-cli only, and not through the Kubernetes API.
+Rancher provides centralised authentication, authorization, project management, and self-service for its users. However, Rancher does not have some convenience features. Without these features, Rancher is not complete as a multi-tenant Kubernetes platform. For example, Rancher does not have a set of policies that isolate tenants from each other sufficiently.
 
-# Enter drover
+Similarly, the native client applications that engineers use, for example kubectl, k9s, and openlens, do not work well. The reason is that Rancher lists project namespaces only through its own UI and rancher-cli. Rancher does not list project namespaces through the Kubernetes API.
 
-Drover aims to improve the developer experience of working with Rancher managed Kubernetes clusters. It does this through a set of helm-charts:
+# What drover does
+
+The goal of drover is to improve the developer experience with Kubernetes clusters that Rancher manages. drover does this with a set of Helm charts:
 
 | Chart | Location | Management Cluster | Workload Cluster | Description |
 | --- | --- | --- | --- | --- |
-| drover | [charts/drover](https://github.com/evil8io/charts/tree/main/charts/drover) | ✅ | ❌ | Offers a set of services that make life more enjoyable for developers |
-| drover-policies | [charts/drover-policies](https://github.com/evil8io/charts/tree/main/charts/drover-policies) | ✅ | ✅ | Offers a strict baseline of Kyverno policies that isolate tenants and forces a secure configuration for workloads |
+| drover | [charts/drover](https://github.com/evil8io/charts/tree/main/charts/drover) | ✅ | ❌ | A set of services that improve the developer experience. |
+| drover-policies | [charts/drover-policies](https://github.com/evil8io/charts/tree/main/charts/drover-policies) | ✅ | ✅ | A strict baseline of Kyverno policies. With these policies, Kyverno isolates tenants, and it forces a secure configuration for workloads. |
 
 ## Services
 
 | Service | Subcommand | Function | Docs |
 | --- | --- | --- | --- |
-| API filter | `api-filter` | A reverse proxy in front of Rancher. It allows users to list their project namespaces with kubectl and it scopes the `--all-namespaces` flag to their project namespaces. | [docs/api-filter.md](docs/api-filter.md) |
-| Project sync | `project-sync` | A service that propagates a configured set of labels and annotations from a Rancher project to the namespaces of that project. | [docs/project-sync.md](docs/project-sync.md) |
-| Token rotation | `rotate-token` | A command, run by a CronJob, that rotates the password and the API token of the drover Rancher user. | [docs/rotate-token.md](docs/rotate-token.md) |
+| API filter | `api-filter` | A reverse proxy in front of Rancher. It lets users list their project namespaces with kubectl. It also limits the `--all-namespaces` flag to their project namespaces. | [docs/api-filter.md](docs/api-filter.md) |
+| Project sync | `project-sync` | A service that copies a configured set of labels and annotations from a Rancher project to the namespaces of that project. | [docs/project-sync.md](docs/project-sync.md) |
+| Token rotation | `rotate-token` | A command that rotates the API token of a Rancher service user of drover. With `--password-secret`, it also writes the password hash of that user. It reads the password from a file. A CronJob runs the command. | [docs/rotate-token.md](docs/rotate-token.md) |
 
 ## Example
 

@@ -1,51 +1,67 @@
 # rotate-token
 
-A command that renews the API token of the Rancher service user in a Kubernetes Secret.
+The `rotate-token` command rotates the API token of the Rancher service user in a Kubernetes Secret.
 
-The command runs once: it reads the token from the Secret, and it asks Rancher for the expiry. A token that lasts longer than `--renew-before` is valid, and the run ends with no change. For a new token the command logs in as the service user, and it derives a token from that session. The login is a first step only, because Rancher ignores the TTL of a login token. Last, the command patches the Secret, deletes the old tokens, and ends the session with a logout.
+The command runs once. A run does these steps:
 
-The command accepts an https URL for `--rancher-url` only, because the login sends the password in the request body. The command never follows a redirect, so a redirect answer fails the run and never resends the password.
+1. The command reads the token from the Secret.
+2. The command asks Rancher for the expiry time of the token. When the time until the token expires is longer than `--renew-before`, the token is valid, and the run ends with no change.
+3. To get a new token, the command logs in to Rancher as the service user.
+4. The command uses the login session to create the new token. The login is only a first step, because Rancher ignores the TTL of a login token.
+5. The command patches the Secret.
+6. The command deletes the old tokens.
+7. The command logs out to end the session.
 
-Rancher reduces a TTL above its own maximum without an error, so a different TTL in the answer gives a warning. When the granted TTL is not longer than `--renew-before`, the run completes the rotation and then exits 1, because every later run rotates again.
+The command accepts only an https URL for `--rancher-url`, because it sends the password in the body of the login request. The command never follows a redirect, and it never sends the password a second time. A redirect response fails the run, except in the `logout` step, which only logs a warning.
 
-The run keeps the new token and the token that it read from the Secret. It deletes the other tokens with the same description, except the newest ones up to `--keep`.
+Rancher reduces a TTL above its own maximum and returns no error. For this reason, the command logs a warning when the TTL in the response of Rancher differs from the requested TTL. When the TTL that Rancher grants is not longer than `--renew-before`, the run completes the rotation and then exits with code 1. The reason is that every later run rotates the token again.
 
-With `--password-secret`, a run first writes the password hash that Rancher reads at a local login. Rancher names that Secret after the User object, in the namespace `cattle-local-user-passwords`. A run that finds the current hash leaves the Secret unchanged. The ServiceAccount needs `get` and `patch` on that one Secret. A failure of the password step does not stop the run. The token steps run, and the run then exits 1 with the error of the password step.
+The run keeps the new token and the token that it read from the Secret. It deletes the other tokens with the `--description` value, except the newest tokens up to a total of `--keep` tokens. It also deletes the login tokens of earlier runs, which have the description `<description> login`.
 
-A CronJob is the normal caller, because most runs find a valid token and exit 0.
+When `--password-secret` is set to a Secret, a run first writes the password hash into that Secret. Rancher reads the hash when a local user logs in. Rancher gives that Secret the name of the User object, and the Secret is in the namespace `cattle-local-user-passwords`. When the Secret already contains the current hash, the run does not change the Secret. The ServiceAccount needs the `get` and `patch` permissions on that one Secret.
+
+When the password step fails, the run does not stop. The token steps still run. The run then exits with code 1 and reports the error of the password step.
+
+Usually, a CronJob runs the command, because most runs find a valid token and exit with code 0.
 
 ## Configuration
 
-`drover rotate-token [flags]` runs the command once.
+To run the command once, use `drover rotate-token [flags]`.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--rancher-url` | (required) | URL of Rancher. Use `https://` only. The path must be empty or `/`. |
-| `--rancher-ca-file` | | PEM bundle that verifies an `https` Rancher URL. |
-| `--rancher-insecure-skip-verify` | `false` | Skip the certificate verification of an `https` Rancher URL. |
-| `--credentials-dir` | (required) | Directory with the files `username` and `password` of the service user. |
-| `--token-secret` | (required) | `namespace/name` of the Secret with the API token. |
-| `--token-key` | `token` | Key of the token inside the Secret. |
-| `--password-secret` | | `namespace/name` of the Secret that Rancher reads for the password of the service user. When set, a run first writes the PBKDF2-SHA3-512 hash of the password into it. The password must have 12 characters or more, the minimum of Rancher. |
-| `--ttl` | `48h` | Lifetime of a new token. Rancher reduces a value above `auth-token-max-ttl-minutes`, and a reduced value that is not longer than `--renew-before` makes the run exit 1 after the rotation. |
-| `--renew-before` | `24h` | Remaining lifetime that starts a rotation. The value must be shorter than `--ttl`. |
-| `--keep` | `2` | Number of tokens with the description to keep. The new token and the token that the run read from the Secret count, and the run never deletes them. The value must be 2 or more, because a pod reads a mounted Secret with a delay after the patch. |
-| `--description` | `drover rotate-token` | Description of the tokens of this command. It also selects the tokens to delete. |
-| `--kube-url` | (in-cluster) | Kubernetes API URL. The default comes from `KUBERNETES_SERVICE_HOST` and `KUBERNETES_SERVICE_PORT`. |
-| `--kube-service-account-dir` | `/var/run/secrets/kubernetes.io/serviceaccount` | Directory with the ServiceAccount token and `ca.crt`. |
-| `--log-level` | `info` | One of `debug`, `info`, `warn`, or `error`. |
-| `--otlp-endpoint` | `$OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint, `host:port` or a URL. Empty turns telemetry off. |
-| `--otlp-traces` | `true` | Send traces to the OTLP endpoint. |
-| `--otlp-metrics` | `true` | Send metrics to the OTLP endpoint. |
-| `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | `service.name` resource attribute. An empty value, `--service-name=`, sets no `service.name`, so that a collector can derive it. The SDK still takes a `service.name` from `OTEL_SERVICE_NAME` or `OTEL_RESOURCE_ATTRIBUTES`. |
+| `--rancher-url` | (required) | The URL of Rancher. Use `https://` only. The path must be empty or `/`. |
+| `--rancher-ca-file` | | The PEM bundle that the command uses to verify the certificate of an `https` Rancher URL. |
+| `--rancher-insecure-skip-verify` | `false` | When the value is `true`, the command does not verify the certificate of an `https` Rancher URL. |
+| `--credentials-dir` | (required) | The directory with the files `username` and `password` of the service user. |
+| `--token-secret` | (required) | The `namespace/name` of the Secret with the API token. |
+| `--token-key` | `token` | The key of the token in the Secret. |
+| `--password-secret` | | The `namespace/name` of the Secret that Rancher reads for the password of the service user. When the flag is set, a run first writes the PBKDF2-SHA3-512 hash of the password into that Secret, unless the Secret already contains that hash. The password must have 12 characters or more, which is the minimum password length of Rancher. With a shorter password, the command exits with code 1 before the first step. |
+| `--ttl` | `48h` | The lifetime of a new token. Rancher reduces a value above its setting `auth-token-max-ttl-minutes`. When the reduced value is not longer than `--renew-before`, the run exits with code 1 after the rotation. |
+| `--renew-before` | `24h` | When the time until the token expires is not longer than this value, the run rotates the token. The value must be shorter than `--ttl`. |
+| `--keep` | `2` | The run keeps this number of tokens with the `--description` value. The new token and the token that the run read from the Secret count toward this number, and the run never deletes them. The value must be 2 or more, because a pod reads a mounted Secret with a delay after the patch. For a value below 1, the command exits with code 2. For the value 1, the command exits with code 1 before the first step. |
+| `--description` | `drover rotate-token` | The description of the tokens that this command creates. The run also uses this description to select the tokens to delete. |
+| `--kube-url` | (in-cluster) | The URL of the Kubernetes API. The command takes the default from the environment variables `KUBERNETES_SERVICE_HOST` and `KUBERNETES_SERVICE_PORT`. |
+| `--kube-service-account-dir` | `/var/run/secrets/kubernetes.io/serviceaccount` | The directory with the ServiceAccount token and the file `ca.crt`. |
+| `--log-level` | `info` | The log level. The value is one of `debug`, `info`, `warn`, or `error`. |
+| `--otlp-endpoint` | `$OTEL_EXPORTER_OTLP_ENDPOINT` | The OTLP gRPC endpoint. The value is `host:port` or a URL. When the value is empty, telemetry is off. |
+| `--otlp-traces` | `true` | When the value is `true`, the command sends traces to the OTLP endpoint. |
+| `--otlp-metrics` | `true` | When the value is `true`, the command sends metrics to the OTLP endpoint. |
+| `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | The value of the `service.name` resource attribute. When the value is empty, as in `--service-name=`, the command sets no `service.name`, so that a collector can derive it. The OpenTelemetry SDK still takes a `service.name` from `OTEL_SERVICE_NAME` or `OTEL_RESOURCE_ATTRIBUTES`. |
 
-The exit code is 0 after a valid token and after a rotation, 1 after a failure, and 2 after a flag error.
+The command exits with one of these codes:
 
-The command never deletes a token with another description, so a kubeconfig token of the service user stays.
+| Exit code | Condition |
+| --- | --- |
+| 0 | Every step succeeds, or only the `logout` step fails. The run finds a valid token, or it completes a rotation with a granted TTL longer than `--renew-before`. |
+| 1 | A step other than `logout` fails, or the granted TTL is not longer than `--renew-before`. The command also exits with code 1 when `--keep` is 1, or when the password for `--password-secret` is shorter than 12 characters. |
+| 2 | The command finds an error in the flags, in a file of `--credentials-dir`, in a CA file, or in the telemetry setup. |
+
+The command deletes only tokens with the `--description` value or with the description `<description> login`. A token with another description stays, for example a kubeconfig token of the service user.
 
 ## Permissions
 
-The pod needs `get` and `patch` on the one token Secret:
+The pod needs the `get` and `patch` permissions on the one token Secret:
 
 ```yaml
 rules:
@@ -55,15 +71,15 @@ rules:
     verbs: [get, patch]
 ```
 
-The Secret must exist before the first run. The command reads the ServiceAccount token for every request, because the kubelet replaces the file.
+The Secret must exist before the first run. The command reads the ServiceAccount token for each request, because the kubelet replaces the token file.
 
 ## Logging
 
-The command writes JSON logs to stderr, one line per step. Each line has a `step` field and an `outcome` field. The `token_prune` line has the field `secret_token`: the name of the token that the run read from the Secret and kept, or an empty string. The command never logs a token, a token key, or the password.
+The command writes JSON logs to stderr. Each step that succeeds writes at least one line with a `step` field and an `outcome` field. When the run fails, the last line contains an `error` field. The `token_prune` line contains the field `secret_token`. The value of this field is the name of the token that the run read from the Secret and kept. When the run kept no token from the Secret, the value is an empty string. The command never logs a token, a token key, or the password.
 
 ## Telemetry
 
-With `--otlp-endpoint` set, one run produces a span named `rotate`, with a child span for each step: `password_sync` (with `--password-secret`), `secret_get`, `token_check`, `login`, `token_create`, `secret_patch`, `token_prune`, and `logout`. The command flushes traces and metrics before it exits, within a 5 s grace period. It exports these metrics:
+When `--otlp-endpoint` is set, each run creates one span with the name `rotate`. This span has a child span for each step. The steps are `password_sync`, `secret_get`, `token_check`, `login`, `token_create`, `secret_patch`, `token_prune`, and `logout`. The run does the `password_sync` step only when `--password-secret` is set. Before the command exits, it flushes the traces and metrics within a grace period of 5 s. The command exports these metrics:
 
 | Metric | Kind | Unit | Attributes |
 | --- | --- | --- | --- |
