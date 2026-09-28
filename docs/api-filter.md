@@ -238,7 +238,7 @@ The service replaces the cluster id, a namespace name, and an object name with a
 
 Search a trace on `resource.service.name`, not on the span name. The service takes the value of that attribute from `--service-name`.
 
-The service records `url.full` on a client span with the query. The query of the privileged list can name every allowed namespace of the caller, so the trace backend gets those names.
+The service exports `url.full` on a client span without its query, so the trace backend never gets a namespace name from the privileged list.
 
 With `--otlp-endpoint` set, the service also exports these metrics:
 

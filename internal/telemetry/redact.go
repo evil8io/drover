@@ -9,36 +9,66 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 )
 
-// urlQueryRedactor is a sdktrace.SpanProcessor that removes the query and the
-// fragment of the url.full attribute of a span. otelhttp puts the full
-// request URL of a client span on this attribute. The query of the
-// privileged namespace list names every allowed namespace of the caller, and
-// that set must not reach the trace backend.
-type urlQueryRedactor struct{}
-
-// OnStart rewrites the url.full attribute of s, when present and when it
-// parses as a URL, to the URL without its query and its fragment.
-func (urlQueryRedactor) OnStart(_ context.Context, s sdktrace.ReadWriteSpan) {
-	for _, attr := range s.Attributes() {
-		if attr.Key != semconv.URLFullKey {
-			continue
-		}
-		parsed, err := url.Parse(attr.Value.AsString())
-		if err != nil {
-			return
-		}
-		parsed.RawQuery = ""
-		parsed.Fragment = ""
-		s.SetAttributes(attribute.String(string(semconv.URLFullKey), parsed.String()))
-		return
-	}
+// redactedURLKeys lists the span attributes that carry a URL with a query
+// that must not reach the trace backend. The query of the privileged
+// namespace list names every allowed namespace of the caller.
+var redactedURLKeys = map[attribute.Key]bool{
+	semconv.URLFullKey: true,
 }
 
-// OnEnd does nothing. urlQueryRedactor redacts an attribute at span start.
-func (urlQueryRedactor) OnEnd(sdktrace.ReadOnlySpan) {}
+// newURLQueryRedactingExporter wraps next so an exported span has the query
+// and the fragment removed from each attribute in redactedURLKeys. otelhttp
+// sets url.full on a client span inside RoundTrip, after the span starts, so
+// a SpanProcessor never sees the final value. A SpanExporter sees the span
+// after RoundTrip ends.
+func newURLQueryRedactingExporter(next sdktrace.SpanExporter) sdktrace.SpanExporter {
+	return urlQueryRedactingExporter{next: next}
+}
 
-// Shutdown does nothing. urlQueryRedactor holds no resource.
-func (urlQueryRedactor) Shutdown(context.Context) error { return nil }
+type urlQueryRedactingExporter struct {
+	next sdktrace.SpanExporter
+}
 
-// ForceFlush does nothing. urlQueryRedactor holds no buffer.
-func (urlQueryRedactor) ForceFlush(context.Context) error { return nil }
+func (e urlQueryRedactingExporter) ExportSpans(ctx context.Context, spans []sdktrace.ReadOnlySpan) error {
+	redacted := make([]sdktrace.ReadOnlySpan, len(spans))
+	for i, span := range spans {
+		redacted[i] = redactedSpan{ReadOnlySpan: span}
+	}
+	return e.next.ExportSpans(ctx, redacted)
+}
+
+func (e urlQueryRedactingExporter) Shutdown(ctx context.Context) error {
+	return e.next.Shutdown(ctx)
+}
+
+// redactedSpan wraps a sdktrace.ReadOnlySpan and overrides Attributes to
+// redact the keys in redactedURLKeys.
+type redactedSpan struct {
+	sdktrace.ReadOnlySpan
+}
+
+func (s redactedSpan) Attributes() []attribute.KeyValue {
+	attrs := s.ReadOnlySpan.Attributes()
+	out := make([]attribute.KeyValue, len(attrs))
+	for i, attr := range attrs {
+		if redactedURLKeys[attr.Key] {
+			if redacted, ok := redactQuery(attr.Value.AsString()); ok {
+				attr = attribute.String(string(attr.Key), redacted)
+			}
+		}
+		out[i] = attr
+	}
+	return out
+}
+
+// redactQuery returns raw without its query and its fragment, and reports
+// whether raw parses as a URL.
+func redactQuery(raw string) (string, bool) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", false
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), true
+}

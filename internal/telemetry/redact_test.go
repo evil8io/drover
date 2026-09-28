@@ -2,8 +2,12 @@ package telemetry
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -11,81 +15,88 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-func TestURLQueryRedactorDropsTheQuery(t *testing.T) {
-	t.Parallel()
+// newTestTracerProvider returns a sdktrace.TracerProvider that exports each
+// span, through the redacting wrapper, to a new tracetest.InMemoryExporter.
+// It shuts the provider down at the end of t.
+func newTestTracerProvider(t *testing.T) (*sdktrace.TracerProvider, *tracetest.InMemoryExporter) {
+	t.Helper()
 
-	const (
-		full = "https://rancher.example/k8s/clusters/c-1/api/v1/namespaces?labelSelector=kubernetes.io%2Fmetadata.name+in+%28a%2Cb%29"
-		want = "https://rancher.example/k8s/clusters/c-1/api/v1/namespaces"
-	)
-
-	exporter := tracetest.NewInMemoryExporter()
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithSpanProcessor(urlQueryRedactor{}),
-		sdktrace.WithSyncer(exporter),
-	)
+	memExporter := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(newURLQueryRedactingExporter(memExporter)))
 	t.Cleanup(func() {
 		if err := tp.Shutdown(context.Background()); err != nil {
 			t.Errorf("Shutdown: %v", err)
 		}
 	})
+	return tp, memExporter
+}
 
-	_, span := tp.Tracer("test").Start(context.Background(), "list_namespaces",
-		trace.WithAttributes(semconv.URLFull(full)))
-	span.End()
+func TestURLQueryRedactingExporterDropsTheQueryOfAClientSpan(t *testing.T) {
+	t.Parallel()
 
-	got, ok := attributeString(exporter.GetSpans()[0].Attributes, semconv.URLFullKey)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	tp, memExporter := newTestTracerProvider(t)
+	client := &http.Client{Transport: otelhttp.NewTransport(http.DefaultTransport, otelhttp.WithTracerProvider(tp))}
+
+	req, err := http.NewRequest(http.MethodGet,
+		server.URL+"/api/v1/namespaces?labelSelector=kubernetes.io%2Fmetadata.name+in+%28a%2Cb%29", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if _, err := io.Copy(io.Discard, res.Body); err != nil {
+		t.Fatalf("read the response body: %v", err)
+	}
+	if err := res.Body.Close(); err != nil {
+		t.Fatalf("close the response body: %v", err)
+	}
+
+	spans := memExporter.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want 1", len(spans))
+	}
+
+	got, ok := attributeString(spans[0].Attributes, semconv.URLFullKey)
 	if !ok {
 		t.Fatal("the span has no url.full attribute")
 	}
-	if got != want {
+	if want := server.URL + "/api/v1/namespaces"; got != want {
 		t.Errorf("url.full = %q, want %q", got, want)
 	}
 }
 
-func TestURLQueryRedactorLeavesASpanWithNoURL(t *testing.T) {
+func TestURLQueryRedactingExporterLeavesASpanWithNoURL(t *testing.T) {
 	t.Parallel()
 
-	exporter := tracetest.NewInMemoryExporter()
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithSpanProcessor(urlQueryRedactor{}),
-		sdktrace.WithSyncer(exporter),
-	)
-	t.Cleanup(func() {
-		if err := tp.Shutdown(context.Background()); err != nil {
-			t.Errorf("Shutdown: %v", err)
-		}
-	})
+	tp, memExporter := newTestTracerProvider(t)
 
 	_, span := tp.Tracer("test").Start(context.Background(), "no_url")
 	span.End()
 
-	if _, ok := attributeString(exporter.GetSpans()[0].Attributes, semconv.URLFullKey); ok {
+	if _, ok := attributeString(memExporter.GetSpans()[0].Attributes, semconv.URLFullKey); ok {
 		t.Fatal("the span has a url.full attribute, want none")
 	}
 }
 
-func TestURLQueryRedactorLeavesAValueThatDoesNotParse(t *testing.T) {
+func TestURLQueryRedactingExporterLeavesAValueThatDoesNotParse(t *testing.T) {
 	t.Parallel()
 
 	const raw = "://not-a-url"
 
-	exporter := tracetest.NewInMemoryExporter()
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithSpanProcessor(urlQueryRedactor{}),
-		sdktrace.WithSyncer(exporter),
-	)
-	t.Cleanup(func() {
-		if err := tp.Shutdown(context.Background()); err != nil {
-			t.Errorf("Shutdown: %v", err)
-		}
-	})
+	tp, memExporter := newTestTracerProvider(t)
 
 	_, span := tp.Tracer("test").Start(context.Background(), "bad_url",
 		trace.WithAttributes(semconv.URLFull(raw)))
 	span.End()
 
-	got, ok := attributeString(exporter.GetSpans()[0].Attributes, semconv.URLFullKey)
+	got, ok := attributeString(memExporter.GetSpans()[0].Attributes, semconv.URLFullKey)
 	if !ok {
 		t.Fatal("the span has no url.full attribute")
 	}
