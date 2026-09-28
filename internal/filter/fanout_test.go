@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"regexp"
 	"slices"
 	"strings"
@@ -58,7 +60,7 @@ func splitNamespaced(path string) (namespace, resource string, ok bool) {
 // the native request, which Rancher denies.
 func collectionUpstream(steve, namespaced http.HandlerFunc) http.HandlerFunc {
 	projects := projectsHandler()
-	identity := selfSubjectReviewHandler(callerUsername)
+	identity := tokenUserHandler()
 	return func(w http.ResponseWriter, r *http.Request) {
 		_, _, isNamespaced := splitNamespaced(r.URL.Path)
 		switch {
@@ -1289,7 +1291,8 @@ func TestFanoutMaxInflightBoundsAllFanoutsTogether(t *testing.T) {
 
 // TestFanoutReleasesSlotsOnClientCancel checks that a fan-out whose client
 // cancels mid-stream releases its local and global slots, so a following
-// fan-out completes.
+// fan-out completes. The first request of the blocked namespace gets no
+// answer until its context ends, so only the cancel can free its slot.
 func TestFanoutReleasesSlotsOnClientCancel(t *testing.T) {
 	t.Parallel()
 	const first, blocked = "ns-a", "ns-b"
@@ -1299,18 +1302,23 @@ func TestFanoutReleasesSlotsOnClientCancel(t *testing.T) {
 		blocked: collectionJSON("PodList", "v1", blocked, "pod-"+blocked, "2"),
 	}
 	lists := namespaceLists(bodies)
-	gate := newBlockGate(0)
-	t.Cleanup(gate.open)
+	var held atomic.Bool
+	ended := make(chan struct{})
 
 	h := newHarnessOpt(t, collectionUpstream(
 		steveHandler(first, blocked),
 		func(w http.ResponseWriter, r *http.Request) {
-			if namespace, _, _ := splitNamespaced(r.URL.Path); namespace == blocked {
-				gate.wait(r.Context())
+			if namespace, _, _ := splitNamespaced(r.URL.Path); namespace == blocked && held.CompareAndSwap(false, true) {
+				select {
+				case <-r.Context().Done():
+				case <-ended:
+				}
+				return
 			}
 			lists(w, r)
 		},
 	), withFanout, func(cfg *Config) { cfg.FanoutMaxInflight = 1 })
+	t.Cleanup(func() { close(ended) })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req := h.request(t, http.MethodGet, podsPath, nil, callerHeader()).WithContext(ctx)
@@ -1323,7 +1331,7 @@ func TestFanoutReleasesSlotsOnClientCancel(t *testing.T) {
 	}
 
 	// A read of the first bytes proves that streamFanout opened the merge on
-	// the first namespace, while the blocked namespace still holds a slot.
+	// the first namespace.
 	buf := make([]byte, 64)
 	read := make(chan struct{})
 	go func() {
@@ -1335,10 +1343,12 @@ func TestFanoutReleasesSlotsOnClientCancel(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("the first fan-out sent no data before the cancel")
 	}
+	if !waitFor(held.Load) {
+		t.Fatal("the blocked namespace got no request before the cancel")
+	}
 
 	cancel()
 	_ = resp.Body.Close()
-	gate.open()
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel2()
@@ -1350,5 +1360,131 @@ func TestFanoutReleasesSlotsOnClientCancel(t *testing.T) {
 	list := parseList(t, body2)
 	if want := []string{"pod-" + first, "pod-" + blocked}; !slices.Equal(list.names(), want) {
 		t.Errorf("items = %v, want %v, a following fan-out did not complete", list.names(), want)
+	}
+}
+
+// TestFanoutCapsTheInflightSlotsOfOneCaller checks that a caller whose client
+// stops reading holds at most its part of the global slots, so a fan-out of
+// another caller still runs. The caller starts two fan-outs of 17 namespaces
+// and reads no answer. The first namespace answers more bytes than the
+// socket buffers take, so each fan-out keeps the slots of the requests that
+// it started. The default part of one caller is 16, which is half of the 32
+// global slots of this test.
+func TestFanoutCapsTheInflightSlotsOfOneCaller(t *testing.T) {
+	t.Parallel()
+	const namespaceCount = 17
+	const other = "Bearer other"
+
+	names := make([]string, 0, namespaceCount)
+	bodies := make(map[string]string, namespaceCount)
+	for i := range namespaceCount {
+		namespace := fmt.Sprintf("ns-%02d", i)
+		names = append(names, namespace)
+		bodies[namespace] = collectionJSON("PodList", "v1", namespace, "pod-"+namespace, "1")
+	}
+	bodies[names[0]] = largePodList(names[0], 1<<20)
+	steve := func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == other {
+			steveHandler(names[1])(w, r)
+			return
+		}
+		steveHandler(names...)(w, r)
+	}
+	h := newHarnessOpt(t, collectionUpstream(steve, namespaceLists(bodies)), withFanout,
+		func(cfg *Config) { cfg.FanoutMaxInflight = 32 })
+	stalled := stalledProxy(t, h.svc)
+
+	callerRequests := func() int {
+		count := 0
+		for _, request := range namespacedRecords(h.upstream) {
+			if request.header.Get("Authorization") == callerToken {
+				count++
+			}
+		}
+		return count
+	}
+	stallFanout(t, stalled, podsPath, callerToken)
+	if !waitFor(func() bool { return callerRequests() >= 16 }) {
+		t.Fatalf("namespaced requests of the first fan-out = %d, want 16", callerRequests())
+	}
+	stallFanout(t, stalled, podsPath, callerToken)
+	if !waitFor(func() bool { return h.upstream.countPath(podsPath) == 2 }) {
+		t.Fatal("the second fan-out of the caller did not start")
+	}
+	// The second fan-out needs no fetch, so it takes its slots at once.
+	time.Sleep(100 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	header := http.Header{"Authorization": []string{other}}
+	resp, err := h.proxy.Client().Do(h.request(t, http.MethodGet, podsPath, nil, header).WithContext(ctx))
+	if err != nil {
+		t.Fatalf("the fan-out of another caller got no answer: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read the answer of another caller: %v", err)
+	}
+	if want := []string{"pod-" + names[1]}; !slices.Equal(parseList(t, body).names(), want) {
+		t.Errorf("items of another caller = %v, want %v", parseList(t, body).names(), want)
+	}
+	if got := callerRequests(); got != 16 {
+		t.Errorf("namespaced requests of the stalled caller = %d, want 16", got)
+	}
+}
+
+// largePodList returns a PodList of the namespace with at least size bytes.
+func largePodList(namespace string, size int) string {
+	padding := strings.Repeat("x", 1024)
+	items := make([]string, 0, size/1024+1)
+	for i := 0; len(items)*1024 < size; i++ {
+		items = append(items, fmt.Sprintf(`{"metadata":{"name":"pod-%d","namespace":%q,"annotations":{"padding":%q}}}`, i, namespace, padding))
+	}
+	return `{"kind":"PodList","apiVersion":"v1","metadata":{"resourceVersion":"1"},"items":[` + strings.Join(items, ",") + `]}`
+}
+
+// smallBufferSize is the socket buffer of a stalled client, so a small
+// answer fills it.
+const smallBufferSize = 16 << 10
+
+// smallBufferListener gives every accepted connection a small write buffer.
+type smallBufferListener struct {
+	net.Listener
+}
+
+func (l smallBufferListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetWriteBuffer(smallBufferSize)
+	}
+	return conn, err
+}
+
+// stalledProxy serves svc on connections with a small write buffer.
+func stalledProxy(t *testing.T, svc *Service) *httptest.Server {
+	t.Helper()
+	proxy := httptest.NewUnstartedServer(svc)
+	proxy.Listener = smallBufferListener{Listener: proxy.Listener}
+	proxy.Start()
+	t.Cleanup(proxy.Close)
+	return proxy
+}
+
+// stallFanout sends a GET of path with the Authorization value auth to
+// proxy, over a connection with a small read buffer, and reads no answer.
+func stallFanout(t *testing.T, proxy *httptest.Server, path, auth string) {
+	t.Helper()
+	conn, err := net.Dial("tcp", proxy.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial the proxy: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetReadBuffer(smallBufferSize)
+	}
+	request := "GET " + path + " HTTP/1.1\r\nHost: rancher\r\nAuthorization: " + auth + "\r\n\r\n"
+	if _, err := io.WriteString(conn, request); err != nil {
+		t.Fatalf("write the request: %v", err)
 	}
 }

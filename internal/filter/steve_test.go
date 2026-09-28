@@ -2,7 +2,9 @@ package filter
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -162,17 +164,17 @@ func TestFetchThrottledPerCaller(t *testing.T) {
 		}
 		steveHandler("a")(w, r)
 	}
+	// A rate of 0.1 per second gives a burst of 1, and the next token is 10 s
+	// away, above fetchWaitCap.
 	h := newHarnessOpt(t, listUpstream(steve, namespaceListHandler), func(cfg *Config) {
-		cfg.FetchRatePerCaller = 1
+		cfg.FetchRatePerCaller = 0.1
 		cfg.MeterProvider = provider
 	})
 	attackerHeader := http.Header{"Authorization": []string{attacker}}
 
-	for i := range 2 {
-		resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, attackerHeader))
-		if resp.StatusCode != http.StatusForbidden {
-			t.Fatalf("request %d status = %d, want the 403 of Steve inside the burst", i, resp.StatusCode)
-		}
+	resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, attackerHeader))
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want the 403 of Steve inside the burst", resp.StatusCode)
 	}
 
 	resp, body := h.do(t, h.request(t, http.MethodGet, listPath, nil, attackerHeader))
@@ -186,8 +188,8 @@ func TestFetchThrottledPerCaller(t *testing.T) {
 	if want := serviceName + ": the fetch rate limit per caller has no free token"; status.Message != want {
 		t.Errorf("message = %q, want %q", status.Message, want)
 	}
-	if got := h.upstream.countPath(stevePath); got != 2 {
-		t.Errorf("Steve requests = %d, want 2, the throttled fetch must skip the upstream call", got)
+	if got := h.upstream.countPath(stevePath); got != 1 {
+		t.Errorf("Steve requests = %d, want 1, the throttled fetch must skip the upstream call", got)
 	}
 
 	resp, _ = h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
@@ -341,55 +343,101 @@ func TestFetchAllowedKeepsUserEmptyOnMalformedIdentityBody(t *testing.T) {
 
 func TestCredentialKey(t *testing.T) {
 	t.Parallel()
+	basic := base64.URLEncoding.EncodeToString([]byte("token-a:secret"))
 	tests := []struct {
 		name   string
 		header http.Header
 		want   string
 	}{
 		{
-			name:   "authorization",
+			name:   "bearer",
 			header: http.Header{"Authorization": []string{"Bearer x"}},
-			want:   "authorization\nBearer x",
+			want:   "token\nx",
 		},
 		{
-			name:   "authorization ignores a cookie",
+			name:   "bearer ignores a cookie",
 			header: http.Header{"Authorization": []string{"Bearer x"}, "Cookie": []string{"R_SESS=a"}},
-			want:   "authorization\nBearer x",
+			want:   "token\nx",
+		},
+		{
+			name:   "bearer in lower case",
+			header: http.Header{"Authorization": []string{"bearer x"}},
+			want:   "token\nx",
+		},
+		{
+			name:   "bearer in upper case with spaces around the token",
+			header: http.Header{"Authorization": []string{" BEARER   x  "}},
+			want:   "token\nx",
+		},
+		{
+			name:   "basic in URL base64",
+			header: http.Header{"Authorization": []string{"Basic " + basic}},
+			want:   "token\ntoken-a:secret",
+		},
+		{
+			name:   "basic in lower case",
+			header: http.Header{"Authorization": []string{"basic  " + basic}},
+			want:   "token\ntoken-a:secret",
+		},
+		{
+			name:   "basic that does not decode",
+			header: http.Header{"Authorization": []string{"Basic !"}, "Cookie": []string{"R_SESS=a"}},
+			want:   noCredential,
+		},
+		{
+			name:   "a tab after the scheme",
+			header: http.Header{"Authorization": []string{"Bearer\tx"}},
+			want:   noCredential,
+		},
+		{
+			name:   "another scheme reads no cookie",
+			header: http.Header{"Authorization": []string{"Token x"}, "Cookie": []string{"R_SESS=a"}},
+			want:   noCredential,
+		},
+		{
+			name:   "a bearer without a token",
+			header: http.Header{"Authorization": []string{"Bearer"}},
+			want:   noCredential,
 		},
 		{
 			name:   "session cookie",
 			header: http.Header{"Cookie": []string{"R_SESS=a"}},
-			want:   "cookie\na",
+			want:   "token\na",
 		},
 		{
 			name:   "session cookie ignores another cookie on the same line",
 			header: http.Header{"Cookie": []string{"CSRF=x; R_SESS=a"}},
-			want:   "cookie\na",
+			want:   "token\na",
 		},
 		{
 			name:   "session cookie on a second Cookie line",
 			header: http.Header{"Cookie": []string{"CSRF=x", "R_SESS=a"}},
-			want:   "cookie\na",
+			want:   "token\na",
 		},
 		{
-			name:   "authorization ignores a second value",
+			name:   "bearer ignores a second value",
 			header: http.Header{"Authorization": []string{"Bearer x", "Bearer y"}},
-			want:   "authorization\nBearer x",
+			want:   "token\nx",
 		},
 		{
 			name:   "session cookie ignores a second session cookie",
 			header: http.Header{"Cookie": []string{"R_SESS=a; R_SESS=b"}},
-			want:   "cookie\na",
+			want:   "token\na",
 		},
 		{
 			name:   "session cookie ignores a session cookie on a second Cookie line",
 			header: http.Header{"Cookie": []string{"R_SESS=a", "R_SESS=b"}},
-			want:   "cookie\na",
+			want:   "token\na",
 		},
 		{
 			name:   "empty authorization reads the session cookie",
 			header: http.Header{"Authorization": []string{""}, "Cookie": []string{"R_SESS=a"}},
-			want:   "cookie\na",
+			want:   "token\na",
+		},
+		{
+			name:   "blank authorization reads the session cookie",
+			header: http.Header{"Authorization": []string{"  "}, "Cookie": []string{"R_SESS=a"}},
+			want:   "token\na",
 		},
 		{
 			name:   "empty authorization and no cookie",
@@ -780,5 +828,80 @@ func TestCacheDoesNotSpinWithNonPositiveMaxEntries(t *testing.T) {
 				t.Fatalf("cache.do did not return with maxEntries %d", maxEntries)
 			}
 		})
+	}
+}
+
+// TestAllowedSetCacheKeyJoinsTheSpellingsOfOneToken checks that the spellings
+// of one token that Rancher reads as that token share one allowed set and one
+// fetch limiter per caller.
+func TestAllowedSetCacheKeyJoinsTheSpellingsOfOneToken(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstream(steveHandler("a"), namespaceListHandler))
+
+	spellings := []http.Header{
+		{"Authorization": []string{"Bearer caller"}},
+		{"Authorization": []string{"bearer caller"}},
+		{"Authorization": []string{"BEARER   caller"}},
+		{"Authorization": []string{"Basic " + base64.URLEncoding.EncodeToString([]byte("caller"))}},
+		{"Cookie": []string{"R_SESS=caller"}},
+	}
+	for _, header := range spellings {
+		resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, header))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status with %v = %d, want 200", header, resp.StatusCode)
+		}
+	}
+
+	if got := h.upstream.countPath(stevePath); got != 1 {
+		t.Errorf("Steve requests = %d, want 1 for one token", got)
+	}
+	h.svc.callers.mu.Lock()
+	defer h.svc.callers.mu.Unlock()
+	if got := len(h.svc.callers.limiters); got != 1 {
+		t.Errorf("limiters = %d, want 1 for one token", got)
+	}
+}
+
+// TestLimiterQueuesWaitsThatRunAtTheSameTime checks that waits which start
+// together each get a token in turn, when the token of each is due inside the
+// wait cap.
+func TestLimiterQueuesWaitsThatRunAtTheSameTime(t *testing.T) {
+	t.Parallel()
+	const waits = 5
+	l := newLimiter(50, 1, time.Now)
+	if err := l.wait(context.Background(), fetchWaitCap); err != nil {
+		t.Fatalf("take the burst: %v", err)
+	}
+
+	errs := make(chan error, waits)
+	for range waits {
+		go func() { errs <- l.wait(context.Background(), fetchWaitCap) }()
+	}
+	for range waits {
+		if err := <-errs; err != nil {
+			t.Errorf("wait = %v, want a token inside the wait cap", err)
+		}
+	}
+}
+
+// TestLimiterWaitGivesItsTokenBackOnCancel checks that a wait that its
+// context ends gives its reserved token back.
+func TestLimiterWaitGivesItsTokenBackOnCancel(t *testing.T) {
+	t.Parallel()
+	clock := newClock()
+	l := newLimiter(1, 1, clock.Now)
+	if err := l.wait(context.Background(), fetchWaitCap); err != nil {
+		t.Fatalf("take the burst: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := l.wait(ctx, fetchWaitCap); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wait = %v, want the deadline of the context", err)
+	}
+
+	clock.advance(time.Second)
+	if err := l.wait(context.Background(), 0); err != nil {
+		t.Errorf("wait one second later = %v, want the token that the canceled wait gave back", err)
 	}
 }

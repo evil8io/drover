@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,9 +14,12 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/evil8io/drover/internal/rancherclient"
 )
 
 const (
@@ -40,8 +44,15 @@ const (
 	// value is the part of the project id after the colon.
 	projectLabel = "field.cattle.io/projectId"
 	// sessionCookie is the cookie that Rancher reads when the first
-	// Authorization value is empty or absent.
+	// Authorization value is blank or absent.
 	sessionCookie = "R_SESS"
+
+	// projectNamespacesPage is the page size of the privileged list that
+	// completeProjects reads.
+	projectNamespacesPage = 500
+	// metadataAccept asks the API server for the metadata of each object
+	// only, and falls back to the full object.
+	metadataAccept = "application/json;as=PartialObjectMetadataList;v=v1;g=meta.k8s.io,application/json"
 
 	maxKnownClusters = 1024
 )
@@ -67,10 +78,10 @@ type projectCollection struct {
 }
 
 // allowedSet is the cached view of one caller. It has the namespace names
-// the caller may list. It also has the ids of the projects that contain at
-// least one of those names. Rancher grants project visibility and namespace
-// access as two separate rights, so a visible project with no allowed
-// namespace is not in this set. extras is the subset of names whose project
+// the caller may list. It also has the ids of the visible projects whose
+// namespaces are all among those names. Rancher grants project visibility
+// and namespace access as two separate rights, so a project with a namespace
+// outside them is left out. extras is the subset of names whose project
 // label is not one of these project ids. user is the Rancher user id of the
 // caller, from a SelfSubjectReview, or the subject of a ServiceAccount token,
 // or empty when the lookup failed. denied marks the set of a ServiceAccount
@@ -161,23 +172,48 @@ func (s *Service) waitFetch(ctx context.Context, l *limiter, limit string) (*htt
 
 // callerHash returns the sha256 hex of the credential key of the headers.
 func callerHash(header http.Header) string {
-	sum := sha256.Sum256([]byte(credentialKey(header)))
+	return hashKey(credentialKey(header))
+}
+
+func hashKey(key string) string {
+	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:])
 }
 
-// credentialKey returns the credential that Rancher reads from the headers:
-// the first Authorization value, or the first R_SESS cookie as net/http
-// parses it when that value is empty. It returns a fixed key when the headers
-// have neither. A second value and another cookie do not change the key, so
-// one credential gives one key.
+// credentialKey returns the key of the token that Rancher reads from the
+// headers, so every spelling of one token gives one key. It returns a fixed
+// key when Rancher reads no token.
 func credentialKey(header http.Header) string {
-	if auth := header.Get("Authorization"); auth != "" {
-		return "authorization\n" + auth
-	}
-	if session, err := (&http.Request{Header: header}).Cookie(sessionCookie); err == nil {
-		return "cookie\n" + session.Value
+	if token := tokenValue(header); token != "" {
+		return "token\n" + token
 	}
 	return noCredential
+}
+
+// tokenValue returns the token that Rancher 2.14 reads from the headers, as
+// its GetTokenAuthFromRequest does. A value with another scheme gives no
+// token, and Rancher then reads no cookie.
+func tokenValue(header http.Header) string {
+	auth := strings.TrimSpace(header.Get("Authorization"))
+	if auth == "" {
+		if session, err := (&http.Request{Header: header}).Cookie(sessionCookie); err == nil {
+			return session.Value
+		}
+		return ""
+	}
+	scheme, rest, _ := strings.Cut(auth, " ")
+	rest = strings.TrimSpace(rest)
+	switch {
+	case strings.EqualFold(scheme, "Bearer"):
+		return rest
+	case strings.EqualFold(scheme, "Basic"):
+		decoded, err := base64.URLEncoding.DecodeString(rest)
+		if err != nil {
+			return ""
+		}
+		return string(decoded)
+	}
+	return ""
 }
 
 // fetchAllowed reads the namespace names and the project ids of the caller,
@@ -202,7 +238,10 @@ func (s *Service) fetchAllowed(ctx context.Context, cluster, auth, cookie string
 	if denied != nil || err != nil {
 		return allowedSet{}, denied, err
 	}
-	projects := allowedProjects(names, projectOf, visible)
+	projects, err := s.completeProjects(ctx, cluster, names, allowedProjects(names, projectOf, visible))
+	if err != nil {
+		return allowedSet{}, nil, err
+	}
 
 	user := s.fetchCallerName(ctx, cluster, auth, cookie)
 
@@ -226,6 +265,83 @@ func allowedProjects(names []string, projectOf map[string]string, visible []stri
 		}
 	}
 	return slices.Sorted(maps.Keys(set))
+}
+
+// namespaceMetadataList is the part of a namespace list that
+// completeProjects reads.
+type namespaceMetadataList struct {
+	Metadata struct {
+		Continue string `json:"continue"`
+	} `json:"metadata"`
+	Items []struct {
+		Metadata struct {
+			Name   string            `json:"name"`
+			Labels map[string]string `json:"labels"`
+		} `json:"metadata"`
+	} `json:"items"`
+}
+
+// completeProjects returns the projects of candidates whose namespaces are
+// all in names, which is sorted. It lists the namespaces under the project
+// label of the candidates with the service token, because the caller can have
+// a right on some namespaces of a visible project only.
+func (s *Service) completeProjects(ctx context.Context, cluster string, names, candidates []string) ([]string, error) {
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	token, err := rancherclient.ReadToken(s.tokenFile)
+	if err != nil {
+		return nil, err
+	}
+	partial := make(map[string]struct{})
+	next := ""
+	for page := 0; page < maxStevePages; page++ {
+		target := *s.upstream
+		target.Path = "/k8s/clusters/" + cluster + "/api/v1/namespaces"
+		query := url.Values{
+			"labelSelector": []string{mergeProjectSelector("", candidates)},
+			"limit":         []string{strconv.Itoa(projectNamespacesPage)},
+		}
+		if next != "" {
+			query.Set("continue", next)
+		}
+		target.RawQuery = query.Encode()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Accept", metadataAccept)
+
+		resp, err := s.base.RoundTrip(req)
+		if err != nil {
+			return nil, fmt.Errorf("project namespace list request failed: %w", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBody))
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("project namespace list request returned %s", resp.Status)
+		}
+		var list namespaceMetadataList
+		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, maxSteveBody)).Decode(&list)
+		_ = resp.Body.Close()
+		if decodeErr != nil {
+			return nil, fmt.Errorf("project namespace list response: %w", decodeErr)
+		}
+		for _, item := range list.Items {
+			if _, found := slices.BinarySearch(names, item.Metadata.Name); !found {
+				partial[item.Metadata.Labels[projectLabel]] = struct{}{}
+			}
+		}
+		if list.Metadata.Continue == "" {
+			return slices.DeleteFunc(slices.Clone(candidates), func(project string) bool {
+				_, ok := partial[project]
+				return ok
+			}), nil
+		}
+		next = list.Metadata.Continue
+	}
+	return nil, fmt.Errorf("project namespace list has more than %d pages", maxStevePages)
 }
 
 // extraNames returns the names among names whose project label, from
@@ -328,8 +444,8 @@ func (s *Service) fetchNamespaceNames(ctx context.Context, cluster, auth, cookie
 // as the part of the project id after the colon. The project label of a
 // namespace has that part only, and the part is unique inside one cluster,
 // so a project of another cluster must not reach the selector. The result is
-// the full visible set. fetchAllowed keeps only the visible projects that
-// contain an allowed namespace, because project visibility alone grants no
+// the full visible set. fetchAllowed keeps only the visible projects whose
+// namespaces are all allowed, because project visibility alone grants no
 // namespace access. A non-nil response is the 401 or 403 answer of Rancher,
 // for the caller.
 func (s *Service) fetchProjectIDs(ctx context.Context, cluster, auth, cookie string) ([]string, *http.Response, error) {
@@ -598,42 +714,44 @@ func newLimiter(rate, burst float64, now func() time.Time) *limiter {
 	return &limiter{rate: rate, burst: burst, now: now, tokens: burst, last: now()}
 }
 
-// wait takes one token. When no token is free, it blocks up to waitCap,
-// against ctx. A nil error means the wait took a token.
+// wait takes one token. When no token is free, it reserves the next token and
+// blocks until that token is due, up to waitCap, against ctx. The reservation
+// takes the token before the wait, so waits that run at the same time queue
+// behind each other. A wait that ctx ends gives its token back. A nil error
+// means the wait took a token.
 func (l *limiter) wait(ctx context.Context, waitCap time.Duration) error {
 	l.mu.Lock()
 	l.refill()
-	if l.tokens >= 1 {
-		l.tokens--
-		l.mu.Unlock()
-		return nil
+	var need time.Duration
+	if l.tokens < 1 {
+		need = time.Duration((1 - l.tokens) / l.rate * float64(time.Second))
+		if err := ctx.Err(); err != nil {
+			l.mu.Unlock()
+			return err
+		}
+		if need > waitCap {
+			l.mu.Unlock()
+			return errFetchThrottled
+		}
 	}
-	need := time.Duration((1 - l.tokens) / l.rate * float64(time.Second))
+	l.tokens--
 	l.mu.Unlock()
-
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if need > waitCap {
-		return errFetchThrottled
+	if need == 0 {
+		return nil
 	}
 
 	timer := time.NewTimer(need)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
+		return nil
 	case <-ctx.Done():
+		l.mu.Lock()
+		l.refill()
+		l.tokens = min(l.burst, l.tokens+1)
+		l.mu.Unlock()
 		return ctx.Err()
 	}
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.refill()
-	if l.tokens < 1 {
-		return errFetchThrottled
-	}
-	l.tokens--
-	return nil
 }
 
 // refill adds the tokens that the time since the last refill earns, up to

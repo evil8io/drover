@@ -70,8 +70,11 @@ type Config struct {
 	// the merge holds.
 	FanoutConcurrency int
 	// FanoutMaxInflight is the count of namespaced requests of all fan-outs
-	// that run at a time. Zero selects 64.
+	// and merged watch opens that run at a time. Zero selects 64.
 	FanoutMaxInflight int
+	// FanoutMaxInflightPerCaller is the part of FanoutMaxInflight that the
+	// requests of one caller hold at a time. Zero selects 16.
+	FanoutMaxInflightPerCaller int
 	// FanoutMaxWatchNamespaces is the count of allowed namespaces above which
 	// a cluster-wide watch answers 403. Zero selects 50. A merged watch holds
 	// one upstream connection per namespace for its whole life, so its bound
@@ -113,7 +116,7 @@ type Service struct {
 	fanoutEnabled            bool
 	fanoutMaxNamespaces      int
 	fanoutConcurrency        int
-	fanoutGlobal             chan struct{}
+	inflight                 *inflightSlots
 	fanoutMaxWatchNamespaces int
 
 	draining atomic.Bool
@@ -197,6 +200,10 @@ func New(cfg Config) (*Service, error) {
 	if fanoutMaxInflight <= 0 {
 		fanoutMaxInflight = defaultFanoutMaxInflight
 	}
+	fanoutMaxInflightPerCaller := cfg.FanoutMaxInflightPerCaller
+	if fanoutMaxInflightPerCaller <= 0 {
+		fanoutMaxInflightPerCaller = defaultFanoutMaxInflightPerCaller
+	}
 	fanoutMaxWatchNamespaces := cfg.FanoutMaxWatchNamespaces
 	if fanoutMaxWatchNamespaces <= 0 {
 		fanoutMaxWatchNamespaces = defaultFanoutMaxWatchNamespaces
@@ -219,11 +226,11 @@ func New(cfg Config) (*Service, error) {
 		tokenFile: cfg.TokenFile,
 		logger:    logger,
 		now:       now,
-		base: otelhttp.NewTransport(base,
+		base: upstreamTransport{next: otelhttp.NewTransport(base,
 			otelhttp.WithMeterProvider(meterProvider),
 			otelhttp.WithTracerProvider(tracerProvider),
 			otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string { return spanName(r) }),
-		),
+		)},
 		cache:    newCache(ttl, maxCacheEntries, now),
 		limiter:  newLimiter(fetchRate, fetchBurst, now),
 		callers:  newCallerLimiters(fetchRatePerCaller, fetchBurstPerCaller, maxCacheEntries, now),
@@ -234,7 +241,7 @@ func New(cfg Config) (*Service, error) {
 		fanoutEnabled:            cfg.Fanout,
 		fanoutMaxNamespaces:      fanoutMaxNamespaces,
 		fanoutConcurrency:        fanoutConcurrency,
-		fanoutGlobal:             make(chan struct{}, fanoutMaxInflight),
+		inflight:                 newInflightSlots(fanoutMaxInflight, fanoutMaxInflightPerCaller),
 		fanoutMaxWatchNamespaces: fanoutMaxWatchNamespaces,
 	}
 	svc.proxy = &httputil.ReverseProxy{
@@ -281,9 +288,11 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if r.Method == http.MethodPost {
+	if r.Method == http.MethodPost && reviewsPath.MatchString(r.URL.Path) {
 		// A review body is small, and a caller that sends it slowly holds a
 		// goroutine. The server resets the deadline before the next request.
+		// A passed deadline cancels the request, so an exec that waits for
+		// its protocol switch must not get one.
 		controller := http.NewResponseController(w)
 		_ = controller.SetReadDeadline(time.Now().Add(bodyReadTimeout))
 		defer func() { _ = controller.SetReadDeadline(time.Time{}) }()

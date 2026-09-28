@@ -1146,3 +1146,35 @@ func TestMergedWatchDropsAnEndBookmarkWithoutAWatchList(t *testing.T) {
 	}
 	wantNoEvent(t, reader)
 }
+
+// TestMergedWatchOpensTakeInflightSlots checks that the upstream watches of a
+// merged watch open inside the global in-flight slots. With one slot, the
+// second open waits until the first upstream watch answers.
+func TestMergedWatchOpensTakeInflightSlots(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	gate := newBlockGate(0)
+	timer := time.AfterFunc(200*time.Millisecond, gate.open)
+	t.Cleanup(func() {
+		timer.Stop()
+		gate.open()
+	})
+	watches := namespaceWatches(release, map[string][]string{"a": {podEvent("a")}, "b": {podEvent("b")}})
+	h := newHarnessOpt(t, collectionUpstream(
+		steveHandler("a", "b"),
+		func(w http.ResponseWriter, r *http.Request) {
+			gate.wait(r.Context())
+			watches(w, r)
+		},
+	), withFanout, func(cfg *Config) { cfg.FanoutMaxInflight = 1 })
+
+	_, reader := startMergedWatch(t, h, podsPath+"?watch=true")
+	if got, want := mergedEvents(t, reader, 2), []string{podEvent("a"), podEvent("b")}; !slices.Equal(got, want) {
+		t.Errorf("events = %q, want %q", got, want)
+	}
+	if got := gate.highest.Load(); got != 1 {
+		t.Errorf("upstream watch opens at the same time = %d, want 1", got)
+	}
+}

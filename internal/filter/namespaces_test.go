@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -340,6 +341,118 @@ func TestListProjectSelectorIncludesEveryProjectWithNamespace(t *testing.T) {
 	want := "field.cattle.io/projectId in (p-a,p-b)"
 	if got := privileged.query.Get("labelSelector"); got != want {
 		t.Errorf("labelSelector = %q, want %q", got, want)
+	}
+}
+
+// TestListNameSelectorOnAPartialProject checks that a visible project with a
+// namespace outside the allowed set gives a name selector. The caller has a
+// right on team-a only, and team-b is in the same project.
+func TestListNameSelectorOnAPartialProject(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstreamWithProjects(
+		steveLabeledHandler(steveNamespace{name: "team-a", project: "p-1"}),
+		projectsHandler("p-1"),
+		namespaceListHandler,
+	))
+	h.upstream.setProjectNamespaces(steveNamespace{name: "team-a", project: "p-1"}, steveNamespace{name: "team-b", project: "p-1"})
+
+	resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	privileged := h.upstream.privileged(t)
+	if want := "kubernetes.io/metadata.name in (team-a)"; privileged.query.Get("labelSelector") != want {
+		t.Errorf("labelSelector = %q, want %q", privileged.query.Get("labelSelector"), want)
+	}
+	lists := h.upstream.projectListRequests()
+	if len(lists) != 1 {
+		t.Fatalf("project namespace lists = %d, want 1", len(lists))
+	}
+	if want := "field.cattle.io/projectId in (p-1)"; lists[0].query.Get("labelSelector") != want {
+		t.Errorf("labelSelector of the project namespace list = %q, want %q", lists[0].query.Get("labelSelector"), want)
+	}
+}
+
+// TestListProjectSelectorOnACompleteProject checks that a visible project
+// whose namespaces are all in the allowed set keeps the project selector.
+func TestListProjectSelectorOnACompleteProject(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstreamWithProjects(
+		steveLabeledHandler(steveNamespace{name: "team-a", project: "p-1"}, steveNamespace{name: "team-b", project: "p-1"}),
+		projectsHandler("p-1"),
+		namespaceListHandler,
+	))
+	h.upstream.setProjectNamespaces(steveNamespace{name: "team-a", project: "p-1"}, steveNamespace{name: "team-b", project: "p-1"})
+
+	resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	privileged := h.upstream.privileged(t)
+	if want := "field.cattle.io/projectId in (p-1)"; privileged.query.Get("labelSelector") != want {
+		t.Errorf("labelSelector = %q, want %q", privileged.query.Get("labelSelector"), want)
+	}
+}
+
+// TestWatchDropsAnotherNamespaceOfAPartialProject is
+// TestListNameSelectorOnAPartialProject for a watch: the privileged watch
+// gets no selector, and the event filter drops the event of team-b.
+func TestWatchDropsAnotherNamespaceOfAPartialProject(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstreamWithProjects(
+		steveLabeledHandler(steveNamespace{name: "team-a", project: "p-1"}),
+		projectsHandler("p-1"),
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, namespaceLine(watchAdded, "team-b", "p-1")+namespaceLine(watchAdded, "team-a", "p-1"))
+		},
+	))
+	h.upstream.setProjectNamespaces(steveNamespace{name: "team-a", project: "p-1"}, steveNamespace{name: "team-b", project: "p-1"})
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, listPath+"?watch=true", nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if want := namespaceLine(watchAdded, "team-a", "p-1"); string(body) != want {
+		t.Errorf("body = %q, want only the event of team-a %q", body, want)
+	}
+	if got := h.upstream.privileged(t).query.Get("labelSelector"); got != "" {
+		t.Errorf("labelSelector = %q, want no selector", got)
+	}
+}
+
+// TestListProjectNamespaceListFailureAnswers502 checks that a failed
+// privileged list of the candidate projects fails the fetch, and that the
+// allowed set is not cached.
+func TestListProjectNamespaceListFailureAnswers502(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, listUpstreamWithProjects(
+		steveLabeledHandler(steveNamespace{name: "team-a", project: "p-1"}),
+		projectsHandler("p-1"),
+		namespaceListHandler,
+	))
+	if err := os.Remove(h.tokenFile); err != nil {
+		t.Fatalf("remove the token file: %v", err)
+	}
+
+	resp, _ := h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	if got := len(h.upstream.projectListRequests()); got != 0 {
+		t.Errorf("project namespace lists = %d, want 0 without a token", got)
+	}
+
+	writeToken(t, h.tokenFile, "service")
+	resp, _ = h.do(t, h.request(t, http.MethodGet, listPath, nil, callerHeader()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status after the token = %d, want 200", resp.StatusCode)
+	}
+	if got := h.upstream.countPath(stevePath); got != 2 {
+		t.Errorf("Steve requests = %d, want 2, a failed fetch must not be cached", got)
 	}
 }
 
