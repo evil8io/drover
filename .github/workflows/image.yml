@@ -16,9 +16,10 @@ on:
         type: string
         required: true
 
-permissions:
-  contents: read
-  packages: write
+# No permissions block here. A reusable workflow that declares its own
+# permissions must get at least that much from every caller, so a caller
+# with fewer permissions, such as a pull-request run, would fail to start.
+# Each caller job in ci.yml sets the permissions instead.
 
 jobs:
   build:

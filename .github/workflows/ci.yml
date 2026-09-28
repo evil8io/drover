@@ -59,13 +59,28 @@ jobs:
             echo "TAGS_EOF"
           } >> "$GITHUB_OUTPUT"
 
-  image:
+  # permissions does not accept an expression, so a pull-request run and a
+  # push to main need separate jobs for separate permissions.
+  image-pr:
+    if: github.event_name == 'pull_request'
+    needs: [go]
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/image.yml
+    with:
+      push: false
+      version: ${{ needs.go.outputs.version }}
+      tags: ${{ needs.go.outputs.tags }}
+
+  image-push:
+    if: github.event_name == 'push'
     needs: [go]
     permissions:
       contents: read
       packages: write
     uses: ./.github/workflows/image.yml
     with:
-      push: ${{ github.event_name == 'push' }}
+      push: true
       version: ${{ needs.go.outputs.version }}
       tags: ${{ needs.go.outputs.tags }}
