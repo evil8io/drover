@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // tenantNamespace returns a settled namespace of a tenant project: labelled,
@@ -635,7 +636,7 @@ func TestApplyAccountsHandlesTheNamespaceCases(t *testing.T) {
 		syncer, _ := newAccountsSyncer(t, fake)
 		syncer.setAccounts(acctCluster, accountState{
 			namespaces: map[string]string{"p-alpha": "uid-1"},
-			settled:    map[string]string{"ns-a": settledKey("p-alpha", "uid-1")},
+			settled:    map[string]string{"ns-a": settledKey("p-alpha", "uid-1", "uid-ns-a")},
 		})
 		watch := newClusterWatch(10)
 		seen := make(map[string]string)
@@ -645,7 +646,7 @@ func TestApplyAccountsHandlesTheNamespaceCases(t *testing.T) {
 		if got := fake.all(); len(got) != 0 {
 			t.Errorf("requests = %d, want 0", len(got))
 		}
-		if got, want := seen["ns-a"], settledKey("p-alpha", "uid-1"); got != want {
+		if got, want := seen["ns-a"], settledKey("p-alpha", "uid-1", "uid-ns-a"); got != want {
 			t.Errorf("seen[ns-a] = %q, want %q", got, want)
 		}
 	})
@@ -660,7 +661,7 @@ func TestApplyAccountsHandlesTheNamespaceCases(t *testing.T) {
 		syncer, _ := newAccountsSyncer(t, fake)
 		syncer.setAccounts(acctCluster, accountState{
 			namespaces: map[string]string{"p-alpha": "uid-1", "p-beta": "uid-2"},
-			settled:    map[string]string{"ns-a": settledKey("p-alpha", "uid-1")},
+			settled:    map[string]string{"ns-a": settledKey("p-alpha", "uid-1", "uid-ns-a")},
 		})
 		watch := newClusterWatch(10)
 		seen := make(map[string]string)
@@ -678,7 +679,7 @@ func TestApplyAccountsHandlesTheNamespaceCases(t *testing.T) {
 				t.Errorf("subjects of %s after the move = %v, want the account namespace of p-beta", path, updated.Subjects)
 			}
 		}
-		if got, want := seen["ns-a"], settledKey("p-beta", "uid-2"); got != want {
+		if got, want := seen["ns-a"], settledKey("p-beta", "uid-2", "uid-ns-a"); got != want {
 			t.Errorf("seen[ns-a] = %q, want %q", got, want)
 		}
 	})
@@ -693,7 +694,7 @@ func TestApplyAccountsHandlesTheNamespaceCases(t *testing.T) {
 		syncer, _ := newAccountsSyncer(t, fake)
 		syncer.setAccounts(acctCluster, accountState{
 			namespaces: map[string]string{"p-alpha": "uid-1"},
-			settled:    map[string]string{"ns-b": settledKey("p-alpha", "uid-1")},
+			settled:    map[string]string{"ns-b": settledKey("p-alpha", "uid-1", "uid-ns-b")},
 		})
 		watch := newClusterWatch(10)
 		seen := make(map[string]string)
@@ -708,7 +709,7 @@ func TestApplyAccountsHandlesTheNamespaceCases(t *testing.T) {
 				t.Errorf("DELETE requests of %s = %d, want 1", path, len(got))
 			}
 		}
-		if got, want := seen["ns-b"], settledKey("", ""); got != want {
+		if got, want := seen["ns-b"], settledKey("", "", ""); got != want {
 			t.Errorf("seen[ns-b] = %q, want %q", got, want)
 		}
 	})
@@ -827,6 +828,336 @@ func TestListProjectCreatesTheAccountsOfANewProjectThroughTheLister(t *testing.T
 	state, _ := syncer.accountsOf(acctCluster)
 	if _, ok := state.namespaces["p-new"]; !ok {
 		t.Error("the account state has no namespace uid for p-new")
+	}
+}
+
+// work runs one worker of acctCluster over items, one after the other, and
+// waits until its queue is empty after each item.
+func work(t *testing.T, syncer *Syncer, items ...patchItem) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watch := newClusterWatch(syncer.patchRate)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		syncer.patchWorker(ctx, acctCluster, watch)
+	}()
+	for _, item := range items {
+		watch.patches.put(item)
+		waitForQueue(t, watch.patches)
+	}
+	cancel()
+	<-done
+}
+
+// TestWorkerGivesRoleBindingsToANamespaceCreatedAgain checks a namespace that
+// a CI job deletes and creates again within one interval. The garbage
+// collector deletes its RoleBindings, and the new namespace has a new uid.
+func TestWorkerGivesRoleBindingsToANamespaceCreatedAgain(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	fake.addNamespace(tenantNamespace("ns-a", "p-alpha"))
+	syncer, _ := newAccountsSyncer(t, fake)
+	syncer.reconcile(context.Background())
+
+	for _, role := range accountRoles {
+		fake.removeRoleBinding("ns-a", roleBindingName(role))
+	}
+	old := tenantNamespace("ns-a", "p-alpha")
+	created := tenantNamespace("ns-a", "p-alpha")
+	created.Metadata.UID = "uid-ns-a-2"
+	fake.addNamespace(created)
+	fake.resetRequests()
+
+	work(t, syncer, patchItem{target: old, origin: originWatch}, patchItem{target: created, origin: originWatch})
+
+	posts := filterMethod(fake.requestsOfPath(roleBindingsPath(acctCluster, "ns-a")), http.MethodPost)
+	if len(posts) != 3 {
+		t.Fatalf("role binding create requests in ns-a = %d, want 3", len(posts))
+	}
+}
+
+// TestWorkerDeletesTheRoleBindingsOfTheOldProjectOfAMovedNamespace checks a
+// namespace that moves from p-alpha to p-beta before p-beta has a trusted
+// account namespace. The RoleBindings of p-alpha go at once.
+func TestWorkerDeletesTheRoleBindingsOfTheOldProjectOfAMovedNamespace(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	for _, role := range accountRoles {
+		fake.addRoleBinding("ns-a", accountBinding("RoleBinding", roleBindingName(role), "ns-a",
+			role.clusterRole, "p-alpha", "uid-1", role))
+	}
+	syncer, _ := newAccountsSyncer(t, fake)
+	syncer.setAccounts(acctCluster, accountState{
+		projects:   []string{"p-acct"},
+		namespaces: map[string]string{"p-alpha": "uid-1"},
+		settled:    map[string]string{},
+	})
+	syncer.setClusters(map[string]map[string]project{acctCluster: {
+		"p-alpha": {ID: acctCluster + ":p-alpha", ClusterID: acctCluster, Name: "p-alpha"},
+		"p-beta":  {ID: acctCluster + ":p-beta", ClusterID: acctCluster, Name: "p-beta"},
+	}})
+
+	work(t, syncer, patchItem{target: tenantNamespace("ns-a", "p-beta"), origin: originWatch})
+
+	for _, role := range accountRoles {
+		path := roleBindingsPath(acctCluster, "ns-a") + "/" + roleBindingName(role)
+		if got := filterMethod(fake.requestsOfPath(path), http.MethodDelete); len(got) != 1 {
+			t.Errorf("DELETE requests of %s = %d, want 1", path, len(got))
+		}
+	}
+}
+
+// TestReconcileDeletesTheRoleBindingsOfAnotherProjectInAPendingProject checks
+// a namespace of p-beta, whose account namespace check fails in the run. The
+// namespace keeps the RoleBindings of p-beta, and loses those of p-alpha.
+func TestReconcileDeletesTheRoleBindingsOfAnotherProjectInAPendingProject(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	markedProject(fake, "p-acct")
+	fake.addProject("p-beta", nil)
+	fake.addNamespace(tenantNamespace("ns-moved", "p-beta"))
+	fake.addNamespace(tenantNamespace("ns-kept", "p-beta"))
+	for _, role := range accountRoles {
+		fake.addRoleBinding("ns-moved", accountBinding("RoleBinding", roleBindingName(role), "ns-moved",
+			role.clusterRole, "p-alpha", "uid-alpha", role))
+		fake.addRoleBinding("ns-kept", accountBinding("RoleBinding", roleBindingName(role), "ns-kept",
+			role.clusterRole, "p-beta", "uid-beta", role))
+	}
+	orphan := accountNamespace("p-beta")
+	var ns namespace
+	ns.Metadata.Name = orphan
+	ns.Metadata.UID = "uid-beta"
+	fake.addNamespace(ns)
+	fake.addClusterRoleBinding(accountBinding("ClusterRoleBinding", namespacesBindingName("p-beta", accountRoles[0]),
+		"", "p-beta-namespaces-edit", "p-beta", ns.Metadata.UID, accountRoles[0]))
+	fake.failPatch(orphan, http.StatusInternalServerError)
+
+	syncer, _ := newAccountsSyncer(t, fake)
+	syncer.reconcile(context.Background())
+
+	for _, role := range accountRoles {
+		moved := roleBindingsPath(acctCluster, "ns-moved") + "/" + roleBindingName(role)
+		if got := filterMethod(fake.requestsOfPath(moved), http.MethodDelete); len(got) != 1 {
+			t.Errorf("DELETE requests of %s = %d, want 1", moved, len(got))
+		}
+		kept := roleBindingsPath(acctCluster, "ns-kept") + "/" + roleBindingName(role)
+		if got := filterMethod(fake.requestsOfPath(kept), http.MethodDelete); len(got) != 0 {
+			t.Errorf("DELETE requests of %s = %d, want 0", kept, len(got))
+		}
+	}
+}
+
+func TestReconcileSweepsAnAccountNamespaceInNoProjectOnlyWithProof(t *testing.T) {
+	t.Parallel()
+
+	setup := func(t *testing.T, withProof bool) *accountsFake {
+		t.Helper()
+		fake := newAccountsFake(t)
+		markedProject(fake, "p-acct")
+		var ns namespace
+		ns.Metadata.Name = accountNamespace("p-gone")
+		ns.Metadata.UID = "uid-" + ns.Metadata.Name
+		fake.addNamespace(ns)
+		ownerUID := "uid-other"
+		if withProof {
+			ownerUID = ns.Metadata.UID
+		}
+		fake.addClusterRoleBinding(accountBinding("ClusterRoleBinding", namespacesBindingName("p-gone", accountRoles[0]),
+			"", "p-gone-namespaces-edit", "p-gone", ownerUID, accountRoles[0]))
+		syncer, _ := newAccountsSyncer(t, fake)
+		syncer.reconcile(context.Background())
+		return fake
+	}
+	nsPath := namespacePath(acctCluster, accountNamespace("p-gone"))
+
+	t.Run("with a cluster role binding that names it as owner", func(t *testing.T) {
+		t.Parallel()
+		fake := setup(t, true)
+		if got := filterMethod(fake.requestsOfPath(nsPath), http.MethodDelete); len(got) != 1 {
+			t.Errorf("DELETE requests of %s = %d, want 1", nsPath, len(got))
+		}
+	})
+
+	t.Run("without such a binding", func(t *testing.T) {
+		t.Parallel()
+		fake := setup(t, false)
+		if got := filterMethod(fake.requestsOfPath(nsPath), http.MethodDelete); len(got) != 0 {
+			t.Errorf("DELETE requests of %s = %d, want 0", nsPath, len(got))
+		}
+	})
+}
+
+func TestReconcileKeepsTheAccountNamespaceWhenABindingDeleteFails(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	markedProject(fake, "p-acct")
+	goneNS := accountNamespaceIn("p-gone")
+	fake.addNamespace(goneNS)
+	crb := accountBinding("ClusterRoleBinding", namespacesBindingName("p-gone", accountRoles[0]),
+		"", "p-gone-namespaces-edit", "p-gone", goneNS.Metadata.UID, accountRoles[0])
+	fake.addClusterRoleBinding(crb)
+	fake.fail(http.MethodDelete, clusterRoleBindingsPath(acctCluster)+"/"+crb.Metadata.Name, http.StatusInternalServerError)
+
+	syncer, _ := newAccountsSyncer(t, fake)
+	syncer.reconcile(context.Background())
+
+	nsPath := namespacePath(acctCluster, goneNS.Metadata.Name)
+	if got := filterMethod(fake.requestsOfPath(nsPath), http.MethodDelete); len(got) != 0 {
+		t.Errorf("DELETE requests of %s = %d, want 0 after a failed binding delete", nsPath, len(got))
+	}
+}
+
+func TestListProjectWritesNoOpenBaoObjectsForAChangedOpenBaoNamespace(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		uid     string
+		project string
+	}{
+		{name: "a new uid", uid: "uid-new", project: "p-acct"},
+		{name: "a tenant project", uid: "uid-bao", project: "p-tenant"},
+		{name: "no namespace"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			fake := newAccountsFake(t)
+			setup := newOpenBaoSetup(t, fake)
+			setup.bao.addMount("kubernetes/c-1")
+			markedProject(fake, "p-acct")
+			if test.uid != "" {
+				var ns namespace
+				ns.Metadata.Name, ns.Metadata.UID = openbaoNamespace, test.uid
+				ns.Metadata.Annotations = map[string]string{projectAnnotation: acctCluster + ":" + test.project}
+				fake.addNamespace(ns)
+			}
+			setup.syncer.setAccounts(acctCluster, accountState{projects: []string{"p-acct"}, openbao: "uid-bao"})
+			setup.syncer.setClusters(map[string]map[string]project{
+				acctCluster: {"p-new": {ID: acctCluster + ":p-new", ClusterID: acctCluster, Name: "p-new"}},
+			})
+
+			setup.syncer.listProject(context.Background(), acctCluster, "p-new", newClusterWatch(10).patches)
+
+			nsName := accountNamespace("p-new")
+			if got := fake.requestsOfPath(rolesPath(acctCluster, nsName)); len(got) != 0 {
+				t.Errorf("role requests in %s = %d, want 0", nsName, len(got))
+			}
+			if got := fake.requestsOfPath(roleBindingsPath(acctCluster, nsName)); len(got) != 0 {
+				t.Errorf("role binding requests in %s = %d, want 0", nsName, len(got))
+			}
+			if got := setup.bao.all(); len(got) != 0 {
+				t.Errorf("OpenBao requests = %d, want 0", len(got))
+			}
+			if state, _ := setup.syncer.accountsOf(acctCluster); state.openbao != "" {
+				t.Errorf("OpenBao namespace uid after the lister = %q, want empty", state.openbao)
+			}
+		})
+	}
+}
+
+// TestListerTakesATokenForEachRequest checks that the lister takes a token of
+// the limiter per request, not per project. At 2 tokens per second, the 4
+// requests of an event of a project with accounts take 1 s.
+func TestListerTakesATokenForEachRequest(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	syncer, _ := newAccountsSyncer(t, fake, func(cfg *Config) { cfg.PatchRate = 2 })
+	syncer.reconcile(context.Background())
+	fake.resetRequests()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watch := newClusterWatch(syncer.patchRate)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		syncer.projectLister(ctx, acctCluster, watch)
+	}()
+	watch.projects.put("p-alpha")
+	waitForQueue(t, watch.projects)
+	cancel()
+	<-done
+
+	requests := fake.all()
+	if len(requests) != 4 {
+		t.Fatalf("requests of the lister = %d, want 4:\n%v", len(requests), requests)
+	}
+	if gap := requests[3].at.Sub(requests[0].at); gap < 900*time.Millisecond {
+		t.Errorf("the last request came %s after the first, want at least 0.9 s", gap)
+	}
+}
+
+// TestReconcileKeepsATrustThatTheListerAddsDuringTheRun checks that the run
+// keeps the account namespace of p-new, which the lister trusts while the run
+// deletes a stray role binding.
+func TestReconcileKeepsATrustThatTheListerAddsDuringTheRun(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	syncer, _ := newAccountsSyncer(t, fake)
+	syncer.reconcile(context.Background())
+
+	var lost namespace
+	lost.Metadata.Name = "ns-x"
+	fake.addNamespace(lost)
+	stray := accountBinding("RoleBinding", roleBindingName(accountRoles[0]), "ns-x",
+		accountRoles[0].clusterRole, "p-gone", "uid-gone", accountRoles[0])
+	fake.addRoleBinding("ns-x", stray)
+	strayPath := roleBindingsPath(acctCluster, "ns-x") + "/" + stray.Metadata.Name
+	fake.onRequest(func(method, path string) {
+		if method != http.MethodDelete || path != strayPath {
+			return
+		}
+		syncer.setProject(acctCluster, "p-new", project{ID: acctCluster + ":p-new", ClusterID: acctCluster, Name: "p-new"})
+		syncer.setAccountNamespace(acctCluster, "p-new", "uid-new")
+	})
+
+	syncer.reconcile(context.Background())
+
+	if got := filterMethod(fake.requestsOfPath(strayPath), http.MethodDelete); len(got) != 1 {
+		t.Fatalf("DELETE requests of %s = %d, want 1", strayPath, len(got))
+	}
+	state, _ := syncer.accountsOf(acctCluster)
+	if got := state.namespaces["p-new"]; got != "uid-new" {
+		t.Errorf("account namespace uid of p-new after the run = %q, want uid-new", got)
+	}
+}
+
+func TestReconcileClearsTheOpenBaoNamespaceUidAfterAnEarlyEnd(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "a failed namespace list", path: namespacesPath(acctCluster)},
+		{name: "a failed service account list", path: serviceAccountsPath(acctCluster, "")},
+		{name: "a failed cluster role binding list", path: clusterRoleBindingsPath(acctCluster)},
+		{name: "a failed role binding list", path: roleBindingsPath(acctCluster, "")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			fake := newAccountsFake(t)
+			fake.addProject("p-alpha", nil)
+			syncer, _ := newAccountsSyncer(t, fake)
+			syncer.reconcile(context.Background())
+			state, _ := syncer.accountsOf(acctCluster)
+			state.openbao = "uid-bao"
+			syncer.setAccounts(acctCluster, state)
+
+			fake.fail(http.MethodGet, test.path, http.StatusInternalServerError)
+			syncer.reconcile(context.Background())
+
+			if state, _ := syncer.accountsOf(acctCluster); state.openbao != "" {
+				t.Errorf("OpenBao namespace uid after the run = %q, want empty", state.openbao)
+			}
+		})
 	}
 }
 

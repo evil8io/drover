@@ -32,6 +32,10 @@ const (
 	// watchBackoffReset is the time that a stream must stay open before the
 	// backoff returns to its minimum.
 	watchBackoffReset = 10 * time.Second
+
+	// maxLimitWait bounds one sleep of the limiter. A rate close to zero
+	// would overflow the duration.
+	maxLimitWait = time.Minute
 )
 
 // errWatchExpired marks a watch that needs a new start without a resource
@@ -55,7 +59,8 @@ type watchSet struct {
 // stream and the lister put a namespace into patches, and the worker of the
 // cluster takes it from there. The project watch puts a project name into
 // projects, and the lister takes it from there. A value on reset tells the
-// worker to clear its name cache. The worker and the lister share limiter.
+// worker to clear its name cache. Each request of the worker and the lister
+// takes a token of limiter.
 type clusterWatch struct {
 	cancel   context.CancelFunc
 	patches  *queue[patchItem]
@@ -271,7 +276,8 @@ func (s *Syncer) streamNamespaces(ctx context.Context, cluster, resourceVersion 
 // returns the resource version of its object, or an error when the event has
 // no object of the kind. readWatch returns the last resource version that it
 // saw, so that the next stream starts after it. A stream that the server ends
-// at its timeout returns no error.
+// at its timeout returns no error. Only an ERROR event with code 410 returns
+// errWatchExpired.
 func (s *Syncer) readWatch(ctx context.Context, kind, cluster, path, selector, resourceVersion string, handle func(watchEvent) (string, error)) (string, error) {
 	token, err := rancherclient.ReadToken(s.tokenFile)
 	if err != nil {
@@ -321,7 +327,11 @@ func (s *Syncer) readWatch(ctx context.Context, kind, cluster, path, selector, r
 		s.metrics.watchEvent(ctx, cluster, kind, event.Type)
 
 		if event.Type == watchError {
-			return "", fmt.Errorf("%w: %s", errWatchExpired, event.status())
+			code, err := event.status()
+			if code == http.StatusGone {
+				return "", fmt.Errorf("%w: %w", errWatchExpired, err)
+			}
+			return resourceVersion, err
 		}
 		next, err := handle(event)
 		if err != nil {
@@ -338,8 +348,10 @@ func (s *Syncer) readWatch(ctx context.Context, kind, cluster, path, selector, r
 // patchWorker patches the namespaces of one cluster queue, one at a time. Its
 // name cache lasts as long as the worker, so a project whose display name has
 // no valid label value gives one warning per worker. The limiter of the
-// cluster bounds the patches per second.
+// cluster bounds the requests per second, so a namespace that needs no
+// request waits for no token.
 func (s *Syncer) patchWorker(ctx context.Context, cluster string, watch *clusterWatch) {
+	ctx = withLimiter(ctx, watch.limiter)
 	names := make(map[string]string)
 	seen := make(map[string]string)
 	for {
@@ -352,16 +364,14 @@ func (s *Syncer) patchWorker(ctx context.Context, cluster string, watch *cluster
 			clear(names)
 		default:
 		}
-		if watch.limiter.wait(ctx) {
-			if item.refresh {
-				item = s.refreshItem(ctx, cluster, item)
-			}
-			if !item.deleted {
-				s.applyPending(ctx, cluster, item, names)
-			}
-			if s.serviceAccounts {
-				s.applyAccounts(ctx, cluster, watch, item, seen)
-			}
+		if item.refresh {
+			item, ok = s.refreshItem(ctx, cluster, item)
+		}
+		if ok && !item.deleted {
+			s.applyPending(ctx, cluster, item, names)
+		}
+		if ok && s.serviceAccounts {
+			s.applyAccounts(ctx, cluster, watch, item, seen)
 		}
 		watch.patches.done()
 		if ctx.Err() != nil {
@@ -411,30 +421,31 @@ type patchItem struct {
 }
 
 // refreshItem reads the namespace of item again. A namespace that is gone
-// returns a deleted item. A failed read keeps the target of the event, and
-// the next reconcile run repeats the work.
-func (s *Syncer) refreshItem(ctx context.Context, cluster string, item patchItem) patchItem {
+// returns a deleted item. A failed read returns false, because the target of
+// the event names the project that the namespace left. The next reconcile run
+// repeats the work.
+func (s *Syncer) refreshItem(ctx context.Context, cluster string, item patchItem) (patchItem, bool) {
 	item.refresh = false
 	token, err := rancherclient.ReadToken(s.tokenFile)
 	if err != nil {
 		s.logFailure(ctx, slog.LevelWarn, "the namespace request failed", err,
 			"cluster", cluster, "namespace", item.target.Metadata.Name)
-		return item
+		return item, false
 	}
 	var fresh namespace
 	found, err := s.getObject(ctx, token, namespacePath(cluster, item.target.Metadata.Name), &fresh)
 	if err != nil {
 		s.logFailure(ctx, slog.LevelWarn, "the namespace request failed", err,
 			"cluster", cluster, "namespace", item.target.Metadata.Name)
-		return item
+		return item, false
 	}
 	if !found {
 		item.deleted = true
-		return item
+		return item, true
 	}
 	item.target = s.pruneNamespace(fresh)
 	item.deleted = item.target.Metadata.DeletionTimestamp != ""
-	return item
+	return item, true
 }
 
 // queue has the items of one cluster that wait for a worker, by the key that
@@ -516,7 +527,7 @@ func (q *queue[T]) idle() bool {
 }
 
 // limiter is a token bucket that bounds the requests per second of the
-// workers of one cluster.
+// worker and the lister of one cluster.
 // It is hand-written, because the module has no external rate package.
 type limiter struct {
 	rate  float64 // tokens added per second
@@ -543,7 +554,7 @@ func (l *limiter) wait(ctx context.Context) bool {
 			l.mu.Unlock()
 			return true
 		}
-		need := time.Duration((1 - l.tokens) / l.rate * float64(time.Second))
+		need := time.Duration(min((1-l.tokens)/l.rate, maxLimitWait.Seconds()) * float64(time.Second))
 		l.mu.Unlock()
 
 		if !waitFor(ctx, need) {
@@ -560,6 +571,25 @@ func (l *limiter) refill() {
 		l.tokens = min(l.burst, l.tokens+elapsed.Seconds()*l.rate)
 		l.last = now
 	}
+}
+
+// limiterKey is the context key of the limiter of a cluster watch.
+type limiterKey struct{}
+
+// withLimiter returns ctx with l. Each request to Rancher under ctx takes one
+// token of l first.
+func withLimiter(ctx context.Context, l *limiter) context.Context {
+	return context.WithValue(ctx, limiterKey{}, l)
+}
+
+// takeToken takes one token of the limiter of ctx, when ctx has one. It
+// returns the error of ctx when ctx ends first.
+func takeToken(ctx context.Context) error {
+	l, ok := ctx.Value(limiterKey{}).(*limiter)
+	if !ok || l.wait(ctx) {
+		return nil
+	}
+	return ctx.Err()
 }
 
 // waitFor sleeps for d. It returns false when ctx ends first.

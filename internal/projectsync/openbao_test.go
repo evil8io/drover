@@ -765,10 +765,17 @@ func TestNewChecksTheOpenBaoConfig(t *testing.T) {
 
 // listNewProject runs the lister for the new project p-new of acctCluster,
 // with the account project p-acct and the OpenBao namespace uid space in the
-// account view, and no reconcile run.
+// account view, and no reconcile run. A non-empty space is also the uid of the
+// OpenBao namespace in p-acct.
 func listNewProject(t *testing.T, setup *openbaoSetup, space string) {
 	t.Helper()
 	markedProject(setup.fake, "p-acct")
+	if space != "" {
+		var ns namespace
+		ns.Metadata.Name, ns.Metadata.UID = openbaoNamespace, space
+		ns.Metadata.Annotations = map[string]string{projectAnnotation: acctCluster + ":p-acct"}
+		setup.fake.addNamespace(ns)
+	}
 	setup.syncer.setAccounts(acctCluster, accountState{projects: []string{"p-acct"}, openbao: space})
 	setup.syncer.setClusters(map[string]map[string]project{
 		acctCluster: {"p-new": {ID: acctCluster + ":p-new", ClusterID: acctCluster, Name: "p-new"}},
@@ -811,8 +818,8 @@ func TestListProjectGivesANewProjectTheOpenBaoRoleAndRoleBinding(t *testing.T) {
 	if got := fake.requestsOfPath(rolesPath(acctCluster, "")); len(got) != 0 {
 		t.Errorf("role list requests = %d, want 0", len(got))
 	}
-	if got := fake.requestsOfPath(namespacePath(acctCluster, openbaoNamespace)); len(got) != 0 {
-		t.Errorf("requests of the OpenBao namespace = %d, want 0", len(got))
+	if got := fake.requestsOfPath(namespacePath(acctCluster, openbaoNamespace)); len(got) != 1 || got[0].method != http.MethodGet {
+		t.Errorf("requests of the OpenBao namespace = %v, want one GET", got)
 	}
 	state, _ := setup.syncer.accountsOf(acctCluster)
 	if state.openbao != "uid-bao" {

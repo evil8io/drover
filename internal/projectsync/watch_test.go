@@ -31,7 +31,7 @@ const (
 		`"annotations":{"field.cattle.io/projectId":"c-1:p-alpha"}}}}`
 	bookmarkEvent = `{"type":"BOOKMARK","object":{"kind":"Namespace","metadata":{"resourceVersion":"32"}}}`
 	expiredEvent  = `{"type":"ERROR","object":{"kind":"Status","reason":"Expired",` +
-		`"message":"too old resource version: 5 (9)"}}`
+		`"message":"too old resource version: 5 (9)","code":410}}`
 
 	terminatingBody = `{"kind":"Status","reason":"Forbidden",` +
 		`"message":"unable to create new content in namespace alpha-new because it is being terminated"}`
@@ -411,6 +411,81 @@ func TestWatchSendsNoPatchWhenTheRefreshFindsTheNamespaceGone(t *testing.T) {
 	}
 	if got := len(requestsOfPathAndMethod(rancher, alphaDepartedPath, http.MethodPatch)); got != 0 {
 		t.Errorf("PATCH requests of %s = %d, want 0", alphaDepartedPath, got)
+	}
+}
+
+// TestWatchTakesNoTokenForANamespaceThatNeedsNoRequest checks the start of a
+// watch without a resource version: an ADDED event for every namespace, and
+// no namespace needs a patch. At 2 tokens per second, a token per namespace
+// makes the 10 namespaces take 4 s.
+func TestWatchTakesNoTokenForANamespaceThatNeedsNoRequest(t *testing.T) {
+	t.Parallel()
+	var frames []string
+	for i := range 10 {
+		frames = append(frames, `{"type":"ADDED","object":`+
+			strings.Replace(alphaOneItem, `"name":"alpha-one"`, `"name":"alpha-settled-`+strconv.Itoa(i)+`"`, 1)+`}`)
+	}
+	rancher := newFakeRancher(t, watching("c-1", frames...))
+	syncer, _ := newSyncer(t, rancher, tokenFile(t, serviceToken), func(cfg *Config) {
+		cfg.PatchRate = 2
+	})
+	syncer.reconcile(context.Background())
+
+	start := time.Now()
+	if _, err := watchOnce(t, syncer, "c-1"); err != nil {
+		t.Fatalf("stream the namespace watch: %v", err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("the worker took %s for 10 namespaces without a request, want less than 2 s", took)
+	}
+	for _, request := range rancher.method(http.MethodPatch) {
+		if strings.Contains(request.path, "alpha-settled-") {
+			t.Errorf("patch of %s, want none", request.path)
+		}
+	}
+}
+
+// TestWatchDropsADeletedEventWhenTheReadFails checks a DELETED event without a
+// deletionTimestamp whose read gets status 500. The object of the event still
+// names p-alpha, which the namespace left, so the worker sends no patch.
+func TestWatchDropsADeletedEventWhenTheReadFails(t *testing.T) {
+	t.Parallel()
+	const leftEvent = `{"type":"DELETED","object":{"kind":"Namespace","metadata":` +
+		`{"name":"alpha-departed","resourceVersion":"36",` +
+		`"labels":{"field.cattle.io/projectId":"p-alpha"},` +
+		`"annotations":{"field.cattle.io/projectId":"c-1:p-alpha"}}}}`
+	rancher, logs, _, err := streamOnce(t,
+		watching("c-1", leftEvent),
+		failRefresh("alpha-departed", http.StatusInternalServerError))
+	if err != nil {
+		t.Fatalf("stream the namespace watch: %v", err)
+	}
+	if got := len(requestsOfPathAndMethod(rancher, alphaDepartedPath, http.MethodGet)); got != 1 {
+		t.Errorf("GET requests of %s = %d, want 1", alphaDepartedPath, got)
+	}
+	if got := len(requestsOfPathAndMethod(rancher, alphaDepartedPath, http.MethodPatch)); got != 0 {
+		t.Errorf("PATCH requests of %s = %d, want 0", alphaDepartedPath, got)
+	}
+	if !strings.Contains(logs.String(), `msg="the namespace request failed" cluster=c-1 namespace=alpha-departed`) {
+		t.Errorf("no failure line for the read:\n%s", logs.String())
+	}
+}
+
+// TestWatchKeepsTheResourceVersionAfterAnErrorEventThatIsNotExpired checks
+// that only code 410 starts the next stream without a resource version.
+func TestWatchKeepsTheResourceVersionAfterAnErrorEventThatIsNotExpired(t *testing.T) {
+	t.Parallel()
+	const internalErrorEvent = `{"type":"ERROR","object":{"kind":"Status","reason":"InternalError",` +
+		`"message":"etcd is busy","code":500}}`
+	_, _, version, err := streamOnce(t, watching("c-1", modifiedEvent, internalErrorEvent))
+	if err == nil || errors.Is(err, errWatchExpired) {
+		t.Fatalf("error = %v, want an error that is not errWatchExpired", err)
+	}
+	if !strings.Contains(err.Error(), "InternalError") {
+		t.Errorf("error = %v, want the reason of the event", err)
+	}
+	if version != "31" {
+		t.Errorf("resource version = %q, want 31", version)
 	}
 }
 

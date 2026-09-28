@@ -64,6 +64,41 @@ func TestParseProjectSyncConfigInsecureSkipVerify(t *testing.T) {
 	}
 }
 
+func TestParseProjectSyncConfigPatchRate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		value   string
+		wantErr bool
+	}{
+		{value: "2.5"},
+		{value: "0"},
+		{value: "NaN", wantErr: true},
+		{value: "+Inf", wantErr: true},
+		{value: "-Inf", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			t.Parallel()
+			_, err := parseProjectSyncConfig([]string{
+				"--rancher-url", "https://rancher.example.com",
+				"--token-file", "/dev/null",
+				"--labels", "cost-center",
+				"--patch-rate", tt.value,
+			}, io.Discard, noEnvironment)
+			if tt.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "-patch-rate") {
+					t.Errorf("error = %v, want an error about -patch-rate", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("parseProjectSyncConfig: %v", err)
+			}
+		})
+	}
+}
+
 func TestParseProjectSyncConfigTelemetryFlags(t *testing.T) {
 	t.Parallel()
 
