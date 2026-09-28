@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.22.2](https://github.com/evil8io/drover/compare/v0.22.1...v0.22.2) (2026-09-28)
+
+
+### Bug Fixes
+
+* **api-filter:** key the caller limits on the token and the user, and select complete projects only ([#121](https://github.com/evil8io/drover/issues/121)) ([9fe04f9](https://github.com/evil8io/drover/commit/9fe04f9a5cd663ce2f05ea4f353d0a6eff3814d3))
+* **api-filter:** take ServiceAccount namespaces from cluster rules only, and fix three watch defects ([#118](https://github.com/evil8io/drover/issues/118)) ([9ca39eb](https://github.com/evil8io/drover/commit/9ca39eb498f10b06a5798d41150af45ef1cbcd00))
+* **project-sync:** close the review findings of the watches and the accounts ([#120](https://github.com/evil8io/drover/issues/120)) ([41068ee](https://github.com/evil8io/drover/commit/41068ee8c1d920f81d059a38710fe254267de8e1))
+* **project-sync:** delete only own OpenBao objects, and write a lost config again ([#119](https://github.com/evil8io/drover/issues/119)) ([ee3b08f](https://github.com/evil8io/drover/commit/ee3b08f6abca331013d978c951ac246e451f02f4))
+* **rotate-token:** keep the mounted token at a Job retry after a reduced ttl ([#117](https://github.com/evil8io/drover/issues/117)) ([f5a9f61](https://github.com/evil8io/drover/commit/f5a9f61b25ff4c893afb2c1bd8a52267192059d4))
+* **telemetry:** redact the query of url.full at export, not at span start ([#115](https://github.com/evil8io/drover/issues/115)) ([bd8b533](https://github.com/evil8io/drover/commit/bd8b53306653d44679be549526685e94428fc4ff))
+
 ## [0.22.1](https://github.com/evil8io/drover/compare/v0.22.0...v0.22.1) (2026-09-28)
 
 
