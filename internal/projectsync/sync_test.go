@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -590,24 +592,56 @@ func TestNamespaceListFailsAfterASecondExpiredContinueToken(t *testing.T) {
 	}
 }
 
-func TestReconcileFailsTheClusterOfAPageAboveTheCap(t *testing.T) {
+// TestReconcileReadsAPageAboveTheSizeOfTheItems checks that a tenant with many
+// large namespaces on one page does not fail the list of the cluster: the
+// page has 36 MB, and each namespace is below the cap.
+func TestReconcileReadsAPageAboveTheSizeOfTheItems(t *testing.T) {
 	t.Parallel()
-	const pageCap = 4096
+	const count = 135
+	bulk := strings.Repeat("x", 256<<10)
+	var page strings.Builder
+	page.WriteString(`{"kind":"NamespaceList","items":[` + alphaTwoItem)
+	for i := range count {
+		fmt.Fprintf(&page, `,{"metadata":{"name":"tenant-%03d","labels":{"field.cattle.io/projectId":"p-gone"},`+
+			`"annotations":{"field.cattle.io/projectId":"c-1:p-gone","bulk":%q}}}`, i, bulk)
+	}
+	page.WriteString(`]}`)
+	if page.Len() <= 32<<20 {
+		t.Fatalf("the page has %d bytes, want more than 32 MiB", page.Len())
+	}
+
+	rancher := newFakeRancher(t, listing("c-1", map[string]string{"": page.String()}))
+	syncer, logs := newSyncer(t, rancher, tokenFile(t, serviceToken), func(cfg *Config) {
+		cfg.Interval = 30 * time.Second
+	})
+	syncer.reconcile(context.Background())
+
+	if got := patchedPaths(rancher); !slices.Equal(got, []string{alphaTwoPath, betaOnePath}) {
+		t.Errorf("patched paths = %v, want [%s %s]", got, alphaTwoPath, betaOnePath)
+	}
+	if !strings.Contains(logs.String(), "errors=0") {
+		t.Errorf("no summary line without errors:\n%s", logs.String())
+	}
+}
+
+func TestReconcileFailsTheClusterOfAnItemAboveTheCap(t *testing.T) {
+	t.Parallel()
+	const itemCap = 4096
 	reader := sdkmetric.NewManualReader()
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 
-	large := `{"kind":"NamespaceList","items":[{"metadata":{"name":"alpha-large",` +
+	large := `{"kind":"NamespaceList","items":[` + alphaTwoItem + `,{"metadata":{"name":"alpha-large",` +
 		`"labels":{"field.cattle.io/projectId":"p-alpha"},"annotations":{"bulk":"` +
-		strings.Repeat("x", 2*pageCap) + `"}}}]}`
+		strings.Repeat("x", 2*itemCap) + `"}}}]}`
 	rancher := newFakeRancher(t, listing("c-1", map[string]string{"": large}))
 	syncer, logs := newSyncer(t, rancher, tokenFile(t, serviceToken), func(cfg *Config) {
 		cfg.MeterProvider = provider
 	})
-	syncer.pageCap = pageCap
+	syncer.itemCap = itemCap
 	syncer.reconcile(context.Background())
 
 	want := `msg="the namespace list request failed" cluster=c-1 ` +
-		`error="decode the namespace list of cluster c-1: the page is larger than 4096 bytes"`
+		`error="decode the namespace list of cluster c-1: an item of the list is larger than 4096 bytes"`
 	if !strings.Contains(logs.String(), want) {
 		t.Errorf("no failure line with the cap:\n%s", logs.String())
 	}
@@ -625,6 +659,20 @@ func TestReconcileFailsTheClusterOfAPageAboveTheCap(t *testing.T) {
 	errs := findSum(t, data, "drover.sync.errors")
 	if len(errs.DataPoints) != 1 || errs.DataPoints[0].Value != 1 {
 		t.Errorf("drover.sync.errors points = %v, want one point with value 1", errs.DataPoints)
+	}
+}
+
+func TestNewRejectsAPatchRateThatIsNotAFiniteNumber(t *testing.T) {
+	t.Parallel()
+	target, err := url.Parse("https://rancher.example.com")
+	if err != nil {
+		t.Fatalf("parse the URL: %v", err)
+	}
+	for _, rate := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		_, err := New(Config{RancherURL: target, TokenFile: tokenFile(t, serviceToken), Labels: []string{"team"}, PatchRate: rate})
+		if err == nil {
+			t.Errorf("New with the patch rate %v returned no error", rate)
+		}
 	}
 }
 

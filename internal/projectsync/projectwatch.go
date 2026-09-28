@@ -178,17 +178,16 @@ func changedKeys(before, after map[string]string) []string {
 }
 
 // projectLister lists the namespaces of the projects of one cluster queue, one
-// project at a time. The limiter of the cluster bounds the lists together
-// with the patches of the worker.
+// project at a time. The limiter of the cluster bounds the requests of the
+// lister together with the requests of the worker.
 func (s *Syncer) projectLister(ctx context.Context, cluster string, watch *clusterWatch) {
+	ctx = withLimiter(ctx, watch.limiter)
 	for {
 		name, ok := watch.projects.next(ctx)
 		if !ok {
 			return
 		}
-		if watch.limiter.wait(ctx) {
-			s.listProject(ctx, cluster, name, watch.patches)
-		}
+		s.listProject(ctx, cluster, name, watch.patches)
 		watch.projects.done()
 		if ctx.Err() != nil {
 			return

@@ -180,7 +180,7 @@ func listPages[T any](ctx context.Context, s *Syncer, token, path, selector stri
 			return nil, err
 		}
 		var meta listMeta
-		err = decodePage(resp.Body, s.pageCap, "metadata", &meta, "items", collect(&items, prune))
+		err = decodePage(resp.Body, s.itemCap, "metadata", &meta, "items", collect(&items, prune))
 		_ = resp.Body.Close()
 		if err != nil {
 			return nil, fmt.Errorf("decode the list %s: %w", path, err)

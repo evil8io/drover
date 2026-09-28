@@ -76,9 +76,9 @@ type accountState struct {
 	// namespace.
 	namespaces map[string]string
 	// settled maps a namespace name to the key that the worker compares: the
-	// project and the uid of its account namespace, from the last run. The
-	// worker skips a namespace whose key is unchanged since that run, so a
-	// watch replay after a restart costs no request.
+	// project, the uid of its account namespace, and the uid of the namespace,
+	// from the last run. The worker skips a namespace whose key is unchanged
+	// since that run, so a watch replay after a restart costs no request.
 	settled map[string]string
 	// openbao is the uid of the OpenBao namespace when the last run trusted
 	// it, and "" otherwise. The lister gives it to the OpenBao RoleBinding of
@@ -219,6 +219,50 @@ func (s *Syncer) setAccounts(cluster string, state accountState) {
 	s.accounts = next
 }
 
+// storeAccounts replaces the account view of cluster with the view of a run.
+// before is the view at the start of the run. The lister can trust an account
+// namespace while the run is busy, so the store keeps such a trust when the
+// run did not check the project and the snapshot still has it. denied are the
+// projects whose account namespace the run did not trust.
+func (s *Syncer) storeAccounts(cluster string, state, before accountState, denied map[string]bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	live := s.clusters[cluster]
+	for name, uid := range s.accounts[cluster].namespaces {
+		if before.namespaces[name] == uid || denied[name] {
+			continue
+		}
+		if _, ok := state.namespaces[name]; ok {
+			continue
+		}
+		if _, ok := live[name]; ok {
+			state.namespaces[name] = uid
+		}
+	}
+	next := maps.Clone(s.accounts)
+	if next == nil {
+		next = make(map[string]accountState)
+	}
+	next[cluster] = state
+	s.accounts = next
+}
+
+// clearOpenBaoNamespace clears the uid of the OpenBao namespace in the view of
+// cluster. A non-empty uid clears only that uid, so that a newer uid of a run
+// stays.
+func (s *Syncer) clearOpenBaoNamespace(cluster, uid string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, ok := s.accounts[cluster]
+	if !ok || state.openbao == "" || (uid != "" && state.openbao != uid) {
+		return
+	}
+	next := maps.Clone(s.accounts)
+	state.openbao = ""
+	next[cluster] = state
+	s.accounts = next
+}
+
 // setAccountNamespace stores the uid of the account namespace of a project in
 // the view of cluster. An empty uid removes the project. A cluster without a
 // view keeps none.
@@ -244,10 +288,10 @@ func (s *Syncer) setAccountNamespace(cluster, name, uid string) {
 	s.accounts = next
 }
 
-// settledKey is the key of the worker cache for a namespace of project name,
-// whose account namespace has uid.
-func settledKey(name, uid string) string {
-	return name + "/" + uid
+// settledKey is the key of the worker cache for the namespace with the uid
+// member in project name, whose account namespace has the uid account.
+func settledKey(name, account, member string) string {
+	return name + "/" + account + "/" + member
 }
 
 // accountFailure logs a failure of the accounts, and counts it in run when
@@ -275,10 +319,19 @@ func (s *Syncer) accountChanged(ctx context.Context, run *counters, cluster, kin
 }
 
 // syncAccounts reconciles the accounts of every project of one cluster.
-// namespaces are the namespaces of the cluster with a project label. It
-// returns the OpenBao target of the cluster when the run keeps the OpenBao
-// objects, and nil otherwise.
+// namespaces are every namespace of the cluster. It returns the OpenBao target
+// of the cluster when the run keeps the OpenBao objects, and nil otherwise.
 func (s *Syncer) syncAccounts(ctx context.Context, token, cluster string, projects map[string]project, namespaces []namespace, run *counters) *openbaoTarget {
+	before, _ := s.accountsOf(cluster)
+	// The lister writes the OpenBao RoleBinding with the uid of the view, so a
+	// run that ends before its own check must not keep that uid.
+	stored := false
+	defer func() {
+		if !stored {
+			s.clearOpenBaoNamespace(cluster, "")
+		}
+	}()
+
 	self, err := s.selfID(ctx, token)
 	if err != nil {
 		s.accountFailure(ctx, run, "the user request failed", err, "cluster", cluster)
@@ -326,6 +379,7 @@ func (s *Syncer) syncAccounts(ctx context.Context, token, cluster string, projec
 
 	trusted := make(map[string]string)
 	pending := make(map[string]bool)
+	denied := make(map[string]bool)
 	for _, name := range slices.Sorted(maps.Keys(projects)) {
 		if !isTenant(projects[name], name, self) {
 			continue
@@ -337,6 +391,7 @@ func (s *Syncer) syncAccounts(ctx context.Context, token, cluster string, projec
 			pending[name] = true
 			continue
 		case trustNo:
+			denied[name] = true
 			s.dropAccountBindings(ctx, token, cluster, name, clusterBindingsOf[name], roleBindingsOf[name], run)
 			continue
 		}
@@ -380,12 +435,13 @@ func (s *Syncer) syncAccounts(ctx context.Context, token, cluster string, projec
 			continue
 		}
 		if uid, ok := trusted[name]; ok {
-			settled[item.Metadata.Name] = settledKey(name, uid)
+			settled[item.Metadata.Name] = settledKey(name, uid, item.Metadata.UID)
 		} else if !isTenant(source, name, self) {
-			settled[item.Metadata.Name] = settledKey(name, "")
+			settled[item.Metadata.Name] = settledKey(name, "", item.Metadata.UID)
 		}
 	}
-	s.setAccounts(cluster, accountState{projects: owners, namespaces: trusted, settled: settled, openbao: space})
+	s.storeAccounts(cluster, accountState{projects: owners, namespaces: trusted, settled: settled, openbao: space}, before, denied)
+	stored = true
 
 	s.sweepAccountNamespaces(ctx, token, cluster, projects, self, owners, namespaces, trusted, clusterBindingsOf, roleBindingsOf, run)
 	if account == "" {
@@ -762,20 +818,26 @@ func managedClusterBinding(item binding, name string) bool {
 // RoleBinding in its account namespace included. The service calls it when
 // the project may not use its account namespace, so that no binding grants a
 // right to a ServiceAccount of that name in a namespace of a tenant.
-func (s *Syncer) dropAccountBindings(ctx context.Context, token, cluster, name string, clusterBindings, roleBindings []binding, run *counters) {
+// It returns the count of the deletes that failed.
+func (s *Syncer) dropAccountBindings(ctx context.Context, token, cluster, name string, clusterBindings, roleBindings []binding, run *counters) int {
+	failed := 0
 	for _, item := range clusterBindings {
-		if managedClusterBinding(item, name) {
-			s.dropBinding(ctx, token, cluster, clusterRoleBindingsPath(cluster), item, name, run)
+		if managedClusterBinding(item, name) && !s.dropBinding(ctx, token, cluster, clusterRoleBindingsPath(cluster), item, name, run) {
+			failed++
 		}
 	}
 	for _, item := range roleBindings {
-		if managedRoleBinding(item) || isOpenBaoBinding(item) {
-			s.dropBinding(ctx, token, cluster, roleBindingsPath(cluster, item.Metadata.Namespace), item, name, run)
+		if (managedRoleBinding(item) || isOpenBaoBinding(item)) &&
+			!s.dropBinding(ctx, token, cluster, roleBindingsPath(cluster, item.Metadata.Namespace), item, name, run) {
+			failed++
 		}
 	}
+	return failed
 }
 
-func (s *Syncer) dropBinding(ctx context.Context, token, cluster, collection string, item binding, project string, run *counters) {
+// dropBinding deletes item at collection. It returns false when the delete
+// fails.
+func (s *Syncer) dropBinding(ctx context.Context, token, cluster, collection string, item binding, project string, run *counters) bool {
 	kind := "clusterrolebinding"
 	if item.Metadata.Namespace != "" {
 		kind = "rolebinding"
@@ -783,17 +845,20 @@ func (s *Syncer) dropBinding(ctx context.Context, token, cluster, collection str
 	if err := s.deleteObject(ctx, token, collection+"/"+item.Metadata.Name); err != nil {
 		s.accountFailure(ctx, run, "the "+kind+" delete failed", err,
 			"cluster", cluster, "project", project, "namespace", item.Metadata.Namespace, "name", item.Metadata.Name)
-		return
+		return false
 	}
 	s.accountChanged(ctx, run, cluster, kind, "delete", item.Metadata.Namespace, item.Metadata.Name, project)
+	return true
 }
 
 // dropStrayRoleBindings deletes the role bindings of the service in a
-// namespace in no project, or whose project gets no accounts. A namespace of
-// a project that the run does not know stays, because a project can be newer
-// than the project list of the run, and so does a namespace that the list of
-// the run does not have. A namespace of a pending project stays too, because
-// the check of its account namespace failed in this run.
+// namespace in no project, or whose project gets no accounts. A namespace that
+// the list of the run does not have keeps its bindings. A namespace of a
+// project that the run does not know keeps the bindings of that project,
+// because a project can be newer than the project list of the run. A
+// namespace of a pending project keeps them too, because the check of its
+// account namespace failed in this run. The bindings of another project go in
+// both cases, because they grant rights in a namespace that the project left.
 func (s *Syncer) dropStrayRoleBindings(ctx context.Context, token, cluster string, projects map[string]project, byName map[string]namespace, trusted map[string]string, pending map[string]bool, roleBindings []binding, run *counters) {
 	for _, item := range roleBindings {
 		if !managedRoleBinding(item) {
@@ -805,10 +870,12 @@ func (s *Syncer) dropStrayRoleBindings(ctx context.Context, token, cluster strin
 			continue
 		}
 		name := projectOf(member, cluster)
-		if _, ok := trusted[name]; ok || pending[name] {
+		if _, ok := trusted[name]; ok {
 			continue
 		}
-		if _, known := projects[name]; !known && name != "" {
+		_, known := projects[name]
+		waiting := pending[name] || (!known && name != "")
+		if waiting && item.Metadata.Labels[accountProjectKey] == name {
 			continue
 		}
 		s.dropBinding(ctx, token, cluster, roleBindingsPath(cluster, nsName), item, item.Metadata.Labels[accountProjectKey], run)
@@ -819,10 +886,11 @@ func (s *Syncer) dropStrayRoleBindings(ctx context.Context, token, cluster strin
 // accounts or no longer exists. A project that the run does not know counts
 // as gone only after Rancher answers 404 for it, because it can be newer than
 // the project list of the run. The bindings go first, so that no binding
-// names a ServiceAccount of a namespace that a tenant could create next.
+// names a ServiceAccount of a namespace that a tenant could create next. A
+// namespace whose bindings do not all go stays until the next run.
 func (s *Syncer) sweepAccountNamespaces(ctx context.Context, token, cluster string, projects map[string]project, self string, owners []string, namespaces []namespace, trusted map[string]string, clusterBindingsOf, roleBindingsOf map[string][]binding, run *counters) {
 	for _, item := range namespaces {
-		if !slices.Contains(owners, projectOf(item, cluster)) || item.Metadata.DeletionTimestamp != "" {
+		if item.Metadata.DeletionTimestamp != "" {
 			continue
 		}
 		// The OpenBao namespace has the prefix of an account namespace, and no
@@ -835,6 +903,13 @@ func (s *Syncer) sweepAccountNamespaces(ctx context.Context, token, cluster stri
 			continue
 		}
 		if _, ok := trusted[name]; ok {
+			continue
+		}
+		// A deleted account project leaves its namespaces in no project. A
+		// tenant can put its own namespace of that name into no project, so
+		// only a cluster role binding of the service is proof.
+		owner := projectOf(item, cluster)
+		if !slices.Contains(owners, owner) && (owner != "" || !ownsBindings(item, clusterBindingsOf[name])) {
 			continue
 		}
 		if source, known := projects[name]; known {
@@ -852,7 +927,9 @@ func (s *Syncer) sweepAccountNamespaces(ctx context.Context, token, cluster stri
 			}
 		}
 
-		s.dropAccountBindings(ctx, token, cluster, name, clusterBindingsOf[name], roleBindingsOf[name], run)
+		if s.dropAccountBindings(ctx, token, cluster, name, clusterBindingsOf[name], roleBindingsOf[name], run) > 0 {
+			continue
+		}
 		if err := s.deleteObject(ctx, token, namespacePath(cluster, item.Metadata.Name)); err != nil {
 			s.accountFailure(ctx, run, "the account namespace delete failed", err, "cluster", cluster, "project", name)
 			continue
@@ -881,9 +958,10 @@ func (s *Syncer) projectGone(ctx context.Context, token, cluster, name string) (
 // ensureProjectAccounts brings the accounts of one project up to date after a
 // project event: the account namespace, the ServiceAccounts, the cluster role
 // bindings, and, when the last run trusted the OpenBao namespace, the OpenBao
-// Role and RoleBinding, and the roles and policies in OpenBao. The worker then handles the role bindings of each namespace
-// of the project. A namespace in no project waits for the reconcile run,
-// because only the run knows the account projects for certain.
+// Role and RoleBinding, and the roles and policies in OpenBao. The worker then
+// handles the role bindings of each namespace of the project. A namespace in
+// no project waits for the reconcile run, because only the run knows the
+// account projects for certain.
 func (s *Syncer) ensureProjectAccounts(ctx context.Context, token, cluster, name string) {
 	state, ok := s.accountsOf(cluster)
 	if !ok || len(state.projects) == 0 {
@@ -921,18 +999,39 @@ func (s *Syncer) ensureProjectAccounts(ctx context.Context, token, cluster, name
 	}
 	s.ensureAccounts(ctx, token, cluster, name, accounts, nil)
 	s.ensureClusterBindings(ctx, token, cluster, name, uid, clusterBindings, nil)
-	if s.openbao != nil && state.openbao != "" {
+	if s.openbao != nil && state.openbao != "" && s.openbaoNamespaceLive(ctx, token, cluster, state) {
 		s.ensureOpenBaoAccess(ctx, token, cluster, name, state.openbao, nil, nil, nil)
 		s.writeOpenBaoProject(ctx, cluster, name)
 	}
 	s.setAccountNamespace(cluster, name, uid)
 }
 
+// openbaoNamespaceLive reports whether the OpenBao namespace of cluster still
+// has the uid that the last run trusted, in an account project of that run.
+// A tenant can delete the namespace and create it again in its own project
+// within one interval. Another uid clears the uid of the view.
+func (s *Syncer) openbaoNamespaceLive(ctx context.Context, token, cluster string, state accountState) bool {
+	var item namespace
+	found, err := s.getObject(ctx, token, namespacePath(cluster, openbaoNamespace), &item)
+	if err != nil {
+		s.accountFailure(ctx, nil, "the OpenBao namespace request failed", err, "cluster", cluster)
+		return false
+	}
+	if found && item.Metadata.UID == state.openbao && item.Metadata.DeletionTimestamp == "" &&
+		slices.Contains(state.projects, projectOf(item, cluster)) {
+		return true
+	}
+	s.logger.InfoContext(ctx, "the OpenBao namespace changed after the last reconcile run", "cluster", cluster)
+	s.clearOpenBaoNamespace(cluster, state.openbao)
+	return false
+}
+
 // applyAccounts brings the role bindings of one namespace of the queue up to
-// date. seen is the cache of the worker: the project and the account
-// namespace uid that the role bindings of a namespace follow. A namespace with
-// the name of an account namespace outside the account projects also puts
-// that project on the project queue, so that the lister checks it.
+// date. seen is the cache of the worker: the project, the account namespace
+// uid, and the namespace uid that the role bindings of a namespace follow. A
+// namespace with the name of an account namespace outside the account
+// projects also puts that project on the project queue, so that the lister
+// checks it.
 func (s *Syncer) applyAccounts(ctx context.Context, cluster string, watch *clusterWatch, item patchItem, seen map[string]string) {
 	nsName := item.target.Metadata.Name
 	if item.deleted {
@@ -946,7 +1045,7 @@ func (s *Syncer) applyAccounts(ctx context.Context, cluster string, watch *clust
 	projects := s.projectsOf(cluster)
 	name := projectOf(item.target, cluster)
 	uid := state.namespaces[name]
-	key := settledKey(name, uid)
+	key := settledKey(name, uid, item.target.Metadata.UID)
 	if cached, ok := seen[nsName]; ok && cached == key {
 		return
 	}
@@ -965,12 +1064,12 @@ func (s *Syncer) applyAccounts(ctx context.Context, cluster string, watch *clust
 		seen[nsName] = key
 		return
 	}
+	// A project that the run or the lister did not reach yet keeps its own
+	// bindings.
+	waiting := false
 	if uid == "" && name != "" {
 		source, known := projects[name]
-		if !known || isTenant(source, name, s.cachedSelf()) {
-			// A project that the run or the lister did not reach yet.
-			return
-		}
+		waiting = !known || isTenant(source, name, s.cachedSelf())
 	}
 
 	token, err := rancherclient.ReadToken(s.tokenFile)
@@ -987,7 +1086,7 @@ func (s *Syncer) applyAccounts(ctx context.Context, cluster string, watch *clust
 		s.ensureRoleBindings(ctx, token, cluster, nsName, name, uid, existing, nil)
 	} else {
 		for _, b := range existing {
-			if managedRoleBinding(b) {
+			if managedRoleBinding(b) && (!waiting || b.Metadata.Labels[accountProjectKey] != name) {
 				s.dropBinding(ctx, token, cluster, roleBindingsPath(cluster, nsName), b, b.Metadata.Labels[accountProjectKey], nil)
 			}
 		}

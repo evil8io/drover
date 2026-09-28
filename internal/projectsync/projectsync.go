@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"math"
 	"net/http"
 	"net/url"
 	"slices"
@@ -63,9 +64,9 @@ type Config struct {
 	OpenBao *OpenBaoConfig
 	// Interval is the time between two runs. Zero selects 60 s.
 	Interval time.Duration
-	// PatchRate bounds the namespace patches and the project namespace lists
-	// per second that the watches of one cluster send, together. Zero selects
-	// 10. The burst is the rate, and at least 1.
+	// PatchRate bounds the requests to Rancher per second that the watches of
+	// one cluster send, together. Zero selects 10. The burst is the rate, and
+	// at least 1.
 	PatchRate float64
 	// Logger gets one line per namespace, and one summary line per run. Nil selects slog.Default.
 	Logger *slog.Logger
@@ -106,8 +107,8 @@ type Syncer struct {
 	// reads. A decoded namespace keeps only these keys.
 	readLabels      []string
 	readAnnotations []string
-	// pageCap is the byte limit of one list page.
-	pageCap int64
+	// itemCap is the byte limit of one item of a list.
+	itemCap int64
 
 	// tokenMissing keeps the last state of the token file, so that the service
 	// logs one warning per state change.
@@ -163,6 +164,15 @@ func New(cfg Config) (*Syncer, error) {
 		if err := checkKey(key); err != nil {
 			return nil, err
 		}
+	}
+	if err := checkRecord("label", cfg.Labels, cfg.NameLabel); err != nil {
+		return nil, err
+	}
+	if err := checkRecord("annotation", cfg.Annotations, cfg.NameAnnotation); err != nil {
+		return nil, err
+	}
+	if math.IsNaN(cfg.PatchRate) || math.IsInf(cfg.PatchRate, 0) {
+		return nil, fmt.Errorf("the patch rate %v is not a finite number", cfg.PatchRate)
 	}
 
 	transport, err := rancherclient.Transport(cfg.CAFile, cfg.InsecureSkipVerify)
@@ -226,7 +236,7 @@ func New(cfg Config) (*Syncer, error) {
 		openbao:         openbao,
 		readLabels:      readLabels,
 		readAnnotations: readAnnotations,
-		pageCap:         maxBody,
+		itemCap:         maxItem,
 		interval:        interval,
 		timeout:         timeout,
 		patchRate:       patchRate,
@@ -466,6 +476,9 @@ func (s *Syncer) syncCluster(ctx context.Context, token, cluster string, project
 	if err != nil {
 		run.errors++
 		s.logListFailure(ctx, err, cluster)
+		if s.serviceAccounts {
+			s.clearOpenBaoNamespace(cluster, "")
+		}
 		return nil
 	}
 	run.namespaces += len(items)

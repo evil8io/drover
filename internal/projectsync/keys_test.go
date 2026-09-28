@@ -1,6 +1,7 @@
 package projectsync
 
 import (
+	"fmt"
 	"net/url"
 	"slices"
 	"strings"
@@ -40,6 +41,11 @@ func TestParseKeys(t *testing.T) {
 		{name: "a name that ends in a dash", list: "cost-", wantErr: true},
 		{name: "a name above 63 characters", list: strings.Repeat("a", 64), wantErr: true},
 		{name: "a prefix with a second slash", list: "example.com/team/owner", wantErr: true},
+		{name: "a prefix with an upper-case letter", list: "Example.com/team", wantErr: true},
+		{name: "a prefix with an underscore", list: "example_com/team", wantErr: true},
+		{name: "a prefix that starts with a dot", list: ".example.com/team", wantErr: true},
+		{name: "a prefix with an empty label", list: "example..com/team", wantErr: true},
+		{name: "a prefix that ends with a dash", list: "example.com-/team", wantErr: true},
 		{name: "a name with the allowed inner characters", list: "example.com/Owner_1.a-b",
 			want: []string{"example.com/Owner_1.a-b"}},
 	}
@@ -120,6 +126,62 @@ func TestNewAcceptsANameKeyAlone(t *testing.T) {
 				NameAnnotation: test.nameAnnotation,
 			})
 			if err != nil {
+				t.Errorf("New returned an error: %v", err)
+			}
+		})
+	}
+}
+
+// longKey returns a key of 317 characters, the longest valid key: a prefix
+// of 253 characters, and a name of 63 characters.
+func longKey(i int) string {
+	prefix := fmt.Sprintf("k%02d.", i) + strings.Repeat("a", 62) + "." + strings.Repeat("b", 62) + "." +
+		strings.Repeat("c", 62) + "." + strings.Repeat("d", 60)
+	return prefix + "/" + strings.Repeat("n", 63)
+}
+
+// TestNewRejectsKeysWhoseRecordIsAboveTheBound checks that the ownership
+// record of the keys fits in maxRecordValue. The prune drops a longer record,
+// and the service then never removes a key.
+func TestNewRejectsKeysWhoseRecordIsAboveTheBound(t *testing.T) {
+	t.Parallel()
+	target, err := url.Parse("https://rancher.example.com")
+	if err != nil {
+		t.Fatalf("parse the URL: %v", err)
+	}
+	if got := len(longKey(0)); got != 317 {
+		t.Fatalf("length of the long key = %d, want 317", got)
+	}
+	keys := func(n int) []string {
+		var out []string
+		for i := range n {
+			out = append(out, longKey(i))
+		}
+		return out
+	}
+
+	tests := []struct {
+		name    string
+		cfg     Config
+		wantErr bool
+	}{
+		{name: "12 label keys", cfg: Config{Labels: keys(12)}},
+		{name: "13 label keys", cfg: Config{Labels: keys(13)}, wantErr: true},
+		{name: "12 label keys and a name label", cfg: Config{Labels: keys(12), NameLabel: longKey(12)}, wantErr: true},
+		{name: "12 annotation keys and a name annotation", cfg: Config{Annotations: keys(12), NameAnnotation: longKey(12)}, wantErr: true},
+		{name: "12 label keys and 12 annotation keys", cfg: Config{Labels: keys(12), Annotations: keys(12)}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := test.cfg
+			cfg.RancherURL = target
+			cfg.TokenFile = tokenFile(t, serviceToken)
+			_, err := New(cfg)
+			if test.wantErr && err == nil {
+				t.Error("New returned no error")
+			}
+			if !test.wantErr && err != nil {
 				t.Errorf("New returned an error: %v", err)
 			}
 		})

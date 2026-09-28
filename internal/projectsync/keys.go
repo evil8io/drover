@@ -3,6 +3,7 @@ package projectsync
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
 	"slices"
 	"strings"
@@ -14,6 +15,9 @@ var reservedDomains = []string{"cattle.io", "kubernetes.io", "k8s.io"}
 
 // qualifiedName is the name part of a Kubernetes label or annotation key.
 var qualifiedName = regexp.MustCompile(`^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$`)
+
+// dnsSubdomain is the prefix part of a Kubernetes label or annotation key.
+var dnsSubdomain = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
 
 const (
 	maxKeyNameLength   = 63
@@ -80,13 +84,31 @@ func checkKey(key string) error {
 	if len(name) > maxKeyNameLength || !qualifiedName.MatchString(name) {
 		return fmt.Errorf("the metadata key %q has no valid name: at most %d characters, alphanumeric at both ends, with - _ . inside", key, maxKeyNameLength)
 	}
-	if hasPrefix && (prefix == "" || len(prefix) > maxKeyPrefixLength || strings.ContainsAny(prefix, " /")) {
-		return fmt.Errorf("the metadata key %q has no valid prefix", key)
+	if hasPrefix && (len(prefix) > maxKeyPrefixLength || !dnsSubdomain.MatchString(prefix)) {
+		return fmt.Errorf("the metadata key %q has no valid prefix: a DNS subdomain in lower case, at most %d characters", key, maxKeyPrefixLength)
 	}
 	for _, domain := range reservedDomains {
 		if prefix == domain || strings.HasSuffix(prefix, "."+domain) {
 			return fmt.Errorf("the metadata key %q is under %s, and Rancher or Kubernetes owns that domain", key, domain)
 		}
+	}
+	return nil
+}
+
+// checkRecord returns an error when the ownership record of keys and nameKey
+// is longer than maxRecordValue. The prune drops a longer record, and the
+// service then never removes a key of it. kind names the keys in the error.
+func checkRecord(kind string, keys []string, nameKey string) error {
+	set := make(map[string]struct{}, len(keys)+1)
+	for _, key := range keys {
+		set[key] = struct{}{}
+	}
+	if nameKey != "" {
+		set[nameKey] = struct{}{}
+	}
+	record := strings.Join(slices.Sorted(maps.Keys(set)), ",")
+	if len(record) > maxRecordValue {
+		return fmt.Errorf("the %s keys need an ownership record of %d bytes, and the limit is %d bytes", kind, len(record), maxRecordValue)
 	}
 	return nil
 }

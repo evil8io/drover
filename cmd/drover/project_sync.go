@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -185,7 +186,7 @@ func parseProjectSyncConfig(args []string, output io.Writer, getenv func(string)
 		"longest lifetime of a credential of a project role that OpenBao creates")
 	flags.DurationVar(&cfg.interval, "interval", 60*time.Second, "time between two runs")
 	flags.Float64Var(&cfg.patchRate, "patch-rate", 10,
-		"namespace patches and project namespace lists per second that the watches of one cluster send, together")
+		"requests to Rancher per second that the watches of one cluster send, together")
 	flags.StringVar(&logLevel, "log-level", "info", "debug, info, warn or error")
 	tf := registerTelemetryFlags(flags, getenv)
 
@@ -211,6 +212,9 @@ func parseProjectSyncConfig(args []string, output io.Writer, getenv func(string)
 	}
 	if cfg.interval <= 0 {
 		return projectSyncConfig{}, fmt.Errorf("-interval %s is not positive", cfg.interval)
+	}
+	if math.IsNaN(cfg.patchRate) || math.IsInf(cfg.patchRate, 0) {
+		return projectSyncConfig{}, fmt.Errorf("-patch-rate %v is not a finite number", cfg.patchRate)
 	}
 
 	if cfg.labels, err = projectsync.ParseKeys(labels); err != nil {

@@ -24,6 +24,11 @@ const (
 	maxBody        = 32 << 20
 	pageSize       = 500
 	maxRecordValue = 4096
+
+	// maxItem is the byte limit of one item of a list. etcd stores an object
+	// of at most 1.5 MiB by default, and the JSON form of an object can be
+	// larger, for example with escaped characters in its annotations.
+	maxItem = 4 << 20
 )
 
 // errListExpired marks a namespace list whose continue token is too old.
@@ -117,8 +122,8 @@ func pick(values map[string]string, keys []string) map[string]string {
 	return out
 }
 
-// watchEvent is one event of a namespace watch stream. The object is a
-// Namespace on every type but ERROR, which carries a Status.
+// watchEvent is one event of a watch stream. The object is a Namespace or a
+// Project on every type but ERROR, which has a Status.
 type watchEvent struct {
 	Type   string          `json:"type"`
 	Object json.RawMessage `json:"object"`
@@ -133,19 +138,21 @@ func (e watchEvent) namespace() (namespace, error) {
 	return item, nil
 }
 
-// status returns the reason and the message of an ERROR event, as one line.
-func (e watchEvent) status() string {
+// status returns the code of an ERROR event, and an error with its code, its
+// reason, and its message.
+func (e watchEvent) status() (int, error) {
 	var answer kubeStatus
 	if err := json.Unmarshal(e.Object, &answer); err != nil {
-		return "the watch returned an error event"
+		return 0, errors.New("the watch returned an error event")
 	}
-	return fmt.Sprintf("the watch returned an error event: %s %s", answer.Reason, answer.Message)
+	return answer.Code, fmt.Errorf("the watch returned an error event: %d %s %s", answer.Code, answer.Reason, answer.Message)
 }
 
 // kubeStatus is the part of a Kubernetes Status object that the service reads.
 type kubeStatus struct {
 	Reason  string `json:"reason"`
 	Message string `json:"message"`
+	Code    int    `json:"code,omitempty"`
 }
 
 // statusError is an answer of Rancher with a status that the service does not expect.
@@ -230,7 +237,7 @@ func (s *Syncer) projectPage(ctx context.Context, token, target string) ([]proje
 		items []project
 		next  pagination
 	)
-	if err := decodePage(resp.Body, s.pageCap, "pagination", &next, "data", collect(&items, s.pruneProject)); err != nil {
+	if err := decodePage(resp.Body, s.itemCap, "pagination", &next, "data", collect(&items, s.pruneProject)); err != nil {
 		return nil, "", fmt.Errorf("decode the project list: %w", err)
 	}
 	return items, next.Next, nil
@@ -295,7 +302,7 @@ func (s *Syncer) namespacePage(ctx context.Context, token, cluster, selector, ne
 		items []namespace
 		meta  listMeta
 	)
-	if err := decodePage(resp.Body, s.pageCap, "metadata", &meta, "items", collect(&items, s.pruneNamespace)); err != nil {
+	if err := decodePage(resp.Body, s.itemCap, "metadata", &meta, "items", collect(&items, s.pruneNamespace)); err != nil {
 		return nil, "", fmt.Errorf("decode the namespace list of cluster %s: %w", cluster, err)
 	}
 	return items, meta.Continue, nil
@@ -304,33 +311,66 @@ func (s *Syncer) namespacePage(ctx context.Context, token, cluster, selector, ne
 // decodePage decodes one page of a list from body as a stream. It passes the
 // decoder to item once per element of the array at itemsKey, decodes the
 // value at metaKey into meta, and skips every other key. The keys can come in
-// any order. A body larger than limit bytes returns an error that names the
-// limit.
+// any order. A value larger than limit bytes returns an error that names the
+// limit. The limit is per value, so that the large objects of one tenant do
+// not fail the page.
 func decodePage(body io.Reader, limit int64, metaKey string, meta any, itemsKey string, item func(*json.Decoder) error) error {
-	limited := &io.LimitedReader{R: body, N: limit + 1}
-	err := walkPage(json.NewDecoder(limited), metaKey, meta, itemsKey, item)
-	if err != nil && limited.N == 0 {
-		return fmt.Errorf("the page is larger than %d bytes", limit)
-	}
-	return err
+	reader := &itemReader{r: body, max: limit}
+	return walkPage(pageDecoder{dec: json.NewDecoder(reader), reader: reader}, metaKey, meta, itemsKey, item)
 }
 
-func walkPage(dec *json.Decoder, metaKey string, meta any, itemsKey string, item func(*json.Decoder) error) error {
+// itemReader returns an error when the decoder reads past limit, which
+// pageDecoder moves before each call of the decoder.
+type itemReader struct {
+	r     io.Reader
+	max   int64
+	read  int64
+	limit int64
+}
+
+func (r *itemReader) Read(p []byte) (int, error) {
+	if r.read >= r.limit {
+		return 0, fmt.Errorf("an item of the list is larger than %d bytes", r.max)
+	}
+	if left := r.limit - r.read; int64(len(p)) > left {
+		p = p[:left]
+	}
+	n, err := r.r.Read(p)
+	r.read += int64(n)
+	return n, err
+}
+
+// pageDecoder gives each value of a page max bytes from its start.
+type pageDecoder struct {
+	dec    *json.Decoder
+	reader *itemReader
+}
+
+func (p pageDecoder) next() *json.Decoder {
+	p.reader.limit = p.dec.InputOffset() + p.reader.max
+	return p.dec
+}
+
+func (p pageDecoder) token() (json.Token, error) { return p.next().Token() }
+func (p pageDecoder) more() bool                 { return p.next().More() }
+func (p pageDecoder) decode(v any) error         { return p.next().Decode(v) }
+
+func walkPage(dec pageDecoder, metaKey string, meta any, itemsKey string, item func(*json.Decoder) error) error {
 	if err := expectDelim(dec, '{'); err != nil {
 		return err
 	}
-	for dec.More() {
-		key, err := dec.Token()
+	for dec.more() {
+		key, err := dec.token()
 		if err != nil {
 			return err
 		}
 		switch key {
 		case metaKey:
-			err = dec.Decode(meta)
+			err = dec.decode(meta)
 		case itemsKey:
 			err = walkItems(dec, item)
 		default:
-			err = dec.Decode(new(json.RawMessage))
+			err = dec.decode(new(json.RawMessage))
 		}
 		if err != nil {
 			return err
@@ -341,24 +381,24 @@ func walkPage(dec *json.Decoder, metaKey string, meta any, itemsKey string, item
 
 // walkItems passes the decoder to item once per element of the array that
 // comes next. A null array has no element.
-func walkItems(dec *json.Decoder, item func(*json.Decoder) error) error {
-	token, err := dec.Token()
+func walkItems(dec pageDecoder, item func(*json.Decoder) error) error {
+	token, err := dec.token()
 	if err != nil || token == nil {
 		return err
 	}
 	if token != json.Delim('[') {
 		return fmt.Errorf("the item list is %v, not an array", token)
 	}
-	for dec.More() {
-		if err := item(dec); err != nil {
+	for dec.more() {
+		if err := item(dec.next()); err != nil {
 			return err
 		}
 	}
 	return expectDelim(dec, ']')
 }
 
-func expectDelim(dec *json.Decoder, want json.Delim) error {
-	token, err := dec.Token()
+func expectDelim(dec pageDecoder, want json.Delim) error {
+	token, err := dec.token()
 	if err != nil {
 		return err
 	}
@@ -403,6 +443,9 @@ func (s *Syncer) patchNamespace(ctx context.Context, token, cluster, name string
 // response with the body open, and the request timeout lasts until the caller
 // closes the body. Another status returns a statusError.
 func (s *Syncer) getList(ctx context.Context, path, target, token string) (*http.Response, error) {
+	if err := takeToken(ctx); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	resp, err := s.openStream(ctx, target, token)
 	if err != nil {
@@ -475,6 +518,9 @@ func (s *Syncer) nextTarget(next string) (string, error) {
 }
 
 func (s *Syncer) do(ctx context.Context, method, target, token, contentType string, body []byte) (int, []byte, error) {
+	if err := takeToken(ctx); err != nil {
+		return 0, nil, err
+	}
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 

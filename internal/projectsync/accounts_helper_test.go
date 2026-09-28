@@ -76,6 +76,11 @@ type accountsFake struct {
 	// patchFailures is the status that a PATCH of a namespace answers,
 	// instead of applying it, by namespace name.
 	patchFailures map[string]int
+	// failures is the status that a request answers instead, by method and
+	// path, as "METHOD path".
+	failures map[string]int
+	// hook sees every request after the record, without the store lock.
+	hook func(method, path string)
 	// tokenClock is the start of the lifetime of a token that a token request
 	// answers, and tokenCap is the longest lifetime that the fake grants, zero
 	// for none. tokens counts the answered token requests.
@@ -199,6 +204,23 @@ func (f *accountsFake) failPatch(name string, status int) {
 	f.patchFailures[name] = status
 }
 
+// fail answers every request of method at path with status.
+func (f *accountsFake) fail(method, path string, status int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failures == nil {
+		f.failures = make(map[string]int)
+	}
+	f.failures[method+" "+path] = status
+}
+
+// onRequest calls hook for every later request.
+func (f *accountsFake) onRequest(hook func(method, path string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hook = hook
+}
+
 func (f *accountsFake) addRoleBinding(ns string, b binding) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -310,6 +332,17 @@ func (f *accountsFake) writes() []recorded {
 func (f *accountsFake) serve(w http.ResponseWriter, r *http.Request) {
 	f.record(r)
 	w.Header().Set("Content-Type", "application/json")
+
+	f.mu.Lock()
+	status, hook := f.failures[r.Method+" "+r.URL.Path], f.hook
+	f.mu.Unlock()
+	if hook != nil {
+		hook(r.Method, r.URL.Path)
+	}
+	if status != 0 {
+		writeStatus(w, status, "InternalError", "the request failed")
+		return
+	}
 
 	path := r.URL.Path
 	switch {

@@ -87,6 +87,9 @@ type fakeRancher struct {
 	// name. This is the read that refreshItem makes after a DELETED event
 	// without a deletionTimestamp. A name without an entry gets status 404.
 	freshNamespaces map[string]string
+	// freshStatus is the status that answers a GET of one namespace instead,
+	// by name.
+	freshStatus map[string]int
 	// lists are the pages of the namespace list of a cluster, by the continue
 	// token that selects the page. The empty token selects the first page. A
 	// cluster without an entry gets its fixed list.
@@ -212,6 +215,16 @@ func refreshed(name, body string) func(*fakeRancher) {
 	}
 }
 
+// failRefresh answers a GET of the single namespace name with status.
+func failRefresh(name string, status int) func(*fakeRancher) {
+	return func(f *fakeRancher) {
+		if f.freshStatus == nil {
+			f.freshStatus = make(map[string]int)
+		}
+		f.freshStatus[name] = status
+	}
+}
+
 func (f *fakeRancher) serve(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	f.mu.Lock()
@@ -295,7 +308,13 @@ func (f *fakeRancher) serveNamespaceItem(w http.ResponseWriter, r *http.Request)
 	name := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
 	f.mu.Lock()
 	body, ok := f.freshNamespaces[name]
+	status := f.freshStatus[name]
 	f.mu.Unlock()
+	if status != 0 {
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, `{"kind":"Status","reason":"InternalError"}`)
+		return
+	}
 	if !ok {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
