@@ -396,6 +396,9 @@ func (s *Syncer) refreshOpenBao(ctx context.Context, token string, names []strin
 		run.errors++
 		s.logFailure(ctx, slog.LevelError, "the OpenBao policy list request failed", err)
 	}
+	if policies != nil {
+		run.errors += s.dropOrphanPolicies(ctx, token, names, projects, policies)
+	}
 
 	var mu sync.Mutex
 	eachCluster(slices.Sorted(maps.Keys(ready)), func(cluster string) {

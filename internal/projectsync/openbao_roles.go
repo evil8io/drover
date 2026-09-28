@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
 	"slices"
@@ -396,6 +397,78 @@ func (s *Syncer) dropGoneCredentials(ctx context.Context, token, cluster string,
 			continue
 		}
 		s.openbaoChanged(ctx, cluster, "role", "delete", name)
+	}
+	return errs
+}
+
+// parsePolicyName returns the cluster, the project, and the role of an ACL
+// policy name of the service. The cluster is the longest id of clusters that
+// fits, because one cluster id can start with another. It returns false for a
+// name that does not parse.
+func (w *openbaoWriter) parsePolicyName(name string, clusters []string) (string, string, accountRole, bool) {
+	rest, ok := strings.CutPrefix(name, strings.ReplaceAll(w.mountPrefix, "/", "-")+"-")
+	if !ok {
+		return "", "", accountRole{}, false
+	}
+	cluster := ""
+	for _, candidate := range clusters {
+		if len(candidate) > len(cluster) && strings.HasPrefix(rest, candidate+"-") {
+			cluster = candidate
+		}
+	}
+	if cluster == "" {
+		return "", "", accountRole{}, false
+	}
+	project, role, ok := parseRoleName(strings.TrimPrefix(rest, cluster+"-"))
+	if !ok {
+		return "", "", accountRole{}, false
+	}
+	return cluster, project, role, true
+}
+
+// dropOrphanPolicies deletes every ACL policy of the service whose project is
+// gone, also when its role is gone already. A failed write or an earlier
+// writer can leave such a policy. names are the clusters of the run, and a
+// policy of another cluster stays. projects are the projects of the run by
+// cluster. A project that the run and the project watch do not know counts as
+// gone only after Rancher answers 404 for it. dropOrphanPolicies removes each
+// deleted name from policies, and returns the count of errors.
+func (s *Syncer) dropOrphanPolicies(ctx context.Context, token string, names []string, projects map[string]map[string]project, policies map[string]bool) int {
+	w := s.openbao
+	errs := 0
+	gone := make(map[string]bool)
+	for _, name := range slices.Sorted(maps.Keys(policies)) {
+		cluster, project, _, ok := w.parsePolicyName(name, names)
+		if !ok {
+			continue
+		}
+		if _, known := projects[cluster][project]; known {
+			continue
+		}
+		if _, live := s.projectsOf(cluster)[project]; live {
+			continue
+		}
+		key := cluster + ":" + project
+		isGone, checked := gone[key]
+		if !checked {
+			var err error
+			if isGone, err = s.projectGone(ctx, token, cluster, project); err != nil {
+				errs++
+				s.logFailure(ctx, slog.LevelError, "the project request failed", err, "cluster", cluster, "project", project)
+				continue
+			}
+			gone[key] = isGone
+		}
+		if !isGone {
+			continue
+		}
+		if err := w.call(ctx, http.MethodDelete, openbaoACLPath+"/"+name, nil, nil, nil); err != nil {
+			errs++
+			s.openbaoObjectFailure(ctx, cluster, "policy", "delete", name, err)
+			continue
+		}
+		delete(policies, name)
+		s.openbaoChanged(ctx, cluster, "policy", "delete", name)
 	}
 	return errs
 }

@@ -67,8 +67,8 @@ With `--openbao-address` as well, the service writes the OpenBao state that foll
 | `--openbao-mount-prefix` | `kubernetes` | Path prefix of the secrets engine mounts. The config of a cluster is at `<prefix>/<cluster id>/config`. |
 | `--openbao-rancher-url` | | URL of Rancher that OpenBao uses. Use `https://`. The path must be empty or `/`. Required with `--openbao-address`. |
 | `--openbao-token-ttl` | `24h` | Requested lifetime of the token of a cluster. The minimum is `10m`. The API server can shorten it. |
-| `--openbao-credential-ttl` | `10m` | Default lifetime of a credential of a project role, the `token_default_ttl` of its role. The minimum is `1s`. |
-| `--openbao-credential-max-ttl` | `1h` | Longest lifetime of a credential of a project role, the `token_max_ttl` of its role. It must not be shorter than `--openbao-credential-ttl`. |
+| `--openbao-credential-ttl` | `15m` | Default lifetime of a credential of a project role, the `token_default_ttl` of its role. The minimum is `1s`. |
+| `--openbao-credential-max-ttl` | `2h` | Longest lifetime of a credential of a project role, the `token_max_ttl` of its role. It must not be shorter than `--openbao-credential-ttl`. |
 | `--interval` | `60s` | Time between two runs. |
 | `--patch-rate` | `10` | Namespace patches and project namespace lists per second that the watches of one cluster send, together. |
 | `--listen` | `:8080` | Address the service listens on. |
@@ -192,7 +192,8 @@ The names are those of the earlier operator objects, so a client keeps its paths
 
 - The project watch writes the roles and the policies of a new or changed project within seconds, together with its ServiceAccounts and its Role `drover-openbao`. It writes without a read. It skips an object that the service read or wrote in the last 10 minutes, so a storm of project events causes no requests.
 - Each reconcile run lists the roles of every mount and the ACL policies. It creates a missing role or policy. It reads an existing one at most once per 10 minutes, and corrects it when it differs. The compare of a policy ignores the space around its text.
-- The reconcile run deletes the policies and the roles of a project that the cluster no longer has. It does this only after it read the full project list, and after Rancher answers 404 for that project, because the project list of a run can be older than a new project. The policy goes before the role. The service finds these objects from the role names in the mount of the cluster, so it never deletes a policy without a role of the service.
+- The reconcile run deletes the policies and the roles of a project that the cluster no longer has. It does this only after it read the full project list, and after Rancher answers 404 for that project, because the project list of a run can be older than a new project. The policy goes before the role. The service finds these objects from the role names in the mount of the cluster, and from the names of the ACL policies.
+- A policy name has the form `<prefix>-<cluster id>-<project>-<role>`. The service reads the cluster id as the longest id of a cluster of the run that fits, and the rest up to the role as the project. A policy of a cluster outside the run stays, and so does a name that does not have this form. So a policy without a role, which a failed write or an earlier writer can leave, goes too.
 - A failed list of the roles of a mount skips the roles and the deletes of that cluster. A failed list of the policies skips the policies and every delete.
 
 ## Telemetry

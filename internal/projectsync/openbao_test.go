@@ -720,7 +720,7 @@ func TestNewChecksTheOpenBaoConfig(t *testing.T) {
 		return OpenBaoConfig{
 			Address: address, AuthPath: "kubernetes", Role: baoRole, JWTFile: "/token",
 			MountPrefix: "kubernetes", RancherURL: rancher, TokenTTL: 24 * time.Hour,
-			CredentialTTL: 10 * time.Minute, CredentialMaxTTL: time.Hour,
+			CredentialTTL: 15 * time.Minute, CredentialMaxTTL: 2 * time.Hour,
 		}
 	}
 	insecure, _ := url.Parse("http://rancher.example.com")
@@ -901,8 +901,8 @@ func wantRoleData(project, role string) map[string]any {
 		"kubernetes_role_name":                  "",
 		"generated_role_rules":                  "",
 		"token_default_audiences":               []any{},
-		"token_default_ttl":                     float64(600),
-		"token_max_ttl":                         float64(3600),
+		"token_default_ttl":                     float64(900),
+		"token_max_ttl":                         float64(7200),
 	}
 }
 
@@ -1140,5 +1140,86 @@ func TestOpenBaoLogsInAgainOnceAfterA403(t *testing.T) {
 	}
 	if !strings.Contains(setup.logs.String(), `level=ERROR msg="the OpenBao policy list request failed"`) {
 		t.Errorf("no error line for the denied policy list:\n%s", setup.logs.String())
+	}
+}
+
+func TestParsePolicyNameTakesTheLongestClusterId(t *testing.T) {
+	t.Parallel()
+	w := &openbaoWriter{mountPrefix: "kubernetes"}
+	clusters := []string{"c-1", "c-1-x", "local"}
+
+	cases := []struct {
+		name, cluster, project, role string
+		ok                           bool
+	}{
+		{"kubernetes-c-1-p-a-read-only", "c-1", "p-a", "read-only", true},
+		{"kubernetes-c-1-x-p-a-project-owner", "c-1-x", "p-a", "project-owner", true},
+		{"kubernetes-local-p-b-project-member", "local", "p-b", "project-member", true},
+		{"kubernetes-c-9-p-a-read-only", "", "", "", false},
+		{"kubernetes-c-1-p-a-admin", "", "", "", false},
+		{"kubernetes-c-1-read-only", "", "", "", false},
+		{"other-c-1-p-a-read-only", "", "", "", false},
+	}
+	for _, tc := range cases {
+		cluster, project, role, ok := w.parsePolicyName(tc.name, clusters)
+		if ok != tc.ok || cluster != tc.cluster || project != tc.project || role.name != tc.role {
+			t.Errorf("parsePolicyName(%q) = %q, %q, %q, %v; want %q, %q, %q, %v",
+				tc.name, cluster, project, role.name, ok, tc.cluster, tc.project, tc.role, tc.ok)
+		}
+	}
+}
+
+func TestReconcileDeletesAnOrphanPolicyOfAGoneProject(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	fake.addUnlistedProject("p-known", nil)
+	setup := newOpenBaoSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+
+	kept := []string{
+		policyNameOf("p-known", "read-only"),
+		"kubernetes-c-9-p-gone-read-only",
+		"kubernetes-c-1-p-gone-admin",
+		"kubernetes-c-1",
+	}
+	orphan := policyNameOf("p-gone", "project-owner")
+	for _, name := range append([]string{orphan}, kept...) {
+		setup.bao.setPolicy(name, "# test")
+	}
+	setup.bao.reset()
+	setup.syncer.reconcile(context.Background())
+
+	if _, ok := setup.bao.policy(orphan); ok {
+		t.Errorf("the orphan policy %s stays", orphan)
+	}
+	for _, name := range kept {
+		if _, ok := setup.bao.policy(name); !ok {
+			t.Errorf("the policy %s is deleted", name)
+		}
+	}
+	if got := countRequests(setup.bao.all(), http.MethodDelete, "/v1/sys/policies/acl/"+orphan); got != 1 {
+		t.Errorf("deletes of the orphan policy = %d, want 1", got)
+	}
+	if got := fake.requestsOfPath(projectsPath + "/c-9:p-gone"); len(got) != 0 {
+		t.Errorf("project requests of a cluster outside the run = %d, want 0", len(got))
+	}
+	assertCredentials(t, setup.bao, "p-alpha")
+}
+
+func TestReconcileDeletesNoOrphanPolicyWithoutTheFullProjectList(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	setup := newOpenBaoSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+
+	orphan := policyNameOf("p-gone", "project-owner")
+	setup.bao.setPolicy(orphan, "# test")
+	fake.setListStatus(http.StatusInternalServerError)
+	setup.syncer.reconcile(context.Background())
+
+	if _, ok := setup.bao.policy(orphan); !ok {
+		t.Error("the orphan policy is deleted without the full project list")
 	}
 }

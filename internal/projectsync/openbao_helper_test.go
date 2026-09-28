@@ -364,8 +364,8 @@ func newOpenBaoSetup(t *testing.T, fake *accountsFake, opts ...func(*Config)) *o
 			RancherURL:  rancher,
 			TokenTTL:    24 * time.Hour,
 
-			CredentialTTL:    10 * time.Minute,
-			CredentialMaxTTL: time.Hour,
+			CredentialTTL:    15 * time.Minute,
+			CredentialMaxTTL: 2 * time.Hour,
 		}
 	}}, opts...)...)
 
