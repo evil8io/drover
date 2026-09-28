@@ -323,7 +323,7 @@ func TestRunClampedTTLInsideTheRenewWindowFailsTheRun(t *testing.T) {
 	if err == nil {
 		t.Fatal("Run returned no error")
 	}
-	if !strings.Contains(err.Error(), "not longer than the renew window") {
+	if !strings.Contains(err.Error(), "less than the renew window") {
 		t.Errorf("the error is %q, and the test expects the renew window", err)
 	}
 
@@ -337,6 +337,144 @@ func TestRunClampedTTLInsideTheRenewWindowFailsTheRun(t *testing.T) {
 	}
 	h.assertLog(t, `"reason":"window"`, `"outcome":"clamped"`)
 	h.assertNoSecret(t)
+}
+
+func TestRunReducedTTLNearTheRenewWindowFailsTheRun(t *testing.T) {
+	t.Parallel()
+	rancher := newFakeRancher(t)
+	rancher.grantedTTL = (24*time.Hour + 30*time.Minute).Milliseconds()
+	kube := newFakeKube(t, nil)
+	h := newHarness(t, kube, rancher)
+
+	err := h.run()
+	if err == nil {
+		t.Fatal("Run returned no error")
+	}
+	if !strings.Contains(err.Error(), "less than the renew window") {
+		t.Errorf("the error is %q, and the test expects the renew window", err)
+	}
+	assertRoutes(t, rancher.routes(), rotationRoutes)
+	h.assertLog(t, `"reason":"window"`, `"outcome":"clamped"`)
+	h.assertNoSecret(t)
+}
+
+func TestRunRequestedTTLNearTheRenewWindowPasses(t *testing.T) {
+	t.Parallel()
+	rancher := newFakeRancher(t)
+	kube := newFakeKube(t, nil)
+	h := newHarness(t, kube, rancher)
+	h.cfg.TTL = 24*time.Hour + 30*time.Minute
+
+	if err := h.run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	assertRoutes(t, rancher.routes(), rotationRoutes)
+}
+
+func TestRunRetryAfterAReducedTTLKeepsTheMountedToken(t *testing.T) {
+	t.Parallel()
+	rancher := newFakeRancher(t)
+	rancher.grantedTTL = (24 * time.Hour).Milliseconds()
+	mounted := rancher.addToken("token-mounted", testDescription, 30*time.Hour, 48*time.Hour, true)
+	kube := newFakeKube(t, map[string]string{testKey: mounted.value})
+	h := newHarness(t, kube, rancher)
+
+	if err := h.run(); err == nil {
+		t.Fatal("the first Run returned no error")
+	}
+	rotated := kube.value(testKey)
+	if rotated == mounted.value {
+		t.Fatal("the first Run did not rotate the token")
+	}
+	first := len(rancher.all())
+
+	// A Job retry after the non-zero exit, before the kubelet updates the
+	// mounted Secret.
+	err := h.run()
+
+	created, _, _ := strings.Cut(rotated, ":")
+	want := []string{created, "token-mounted"}
+	slices.Sort(want)
+	assertRoutes(t, rancher.names(), want)
+	assertRoutes(t, rancher.routes()[first:], []string{"GET /v3/tokens/" + created})
+	if got := kube.value(testKey); got != rotated {
+		t.Errorf("the retry changed the Secret to %q", got)
+	}
+	if err == nil || !strings.Contains(err.Error(), "younger than") {
+		t.Errorf("the retry returned %v, and the test expects the young token", err)
+	}
+	h.assertNoSecret(t)
+}
+
+func TestRunTokenInsideRenewWindowByAge(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		age        time.Duration
+		ttl        time.Duration
+		wantRotate bool
+	}{
+		{"younger than the minimum age", minRotateAge - time.Second, 24 * time.Hour, false},
+		{"at the minimum age", minRotateAge, 24 * time.Hour, true},
+		{"young and expired", 2 * time.Minute, time.Minute, true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			rancher := newFakeRancher(t)
+			token := rancher.addToken("token-current", testDescription, test.age, test.ttl, true)
+			kube := newFakeKube(t, map[string]string{testKey: token.value})
+			h := newHarness(t, kube, rancher)
+
+			err := h.run()
+
+			rotated := slices.Contains(rancher.routes(), "POST /v3-public/localProviders/local?action=login")
+			if rotated != test.wantRotate {
+				t.Errorf("the run rotated: %t, and the test expects %t", rotated, test.wantRotate)
+			}
+			if gotErr := err != nil; gotErr == test.wantRotate {
+				t.Errorf("Run returned %v, and the test expects an error: %t", err, !test.wantRotate)
+			}
+			h.assertNoSecret(t)
+		})
+	}
+}
+
+func TestRunPruneKeepsALoginTokenOfTheSecret(t *testing.T) {
+	t.Parallel()
+	rancher := newFakeRancher(t)
+	mounted := rancher.addToken("token-mounted", testDescription+" login", time.Hour, 16*time.Hour, false)
+	rancher.addToken("token-stale-login", testDescription+" login", 2*time.Hour, 16*time.Hour, false)
+	kube := newFakeKube(t, map[string]string{testKey: mounted.value})
+	h := newHarness(t, kube, rancher)
+
+	if err := h.run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	created, _, _ := strings.Cut(kube.value(testKey), ":")
+	want := []string{created, "token-mounted"}
+	slices.Sort(want)
+	assertRoutes(t, rancher.names(), want)
+	h.assertLog(t, `"step":"token_prune"`, `"secret_token":"token-mounted"`, `"deleted":1`)
+	h.assertNoSecret(t)
+}
+
+func TestNewRejectsAnHTTPKubeURL(t *testing.T) {
+	t.Parallel()
+	rancher := newFakeRancher(t)
+	kube := newFakeKube(t, nil)
+	h := newHarness(t, kube, rancher)
+	h.cfg.Kube.Scheme = "http"
+
+	err := h.run()
+	if err == nil {
+		t.Fatal("Run returned no error")
+	}
+	if !strings.Contains(err.Error(), "is not https") {
+		t.Errorf("the error is %q, and the test expects https", err)
+	}
+	assertRoutes(t, kube.routes(), []string{})
 }
 
 func TestRunExpiryWithoutExpiresAt(t *testing.T) {

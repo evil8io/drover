@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"net/url"
 	"time"
-	"unicode/utf8"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
@@ -41,6 +40,11 @@ const (
 	outcomeRotate  = "rotate"
 	outcomeClamped = "clamped"
 	outcomeFailed  = "failed"
+
+	// minRotateAge covers the delay until the kubelet updates a mounted Secret.
+	minRotateAge = 5 * time.Minute
+	// minOutsideWindow is the least time that a reduced TTL adds to the renew window.
+	minOutsideWindow = time.Hour
 )
 
 // Config configures one run.
@@ -169,7 +173,7 @@ func newRotator(cfg Config) (*rotator, error) {
 		httpsOnly bool
 	}{
 		{"the Rancher URL", cfg.Rancher, true},
-		{"the Kubernetes URL", cfg.Kube, false},
+		{"the Kubernetes URL", cfg.Kube, true},
 	} {
 		if field.value == nil {
 			return nil, fmt.Errorf("%s is required", field.name)
@@ -213,8 +217,8 @@ func newRotator(cfg Config) (*rotator, error) {
 		return nil, errors.New("the password Secret needs both a namespace and a name")
 	}
 	if cfg.PasswordSecret != "" {
-		if n := utf8.RuneCountInString(cfg.Password); n < passwordMinLength {
-			return nil, fmt.Errorf("the password has %d characters, and Rancher needs %d or more", n, passwordMinLength)
+		if err := CheckPasswordLength(cfg.Password); err != nil {
+			return nil, err
 		}
 	}
 
@@ -283,17 +287,19 @@ func (r *rotator) rotate(ctx context.Context, secretName string) error {
 	return errors.Join(pruneErr, r.checkGrantedTTL(ctx, created.ttl))
 }
 
-// checkGrantedTTL returns an error when a token with the granted TTL expires
-// inside the renew window at once. The TTL zero never expires.
+// checkGrantedTTL returns an error when the granted TTL is not longer than the
+// renew window, or when Rancher reduced the TTL to less than the renew window
+// plus minOutsideWindow. The TTL zero never expires.
 func (r *rotator) checkGrantedTTL(ctx context.Context, granted time.Duration) error {
-	if granted <= 0 || granted > r.cfg.RenewBefore {
+	outside := granted - r.cfg.RenewBefore
+	if granted <= 0 || (outside > 0 && (granted >= r.cfg.TTL || outside >= minOutsideWindow)) {
 		return nil
 	}
-	r.logger.ErrorContext(ctx, "the granted ttl is inside the renew window",
+	r.logger.ErrorContext(ctx, "the granted ttl is too short for the renew window",
 		"step", stepTokenCreate, "outcome", outcomeClamped, "reason", "window",
 		"granted_ttl_ms", granted.Milliseconds(), "renew_before_ms", r.cfg.RenewBefore.Milliseconds())
-	return fmt.Errorf("rancher granted a ttl of %s, which is not longer than the renew window of %s, "+
-		"so every run rotates: raise auth-token-max-ttl-minutes or lower -renew-before", granted, r.cfg.RenewBefore)
+	return fmt.Errorf("rancher granted a ttl of %s, which is less than the renew window of %s plus %s: "+
+		"raise auth-token-max-ttl-minutes or lower -renew-before", granted, r.cfg.RenewBefore, minOutsideWindow)
 }
 
 // step starts a child span named name, and returns the traced context and a

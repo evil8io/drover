@@ -14,7 +14,9 @@ The command runs once. A run does these steps:
 
 The command accepts only an https URL for `--rancher-url`, because it sends the password in the body of the login request. The command never follows a redirect, and it never sends the password a second time. A redirect response fails the run, except in the `logout` step, which only logs a warning.
 
-Rancher reduces a TTL above its own maximum and returns no error. For this reason, the command logs a warning when the TTL in the response of Rancher differs from the requested TTL. When the TTL that Rancher grants is not longer than `--renew-before`, the run completes the rotation and then exits with code 1. The reason is that every later run rotates the token again.
+Rancher reduces a TTL above its own maximum and returns no error. For this reason, the command logs a warning when the TTL in the response of Rancher differs from the requested TTL. When Rancher reduces the TTL to less than `--renew-before` plus 1 hour, the run completes the rotation and then exits with code 1. The reason is that the new token then rotates again within 1 hour.
+
+The run does not rotate a token that expires inside `--renew-before` when the token is younger than 5 minutes. The run then exits with code 1, and it does not change the token. A pod reads the mounted Secret with a delay after the patch. A second rotation in that delay deletes the token that the pod reads. For example, a retry of the Job after a reduced TTL finds such a token.
 
 The run keeps the new token and the token that it read from the Secret. It deletes the other tokens with the `--description` value, except the newest tokens up to a total of `--keep` tokens. It also deletes the login tokens of earlier runs, which have the description `<description> login`.
 
@@ -32,16 +34,16 @@ To run the command once, use `drover rotate-token [flags]`.
 | --- | --- | --- |
 | `--rancher-url` | (required) | The URL of Rancher. Use `https://` only. The path must be empty or `/`. |
 | `--rancher-ca-file` | | The PEM bundle that the command uses to verify the certificate of an `https` Rancher URL. |
-| `--rancher-insecure-skip-verify` | `false` | When the value is `true`, the command does not verify the certificate of an `https` Rancher URL. |
+| `--rancher-insecure-skip-verify` | `false` | When the value is `true`, the command does not verify the certificate of an `https` Rancher URL. The command then sends the password to a server that it does not verify. Together with `--rancher-ca-file`, the command exits with code 2. |
 | `--credentials-dir` | (required) | The directory with the files `username` and `password` of the service user. |
 | `--token-secret` | (required) | The `namespace/name` of the Secret with the API token. |
 | `--token-key` | `token` | The key of the token in the Secret. |
-| `--password-secret` | | The `namespace/name` of the Secret that Rancher reads for the password of the service user. When the flag is set, a run first writes the PBKDF2-SHA3-512 hash of the password into that Secret, unless the Secret already contains that hash. The password must have 12 characters or more, which is the minimum password length of Rancher. With a shorter password, the command exits with code 1 before the first step. |
-| `--ttl` | `48h` | The lifetime of a new token. Rancher reduces a value above its setting `auth-token-max-ttl-minutes`. When the reduced value is not longer than `--renew-before`, the run exits with code 1 after the rotation. |
+| `--password-secret` | | The `namespace/name` of the Secret that Rancher reads for the password of the service user. When the flag is set, a run first writes the PBKDF2-SHA3-512 hash of the password into that Secret, unless the Secret already contains that hash. The password must have 12 characters or more, which is the minimum password length of Rancher. With a shorter password, the command exits with code 2. |
+| `--ttl` | `48h` | The lifetime of a new token. Rancher reduces a value above its setting `auth-token-max-ttl-minutes`. When the reduced value is less than `--renew-before` plus 1 hour, the run exits with code 1 after the rotation. |
 | `--renew-before` | `24h` | When the time until the token expires is not longer than this value, the run rotates the token. The value must be shorter than `--ttl`. |
-| `--keep` | `2` | The run keeps this number of tokens with the `--description` value. The new token and the token that the run read from the Secret count toward this number, and the run never deletes them. The value must be 2 or more, because a pod reads a mounted Secret with a delay after the patch. For a value below 1, the command exits with code 2. For the value 1, the command exits with code 1 before the first step. |
+| `--keep` | `2` | The run keeps this number of tokens with the `--description` value. The new token and the token that the run read from the Secret count toward this number, and the run never deletes them. The value must be 2 or more, because a pod reads a mounted Secret with a delay after the patch. For a value below 2, the command exits with code 2. |
 | `--description` | `drover rotate-token` | The description of the tokens that this command creates. The run also uses this description to select the tokens to delete. |
-| `--kube-url` | (in-cluster) | The URL of the Kubernetes API. The command takes the default from the environment variables `KUBERNETES_SERVICE_HOST` and `KUBERNETES_SERVICE_PORT`. |
+| `--kube-url` | (in-cluster) | The URL of the Kubernetes API. Use `https://` only, because the requests contain the ServiceAccount token and the Rancher token. The command takes the default from the environment variables `KUBERNETES_SERVICE_HOST` and `KUBERNETES_SERVICE_PORT`. |
 | `--kube-service-account-dir` | `/var/run/secrets/kubernetes.io/serviceaccount` | The directory with the ServiceAccount token and the file `ca.crt`. |
 | `--log-level` | `info` | The log level. The value is one of `debug`, `info`, `warn`, or `error`. |
 | `--otlp-endpoint` | `$OTEL_EXPORTER_OTLP_ENDPOINT` | The OTLP gRPC endpoint. The value is `host:port` or a URL. When the value is empty, telemetry is off. |
@@ -53,8 +55,8 @@ The command exits with one of these codes:
 
 | Exit code | Condition |
 | --- | --- |
-| 0 | Every step succeeds, or only the `logout` step fails. The run finds a valid token, or it completes a rotation with a granted TTL longer than `--renew-before`. |
-| 1 | A step other than `logout` fails, or the granted TTL is not longer than `--renew-before`. The command also exits with code 1 when `--keep` is 1, or when the password for `--password-secret` is shorter than 12 characters. |
+| 0 | Every step succeeds, or only the `logout` step fails. The run finds a valid token, or it completes a rotation with a TTL that does not fail the run. |
+| 1 | A step other than `logout` fails. The run also exits with code 1 when Rancher reduces the TTL to less than `--renew-before` plus 1 hour, or when the token in the Secret is inside `--renew-before` and younger than 5 minutes. |
 | 2 | The command finds an error in the flags, in a file of `--credentials-dir`, in a CA file, or in the telemetry setup. |
 
 The command deletes only tokens with the `--description` value or with the description `<description> login`. A token with another description stays, for example a kubeconfig token of the service user.

@@ -76,6 +76,12 @@ func TestParseRotateConfigErrors(t *testing.T) {
 		{"renew window as long as the ttl", with("--ttl", "24h", "--renew-before", "24h")},
 		{"renew window zero", with("--renew-before", "0s")},
 		{"keep zero", with("--keep", "0")},
+		{"keep one", with("--keep", "1")},
+		{"password shorter than 12 characters with a password secret",
+			with("--password-secret", "cattle-local-user-passwords/u-drover")},
+		{"rancher CA file with the skip of the verification",
+			with("--rancher-ca-file", "/etc/drover/ca.pem", "--rancher-insecure-skip-verify")},
+		{"kube url over http", with("--kube-url", "http://kubernetes.default.svc")},
 		{"empty description", with("--description", "")},
 		{"empty service account dir", with("--kube-service-account-dir", "")},
 		{"kube url with a path", with("--kube-url", "https://kubernetes.default.svc/api")},
@@ -297,7 +303,7 @@ func TestParseRotateConfigTelemetryFromEnvironment(t *testing.T) {
 
 func TestParseRotateConfigPasswordSecret(t *testing.T) {
 	t.Parallel()
-	credentials := credentialsDir(t, map[string]string{"username": "drover\n", "password": "secret\n"})
+	credentials := credentialsDir(t, map[string]string{"username": "drover\n", "password": "5eKr3t-p4ssw0rd\n"})
 	base := []string{
 		"--rancher-url", "https://rancher.example.com",
 		"--credentials-dir", credentials,

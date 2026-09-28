@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"unicode/utf8"
 )
 
 // Rancher reads the password of a local user from a Secret. These constants are
@@ -23,6 +24,15 @@ const (
 	passwordSaltLength     = 32
 	passwordMinLength      = 12
 )
+
+// CheckPasswordLength returns an error for a password that is shorter than the
+// minimum length of Rancher.
+func CheckPasswordLength(password string) error {
+	if n := utf8.RuneCountInString(password); n < passwordMinLength {
+		return fmt.Errorf("the password has %d characters, and Rancher needs %d or more", n, passwordMinLength)
+	}
+	return nil
+}
 
 func (r *rotator) passwordRef() string {
 	return r.cfg.PasswordNamespace + "/" + r.cfg.PasswordSecret
