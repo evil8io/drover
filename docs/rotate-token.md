@@ -12,11 +12,11 @@ The command runs once. A run does these steps:
 6. The command deletes the old tokens.
 7. The command logs out to end the session.
 
-The command accepts only an https URL for `--rancher-url`, because it sends the password in the body of the login request. The command never follows a redirect. The run fails on a redirect response, and the command never sends the password a second time.
+The command accepts only an https URL for `--rancher-url`, because it sends the password in the body of the login request. The command never follows a redirect, and it never sends the password a second time. A redirect response fails the run, except in the `logout` step, which only logs a warning.
 
 Rancher reduces a TTL above its own maximum and returns no error. For this reason, the command logs a warning when the TTL in the response of Rancher differs from the requested TTL. When the TTL that Rancher grants is not longer than `--renew-before`, the run completes the rotation and then exits with code 1. The reason is that every later run rotates the token again.
 
-The run keeps the new token and the token that it read from the Secret. It deletes the other tokens with the same description, except the newest tokens up to a total of `--keep` tokens.
+The run keeps the new token and the token that it read from the Secret. It deletes the other tokens with the `--description` value, except the newest tokens up to a total of `--keep` tokens. It also deletes the login tokens of earlier runs, which have the description `<description> login`.
 
 When `--password-secret` is set to a Secret, a run first writes the password hash into that Secret. Rancher reads the hash when a local user logs in. Rancher gives that Secret the name of the User object, and the Secret is in the namespace `cattle-local-user-passwords`. When the Secret already contains the current hash, the run does not change the Secret. The ServiceAccount needs the `get` and `patch` permissions on that one Secret.
 
@@ -36,10 +36,10 @@ To run the command once, use `drover rotate-token [flags]`.
 | `--credentials-dir` | (required) | The directory with the files `username` and `password` of the service user. |
 | `--token-secret` | (required) | The `namespace/name` of the Secret with the API token. |
 | `--token-key` | `token` | The key of the token in the Secret. |
-| `--password-secret` | | The `namespace/name` of the Secret that Rancher reads for the password of the service user. When the flag is set, a run first writes the PBKDF2-SHA3-512 hash of the password into that Secret. The password must have 12 characters or more, which is the minimum password length of Rancher. |
+| `--password-secret` | | The `namespace/name` of the Secret that Rancher reads for the password of the service user. When the flag is set, a run first writes the PBKDF2-SHA3-512 hash of the password into that Secret, unless the Secret already contains that hash. The password must have 12 characters or more, which is the minimum password length of Rancher. With a shorter password, the command exits with code 1 before the first step. |
 | `--ttl` | `48h` | The lifetime of a new token. Rancher reduces a value above its setting `auth-token-max-ttl-minutes`. When the reduced value is not longer than `--renew-before`, the run exits with code 1 after the rotation. |
 | `--renew-before` | `24h` | When the time until the token expires is not longer than this value, the run rotates the token. The value must be shorter than `--ttl`. |
-| `--keep` | `2` | The run keeps this number of tokens with the `--description` value. The new token and the token that the run read from the Secret count toward this number, and the run never deletes them. The value must be 2 or more, because a pod reads a mounted Secret with a delay after the patch. |
+| `--keep` | `2` | The run keeps this number of tokens with the `--description` value. The new token and the token that the run read from the Secret count toward this number, and the run never deletes them. The value must be 2 or more, because a pod reads a mounted Secret with a delay after the patch. For a value below 1, the command exits with code 2. For the value 1, the command exits with code 1 before the first step. |
 | `--description` | `drover rotate-token` | The description of the tokens that this command creates. The run also uses this description to select the tokens to delete. |
 | `--kube-url` | (in-cluster) | The URL of the Kubernetes API. The command takes the default from the environment variables `KUBERNETES_SERVICE_HOST` and `KUBERNETES_SERVICE_PORT`. |
 | `--kube-service-account-dir` | `/var/run/secrets/kubernetes.io/serviceaccount` | The directory with the ServiceAccount token and the file `ca.crt`. |
@@ -53,11 +53,11 @@ The command exits with one of these codes:
 
 | Exit code | Condition |
 | --- | --- |
-| 0 | The run finds a valid token, or the run completes a rotation. |
-| 1 | The run fails. |
-| 2 | The command finds an error in the flags. |
+| 0 | Every step succeeds, or only the `logout` step fails. The run finds a valid token, or it completes a rotation with a granted TTL longer than `--renew-before`. |
+| 1 | A step other than `logout` fails, or the granted TTL is not longer than `--renew-before`. The command also exits with code 1 when `--keep` is 1, or when the password for `--password-secret` is shorter than 12 characters. |
+| 2 | The command finds an error in the flags, in a file of `--credentials-dir`, in a CA file, or in the telemetry setup. |
 
-The command never deletes a token with another description, so a kubeconfig token of the service user stays.
+The command deletes only tokens with the `--description` value or with the description `<description> login`. A token with another description stays, for example a kubeconfig token of the service user.
 
 ## Permissions
 
@@ -75,7 +75,7 @@ The Secret must exist before the first run. The command reads the ServiceAccount
 
 ## Logging
 
-The command writes JSON logs to stderr, and it writes one line for each step. Each line contains a `step` field and an `outcome` field. The `token_prune` line contains the field `secret_token`. The value of this field is the name of the token that the run read from the Secret and kept. When the run kept no token from the Secret, the value is an empty string. The command never logs a token, a token key, or the password.
+The command writes JSON logs to stderr. Each step that succeeds writes at least one line with a `step` field and an `outcome` field. When the run fails, the last line contains an `error` field. The `token_prune` line contains the field `secret_token`. The value of this field is the name of the token that the run read from the Secret and kept. When the run kept no token from the Secret, the value is an empty string. The command never logs a token, a token key, or the password.
 
 ## Telemetry
 

@@ -25,7 +25,7 @@ Write a rule in the imperative. Give the reason for the rule. Delete a line when
 | `project-sync` | `internal/projectsync` | `internal/projectsync/CLAUDE.md` |
 | `rotate-token` | `internal/rotate` | `internal/rotate/CLAUDE.md` |
 
-`internal/rancherclient` is the shared HTTP transport to Rancher, and `internal/telemetry` is the shared setup for logging, tracing, and metrics.
+`internal/rancherclient` has the HTTP transport to Rancher of `api-filter` and `project-sync`, and the trace and metric wrapper of that transport. `rotate-token` uses only the wrapper, with its own transport from `internal/rotate/client.go`. `internal/telemetry` is the shared setup for logging, tracing, and metrics.
 
 ## Docs
 

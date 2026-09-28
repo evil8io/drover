@@ -40,7 +40,7 @@ The goal of drover is to improve the developer experience with Kubernetes cluste
 | --- | --- | --- | --- |
 | API filter | `api-filter` | A reverse proxy in front of Rancher. It lets users list their project namespaces with kubectl. It also limits the `--all-namespaces` flag to their project namespaces. | [docs/api-filter.md](docs/api-filter.md) |
 | Project sync | `project-sync` | A service that copies a configured set of labels and annotations from a Rancher project to the namespaces of that project. | [docs/project-sync.md](docs/project-sync.md) |
-| Token rotation | `rotate-token` | A command that rotates the password and the API token of the drover Rancher user. A CronJob runs the command. | [docs/rotate-token.md](docs/rotate-token.md) |
+| Token rotation | `rotate-token` | A command that rotates the API token of a Rancher service user of drover. With `--password-secret`, it also writes the password hash of that user. It reads the password from a file. A CronJob runs the command. | [docs/rotate-token.md](docs/rotate-token.md) |
 
 ## Example
 

@@ -6,7 +6,7 @@ The service polls Rancher at every `--interval`, in a reconcile run. It also kee
 
 Status 403 for the namespace list of a cluster means that the service user does not have the right to list namespaces on that cluster. The service then writes a warning with the cluster id and continues with the next cluster.
 
-With `--service-accounts`, the service also keeps three ServiceAccounts per Rancher project, one per project role. A CI job of a project authenticates with a token of such a ServiceAccount, through the Rancher proxy. See [Service accounts](#service-accounts).
+With `--service-accounts`, the service also keeps three ServiceAccounts per project of a tenant, one per project role. A CI job of a project authenticates with a token of such a ServiceAccount, through the Rancher proxy. See [Service accounts](#service-accounts).
 
 With `--openbao-address` as well, the service writes the OpenBao state that follows from the Rancher objects. This state contains a mount of the Kubernetes secrets engine per cluster, with the config of that mount. It also contains a role and an ACL policy per project role. OpenBao then creates short-lived tokens of these ServiceAccounts. See [OpenBao config](#openbao-config).
 
@@ -76,7 +76,7 @@ Start the service with `drover project-sync [flags]`.
 | `--openbao-credential-ttl` | `15m` | Default lifetime of a credential of a project role. This value is the `token_default_ttl` of the role in OpenBao for that project role. The minimum is `1s`. |
 | `--openbao-credential-max-ttl` | `2h` | Longest lifetime of a credential of a project role. This value is the `token_max_ttl` of the role in OpenBao for that project role. It must not be shorter than `--openbao-credential-ttl`. |
 | `--interval` | `60s` | Time between two reconcile runs. |
-| `--patch-rate` | `10` | Limit for the namespace patches and the project namespace lists per second that the watches of one cluster send together. |
+| `--patch-rate` | `10` | Limit per second for the namespaces and the projects that the watches of one cluster take from their queues, together. A value of `0` or less selects `10`. |
 | `--listen` | `:8080` | Address that the service listens on. |
 | `--log-level` | `info` | The value is one of `debug`, `info`, `warn`, or `error`. |
 | `--otlp-endpoint` | `$OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint, as `host:port` or as a URL. When the value is empty, telemetry is off. |
@@ -90,7 +90,7 @@ The `--name-annotation` value is the raw display name of the project. The `--nam
 
 A name key is the key of `--name-label` or `--name-annotation`. The service writes only the display name to a name key. That key can also be a key of `--labels` or `--annotations`. The service then still writes the display name to it, never a label or an annotation of the Project object. A namespace can therefore have no name key, because the display name has no valid label value, or because the namespace is in no project.
 
-The service also starts when there is no token file. It skips the reconcile runs until the file contains a token. It writes one warning per state change of the file.
+The service also starts when there is no token file. It skips the reconcile runs until the file contains a token. It writes one warning when the file has no token, and one info line when the file has a token again.
 
 The service answers `GET /healthz` with status 200 and the body `ok`.
 
@@ -104,19 +104,21 @@ A key outside these lists belongs to the tenant, and the service never removes i
 
 ## Design
 
-The service polls `GET /v3/projects` at every interval. With one call per interval, the service gets every project that the service user can see, because Rancher filters that list by RBAC. The service takes the set of clusters from the `clusterId` of those projects, so it needs no cluster list of its own. One reconcile run syncs at most 8 clusters at the same time.
+The service polls `GET /v3/projects` at every interval. With one list per interval, the service gets every project that the service user can see, because Rancher filters that list by RBAC. The service takes the set of clusters from the `clusterId` of those projects, so it needs no cluster list of its own. One reconcile run syncs at most 8 clusters at the same time.
 
 The reconcile run lists every namespace of a cluster, also a namespace without the project label. It thus finds a namespace that left its project and no longer has the project label. It lists in pages of 500, with the `limit` and `continue` parameters of the Kubernetes API. When a `continue` token is too old, the API server answers with status 410. The service then starts the list again from the first page, once. The service decodes each page as a stream, one namespace at a time.
 
-For each namespace, the service keeps in memory only the keys that it reads for the sync. These are the project label, the project annotation, the two ownership annotations, and the keys of `--labels`, `--annotations`, `--name-label`, and `--name-annotation`. The service keeps the metadata under other keys in memory only while it decodes that namespace. A tenant can fill an ownership annotation up to the size limit of the API server for annotations, 256 KiB. The service therefore treats an ownership annotation above 4096 bytes as absent, because a list that the service writes is a short list of keys. The service then writes that annotation again in the next patch.
+For each namespace, the service keeps in memory only the keys that it reads for the sync. These are the project label, the project annotation, the two ownership annotations, and the keys of `--labels`, `--annotations`, `--name-label`, and `--name-annotation`. The service keeps the metadata under other keys in memory only while it decodes that namespace. A tenant can fill an ownership annotation up to the size limit of the API server for annotations, 256 KiB. The service therefore treats an ownership annotation above 4096 bytes as absent, because a list that the service writes is a short list of keys. The service replaces that annotation in the next patch, when the new list of keys is not empty.
 
-The service also lists the projects in pages of 500. For each project, it keeps only the keys of `--labels` and `--annotations`. The service reads at most 32 MiB of one page of either list. When a namespace page is larger, the reconcile run fails for that cluster, with an error that contains the limit in bytes. The reconcile run continues for the other clusters. When a project page is larger, the whole reconcile run fails.
+The service also lists the projects in pages of 500. For each project, it keeps only the keys of `--labels` and `--annotations`. The service reads at most 32 MiB of one page of any list. When a namespace page is larger, the reconcile run fails for that cluster only, with an error that contains the limit in bytes. When a project page is larger, the whole reconcile run fails. When a page of another list is larger, only the work that needs that list fails.
 
 The service also keeps one namespace watch per cluster open, on `GET /k8s/clusters/<id>/api/v1/namespaces?watch=true`. The watch selects only the namespaces with the project label. Rancher sets that label about three seconds after the namespace is created, so the service acts on an `ADDED` event and on a `MODIFIED` event. When the project label is removed from a namespace, the namespace is no longer in the selection. The API server then sends a `DELETED` event for it, with the namespace from before the change. Unless the namespace is in deletion, the service reads the namespace again and handles its current state.
 
-When a stream ends, the service starts it again after a backoff. The backoff increases from 1 s to 30 s. When the resource version is expired, the service starts the stream again without a resource version. The periodic reconcile run still handles a missed event, a dropped watch, and a new cluster.
+When a stream ends without an error after at least 10 s, the service starts a new stream at once. After an error, or after a stream shorter than 10 s, the service waits for a backoff first. The backoff doubles from 1 s up to 30 s, and it returns to 1 s after a stream of at least 10 s. After status 410, or after an `ERROR` event in the stream, the service starts the stream again without a resource version. The periodic reconcile run still handles a missed event, a dropped watch, and a new cluster.
 
-The watch puts the namespace of an event into the patch queue of its cluster, with the namespace name as the key. One worker per cluster patches the namespaces of that queue, one at a time. After a second event of a namespace, the queue contains only the second event for that namespace. For several events on one namespace before its patch, the worker thus sends one patch. The service limits the patches and the project namespace lists of one cluster, together, to `--patch-rate` per second. The burst is equal to the rate.
+The watch puts the namespace of an event into the patch queue of its cluster, with the namespace name as the key. One worker per cluster patches the namespaces of that queue, one at a time. After a second event of a namespace, the queue contains only the second event for that namespace. For several events on one namespace before its patch, the worker thus sends one patch.
+
+The worker and the lister of a cluster share one rate limiter, with `--patch-rate` tokens per second. The worker takes one token per namespace from the queue, also when the namespace needs no patch. The lister takes one token per project. One token covers every request for that namespace or that project. The burst is equal to the rate, with a minimum of 1.
 
 A patch of a namespace that no longer exists, or of a namespace in `Terminating`, is not an error. The service skips it, and the next reconcile run repeats the work.
 
@@ -143,7 +145,7 @@ With `--service-accounts`, the service keeps these objects in every cluster that
 5. Per project role, the ClusterRoleBinding `drover-<project>-<role>-namespaces`, to the Rancher ClusterRole `<project>-namespaces-edit` for `project-owner` and `project-member`, and to `<project>-namespaces-readonly` for `read-only`. Rancher keeps the `resourceNames` of these ClusterRoles equal to the namespaces of the project. The API filter uses these `resourceNames` to answer a namespace list of the ServiceAccount.
 6. For `project-owner` and `project-member`, the ClusterRoleBinding `drover-<project>-<role>-create-ns`, to the Rancher ClusterRole `create-ns`.
 
-Every object has the labels `drover-project: <project>` and `drover-role: <role>`, and every binding has one subject. The account namespace is the owner of the bindings, so the garbage collector deletes them together with the namespace.
+Every ServiceAccount and every binding has the labels `drover-project: <project>` and `drover-role: <role>`, and every binding has one subject. The account namespace has the label `drover-project: <project>`, without `drover-role`. The account namespace is the owner of the bindings, so the garbage collector deletes them together with the namespace.
 
 A tenant project is a project that is not the System project, the Default project, or an account project. The service finds the System project and the Default project by the labels `authz.management.cattle.io/system-project` and `authz.management.cattle.io/default-project`.
 
@@ -151,7 +153,7 @@ The ServiceAccounts get the Kubernetes rights of a project role through `admin`,
 
 The service applies these rules:
 
-- When a namespace joins a project, the service creates the three RoleBindings in it. When a namespace moves to another project, the service changes the subjects and the owner of its RoleBindings to those of the new project. When a namespace leaves its project, the service deletes the RoleBindings. The namespace watch starts this work within seconds.
+- When a namespace joins a project, the service creates the three RoleBindings in it. When a namespace moves to another project, the service changes the subjects and the owner of its RoleBindings to those of the new project. When a namespace leaves its project, the service deletes the RoleBindings. The namespace watch starts this work within seconds. For a namespace that a user deletes and creates again in the same project, only the next reconcile run creates the RoleBindings.
 - For a new project, the service creates the account namespace, the ServiceAccounts, and the ClusterRoleBindings within seconds, through the project watch.
 - The reconcile run corrects a binding that differs, and it creates an object again when the object does not exist. A tenant can edit or delete the RoleBindings in its namespaces, and the next reconcile run restores them.
 - The service uses an account namespace only in an account project. A tenant can create a namespace with the name `drover-<project>` first, in its own project. The service then writes a warning, gives the project no accounts, and deletes the bindings of the project.
@@ -179,15 +181,15 @@ The Role and the RoleBinding have the labels `drover-project: <project>` and `dr
 - The service deletes none of these objects when `--openbao-address` is set to an empty value. It also keeps the config of a removed cluster in OpenBao.
 - To make the token in OpenBao invalid, delete the ServiceAccount `openbao`. The next reconcile run creates it again and writes a new token. Do not delete the namespace `drover-openbao` for this. The reason is the same as in [Service accounts](#service-accounts).
 
-For each cluster, the service writes the config in three steps:
+The service writes the config of a cluster in three steps:
 
-1. It requests a token of `drover-openbao/openbao` with the TokenRequest API, through the Rancher proxy. The request is `POST /k8s/clusters/<cluster id>/api/v1/namespaces/drover-openbao/serviceaccounts/openbao/token`. The request contains `spec.expirationSeconds` from `--openbao-token-ttl`, and no audiences. The API server can shorten the lifetime, for example to 24 hours on EKS, so the service uses `status.expirationTimestamp` from the answer.
-2. It logs in with `POST <address>/v1/auth/<auth path>/login`, with the role and the content of the file in `--openbao-jwt-file`. It reads the file at every login, because the kubelet replaces the token. The service keeps the client token for the reconcile run and the project watch, until a fifth of its lifetime remains. After a 403 answer, the service logs in again once and repeats the request.
+1. Before the work on the first cluster, it gets a client token of OpenBao. It logs in with `POST <address>/v1/auth/<auth path>/login`, with the role and the content of the file in `--openbao-jwt-file`, only when it has no kept client token. It reads the file at every login, because the kubelet replaces the token. The service keeps the client token for the reconcile run and the project watch, until a fifth of its lifetime remains. After a 403 answer, the service logs in again once and repeats the request.
+2. It requests a token of `drover-openbao/openbao` with the TokenRequest API, through the Rancher proxy. The request is `POST /k8s/clusters/<cluster id>/api/v1/namespaces/drover-openbao/serviceaccounts/openbao/token`. The request contains `spec.expirationSeconds` from `--openbao-token-ttl`, and no audiences. The API server can shorten the lifetime, for example to 24 hours on EKS, so the service uses `status.expirationTimestamp` from the answer.
 3. It sends `POST <address>/v1/<prefix>/<cluster id>/config`, with the client token in the header `X-Vault-Token`. The body is `{"kubernetes_host": "<openbao rancher url>/k8s/clusters/<cluster id>", "kubernetes_ca_cert": "<rancher ca>", "service_account_jwt": "<token>", "disable_local_ca_jwt": true}`.
 
 The Kubernetes secrets engine of OpenBao cannot skip the TLS verification of `kubernetes_host`. When `kubernetes_ca_cert` is not empty, the engine verifies Rancher only with that field. When the field is empty, the engine verifies Rancher with the root certificates of the system. The service therefore reads the Rancher setting `cacerts` with `GET /v3/settings/cacerts`, once per reconcile run that has a cluster to keep. It sends the value of that setting as `kubernetes_ca_cert`. Rancher puts the CA chain of a private certificate into that setting, and leaves it empty for a public certificate.
 
-The service always sends the field. When the value is empty, OpenBao thus removes a CA that the service wrote earlier. When the read fails, the service writes an error line, and the reconcile run writes nothing. The service does this so that it does not remove the CA of a private certificate.
+The service always sends the field. When the value is empty, OpenBao thus removes a CA that the service wrote earlier. When the read fails, the service writes an error line, and the reconcile run writes nothing to OpenBao. The service does this so that it does not remove the CA of a private certificate.
 
 OpenBao keeps the token that the service writes, and it never renews that token. The service therefore keeps in memory, per cluster, the expiry of the token of the last successful write. The reconcile run writes the config of a cluster again when one of these conditions is true:
 
@@ -195,7 +197,7 @@ OpenBao keeps the token that the service writes, and it never renews that token.
 - The ServiceAccount `openbao` has a new uid.
 - The Rancher CA differs from the CA of that write.
 
-The service thus writes a new Rancher CA to OpenBao in the next reconcile run. After a restart, the service has no expiry in memory, so the first reconcile run writes the config of every cluster. After a failed write, the service keeps the old expiry, and the next reconcile run tries again.
+The service thus writes a new Rancher CA to OpenBao in the next reconcile run. After a restart, the service has no expiry in memory, so the first reconcile run writes the config of every cluster. After a failed write, the service keeps the old expiry, and the next reconcile run tries again. A new mount is not one of these conditions. So when the service creates a deleted mount again, the new mount has no config until a condition of the list is true.
 
 OpenBao checks the ACL policy before it checks the mount. When the service has `update` on the path and writes under a mount that does not exist, OpenBao answers 404 with the message `no handler for route`. An older OpenBao server answers 400 with the same message. The service creates the mount before it writes the config, so it handles this answer only as a fallback.
 
@@ -203,7 +205,7 @@ For this answer, the service writes an info line with the cluster id, and counts
 
 ### Mounts, roles, and policies
 
-Before the reconcile run writes the config of a cluster, it sends `GET <address>/v1/sys/mounts/<prefix>/<cluster id>`. When the mount does not exist, OpenBao answers 400 with `No secret engine mount at`. The service then enables the mount with `POST <address>/v1/sys/mounts/<prefix>/<cluster id>` and the body `{"type": "kubernetes"}`. A mount of another type is an error. The service keeps the mount of a removed cluster.
+In each reconcile run, the service starts the work on a cluster with `GET <address>/v1/sys/mounts/<prefix>/<cluster id>`. When the mount does not exist, OpenBao answers 400 with `No secret engine mount at`. The service then enables the mount with `POST <address>/v1/sys/mounts/<prefix>/<cluster id>` and the body `{"type": "kubernetes"}`. A mount of another type is an error. The service keeps the mount of a removed cluster.
 
 For every tenant project with a trusted account namespace, and for each project role, the service keeps these objects:
 
@@ -212,15 +214,15 @@ For every tenant project with a trusted account namespace, and for each project 
 
 The names are the same as the names of the earlier operator objects, so a client keeps its paths and policies. The service applies these rules:
 
-- The project watch writes the roles and the policies of a new or changed project within seconds, together with its ServiceAccounts and its Role `drover-openbao`. It does not read an object before it writes it. It skips an object that the service read or wrote in the last 10 minutes. The service thus sends no requests when many project events arrive in a short time.
+- The project watch writes the roles and the policies of a new or changed project within seconds, together with its ServiceAccounts and its Role `drover-openbao`. It does not read an object before it writes it. It skips an object that the service read or wrote in the last 10 minutes. The service thus sends no repeated OpenBao writes when many project events arrive in a short time.
 - Each reconcile run lists the roles of every mount and the ACL policies. It creates a role or a policy that does not exist. At most once per 10 minutes, it reads a role or a policy that exists, and it corrects the object when it differs. When the service compares a policy, it ignores the white space around the text of the policy.
 - The reconcile run deletes the policies and the roles of a project that the cluster no longer has. It does this only after it read the full project list, and after Rancher answers 404 for that project. The reason is that the project list of a reconcile run can be older than a new project. The service deletes the policy before the role. The service finds these objects from the role names in the mount of the cluster, and from the names of the ACL policies.
-- A policy name has the form `<prefix>-<cluster id>-<project>-<role>`. From such a name, the service takes as the cluster id the longest id of a cluster of the reconcile run that fits. It takes the rest, up to the role, as the project. The service thus also deletes a policy whose role does not exist. Such a policy can remain after a failed write, or from an earlier writer. The service does not delete a policy of a cluster outside the reconcile run, or a policy whose name does not have this form.
-- When the list of the roles of a mount fails, the service skips the roles of that cluster. It also deletes no OpenBao object of that cluster. When the list of the policies fails, the service skips the policies, and it deletes no OpenBao object.
+- A policy name has the form `<prefix>-<cluster id>-<project>-<role>`. From such a name, the service takes as the cluster id the longest id of a cluster of the reconcile run that fits. It takes the rest, up to the role, as the project. The service thus also deletes a policy without a role, for example a policy that remains after a failed write or from an earlier writer. The service keeps a policy whose name does not have this form, and a policy of a cluster outside the run. The exception is a cluster outside the run whose id starts with the id of a cluster of the run and a dash.
+- When the list of the roles of a mount fails, the service skips the roles of that cluster. It deletes no role of that cluster, but it still deletes a policy of that cluster whose project is gone. When the list of the policies fails, the service skips the policies, and it deletes no OpenBao object.
 
 ## Telemetry
 
-When `--otlp-endpoint` is set, the service produces a span named `reconcile` for each reconcile run. It produces a span named `patch_namespace` for each patched namespace. That span has the attributes `drover.cluster`, `drover.origin`, and `k8s.namespace.name`. The `drover.origin` value is `reconcile`, `watch`, or `project`.
+When `--otlp-endpoint` is set, the service produces a span named `reconcile` for each reconcile run. It produces a span named `patch_namespace` for each patch request of a namespace. That span has the attributes `drover.cluster`, `drover.origin`, and `k8s.namespace.name`. The `drover.origin` value is `reconcile`, `watch`, or `project`.
 
 With `--openbao-address`, the service also produces a span named `openbao_login` for the OpenBao login. It produces a span named `openbao_config` for the config write of one cluster, with the attribute `drover.cluster`. The service exports these metrics:
 

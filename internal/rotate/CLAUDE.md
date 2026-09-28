@@ -12,7 +12,7 @@ These facts about Rancher tokens were verified against Rancher 2.14.5:
 
 Follow these rules:
 
-- `rotate-token` selects the tokens to delete by their description. Never delete a token with a different description, because a kubeconfig token of the service user has a different description.
+- `rotate-token` selects the tokens to delete by their description. The run deletes tokens with the `--description` value, and login tokens of earlier runs with the description `<description> login`. Never delete a token with any other description, because a kubeconfig token of the service user has another description.
 - Keep `--keep` at 2 or more. The reason is that a pod reads a mounted Secret with a delay after the patch. The old token must work during that delay.
 - Never delete the token that the run read from the Secret, even when newer tokens with the description exist. A token of an earlier run with a failed patch is newer than the mounted token. Also, a pod reads the mounted Secret with a delay after the patch.
 - The run is check-and-renew. For this reason, a CronJob that runs every 10 minutes is cheap, and a missed run is harmless. Do not change the run to a fixed rotation on a schedule.

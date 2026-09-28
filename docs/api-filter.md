@@ -6,21 +6,21 @@ Rancher grants a project member `get` on the namespaces of its projects, and no 
 
 ## How it works
 
-The service handles two request patterns from a Rancher kubeconfig. It passes every other request to Rancher unchanged.
+The service handles two request patterns from a Rancher kubeconfig. With `--fanout` on, it also handles the requests in Fan-out. It passes every other request to Rancher unchanged.
 
 **List namespaces**
 
 1. The service sends the request to Rancher with the caller's own credentials.
 2. When Rancher answers with a status other than 403, the service returns that answer to the client unchanged.
 3. On a 403 error, the service reads the allowed namespaces of the caller. These namespaces are the allowed set of the caller. For a caller with a Rancher token or a session cookie, the service gets them from Steve, the Rancher API server in the cluster agent. For a caller with a ServiceAccount token, the service gets them from the RBAC rules of the caller. See the paragraphs after this list.
-4. For a plain list, the service makes a new request with the service token, with no cookie, and with a label selector. The service token is the API token of the Rancher service user (see Requirements). The selector matches `field.cattle.io/projectId` on the projects of the caller that contain an allowed namespace, when every allowed namespace has that label. In every other case, the selector matches the allowed namespace names. When the caller can see no namespace, this name selector matches no namespace.
-5. For a watch (`?watch=true`), the service makes a new request with the service token, with no cookie, and with the caller's own query. The service gives the watch a project selector, or no selector at all. A project selector matches a new namespace of a project automatically. A name selector needs a new upstream watch for each new namespace. The service merges the selector of the caller into that selector, as it does on a list. These three cases apply:
+4. For a plain list, the service makes a new request with the service token, with no cookie, and with a label selector. The service token is the API token of the Rancher service user (see Requirements). The selector matches `field.cattle.io/projectId` on the projects of the caller that contain an allowed namespace. The service uses this selector when the label of every allowed namespace names one of those projects. In every other case, the selector matches the allowed namespace names. When the caller can see no namespace, this name selector matches no namespace.
+5. For a watch (`?watch=true`), the service makes a new request with the service token, with no cookie, and with the caller's own query. The service gives the watch a project selector, a selector that matches no namespace, or no selector at all. A project selector matches a new namespace of a project automatically. A name selector needs a new upstream watch for each new namespace. The service merges the selector of the caller into that selector, as it does on a list. These three cases apply:
    - A caller with no namespace and no project gets the selector that matches no namespace.
    - A caller whose namespaces are all in its own projects gets a `field.cattle.io/projectId` selector on those projects. A new namespace of such a project matches that selector automatically.
    - A caller with a namespace outside its own projects gets no selector. No single label selector matches that namespace and the projects of the caller at the same time.
 
    The service keeps every Accept entry of the caller with the media type `application/json` in the new request, for example a table request from kubectl. It drops every other entry, for example protobuf or CBOR. When no entry remains, the service sets `application/json`.
-6. The service sends the new request to Rancher, and it streams the answer to the client. The event filter runs on every watch, also on a watch with a selector. The event filter passes an event when every namespace in the event is in the allowed set. It also passes an event when the `field.cattle.io/projectId` label of the event matches a project of the caller that contains an allowed namespace. The event filter drops every other event.
+6. The service sends the new request to Rancher, and it streams the answer to the client. The event filter runs on every watch, also on a watch with a selector. The event filter passes an event when every namespace in the event is in the allowed set. It also passes an event when the `field.cattle.io/projectId` label of the event matches a project of the caller that contains an allowed namespace. The event filter drops every other `ADDED`, `MODIFIED`, or `DELETED` event. It passes an event of another type, for example `BOOKMARK` or `ERROR`, and an event that it cannot parse.
 
    A server-side table event has one row per namespace, and the event filter checks the name and the labels of each row. For a watch with no selector, the event filter is the only check. For a watch with a selector, the event filter is a second check after the selector.
 
@@ -30,7 +30,7 @@ A request is a watch when its `watch` parameter is present with a value other th
 - A watch with no selector also gets the event, when the cached allowed set contains the namespace at the time of the event.
 - In the other cases, the service itself changes the stream, as described below.
 
-The cache of allowed sets has one entry per credential that Rancher reads. That credential is the first `Authorization` value. When that value is empty or absent, the credential is the first `R_SESS` cookie. A second `Authorization` value, a second `R_SESS` cookie, and any other cookie are not part of the cache key.
+The cache of allowed sets has one entry per cluster and per credential that Rancher reads. That credential is the first `Authorization` value. When that value is empty or absent, the credential is the first `R_SESS` cookie. A second `Authorization` value, a second `R_SESS` cookie, and any other cookie are not part of the cache key.
 
 To fetch the allowed set, the service reads from Steve, from the project list, or from the rules review. When one of these reads gets a 401 or 403 error, the caller gets the native 403 error of its own request, with its message. The native 403 error is the answer of Rancher to the original request of the caller. A client that gets a 401 error for a valid token authenticates again. The native answer names the permission that the caller does not have. The service returns a 429 error of a fetch rate limit to the caller unchanged.
 
@@ -38,11 +38,11 @@ A ServiceAccount token is a bearer JWT whose subject starts with `system:service
 
 The service therefore reads the allowed namespaces of such a caller from a `SelfSubjectRulesReview`. It creates the review with the credentials of the caller, in the namespace of the ServiceAccount. The built-in `system:basic-user` role grants every authenticated caller the permission to create that review. The allowed set is the union of the `resourceNames` of the rules that grant `get` on `namespaces` in the core group. A wildcard in the verbs, the groups, or the resources also matches. This allowed set has no project, so a list gets a name selector, and a watch gets only the event filter, with no selector.
 
-A rule that grants `get` on `namespaces` without names does not separate tenants. A caller with no such rule has no allowed namespace. In both cases, the caller gets the native 403 error of its own request, with its message, and not an empty list. The service caches that answer for one cache TTL, so it does one review per TTL for such a caller. The service runs the review in the namespace of the ServiceAccount, because no tenant binds a role in that namespace.
+A rule that grants `get` on `namespaces` without names does not separate tenants. A caller with no such rule has no allowed namespace. In both cases, the caller gets the native 403 error of its own request, with its message, and not an empty list. The service caches the denied result for one cache TTL, so it does one review per TTL for such a caller. The service runs the review in the namespace of the ServiceAccount, because no tenant binds a role in that namespace.
 
 When a RoleBinding in that namespace binds a broad role, for example `view`, the result of the review contains a `get` on `namespaces` without names. The caller then gets the 403 error. To see the rules that the service reads, run `kubectl auth can-i --list -n <namespace of the ServiceAccount>`.
 
-The stream of a namespace watch stays open when the allowed set of the caller changes. Headlamp opens no new watch after a clean end of a stream. After such an end, the view of Headlamp gets no updates until the user reloads it. A timer re-reads the allowed set of the caller once per cache TTL. The timer reads the set from the cache of a plain list, so it adds no request. The service then compares the new names with the names of the stream, and it builds the selector again from the new set:
+The stream of a namespace watch stays open when the allowed set of the caller changes. Headlamp opens no new watch after a clean end of a stream. After such an end, the view of Headlamp gets no updates until the user reloads it. A timer re-reads the allowed set of the caller once per cache TTL. The timer reads the set from the cache of a plain list, so it adds at most one fetch per cache TTL. The service then compares the new names with the names of the stream, and it builds the selector again from the new set:
 
 1. For each name that the caller loses, the service sends a `DELETED` event with the object `{"kind":"Namespace","apiVersion":"v1","metadata":{"name":"<name>"}}`, before any other change. The caller listed that name before, so the event contains no new information for the caller. The event can come after the `DELETED` event of the upstream watch. A client accepts that second event without a problem. The event of the service also takes the place of an upstream event that the event filter dropped.
 2. A watch that takes no event of the service ends instead, as described in the list below. For such a watch with a project selector, the service first reads each lost namespace once with the service token. The upstream watch sends the `DELETED` event of a deleted namespace. It also sends that event for a namespace whose `field.cattle.io/projectId` label no longer matches the selector. The service therefore keeps the stream open when the read gets a 404 answer. It also keeps the stream open when the `field.cattle.io/projectId` label of the namespace does not match the selector.
@@ -50,7 +50,7 @@ The stream of a namespace watch stays open when the allowed set of the caller ch
    The service counts a read with another status as a namespace under the selector. The service then ends the stream, so that the client keeps no stale namespace. The service stops the reads at the first name that ends the stream.
 3. A watch with a selector gets a new upstream watch when the selector changes. The new request has the new selector, and no `resourceVersion`, `resourceVersionMatch`, or `sendInitialEvents`. The API server starts such a watch with an `ADDED` event for each namespace under the selector. The client thus gets the namespaces that the caller gains. A client treats the `ADDED` event of a namespace that it already has as an update. The service then closes the old upstream watch.
 4. A new upstream watch takes one token of the fetch rate limit per caller. The caller decides when its allowed set changes. Each new upstream watch replays the namespaces under the selector for every open stream of that caller.
-5. A watch without a selector keeps its upstream watch, because a new upstream watch without a selector replays every namespace of the cluster. For each name that the caller gains, the service reads that namespace with the service token. The stream then gets an `ADDED` event with the object of the answer. Steve lists that name for the caller, so the caller is allowed to read it. When the read gets a status other than 200, the service tries again at the next re-read.
+5. A watch without a selector keeps its upstream watch, because a new upstream watch without a selector replays every namespace of the cluster. For each name that the caller gains, the service reads that namespace with the service token. The stream then gets an `ADDED` event with the object of the answer. The allowed set of the caller contains that name, so the caller is allowed to read it. When the read gets a status other than 200, the service tries again at the next re-read.
 
 A new namespace in a project of the caller that already contains an allowed namespace does not change the selector. The service then keeps the upstream watch, and the upstream watch sends the event of that namespace. A chunked stream gets an event of the service as one line. An upgraded stream, a stream over a websocket connection, gets it as one text frame with plain JSON. On a websocket connection, the service does the handshake of the new upstream watch itself, with a new key.
 
@@ -104,14 +104,14 @@ On the `selfsubjectaccessreviews` path, the service grants a cluster-wide `list`
 
 With `--fanout` on, the service also answers a cluster-wide watch, for example `kubectl get pods -A --watch`, with one upstream watch per allowed namespace. It merges the upstream watches into one stream.
 
-1. The service opens every upstream watch at the same time, on the namespaced path of the kind, with the credentials of the caller. `--fanout-max-watch-namespaces` is the maximum size of that set of watches. A caller with more allowed namespaces than that maximum gets a 403 error, and the service opens no upstream watch. That maximum is lower than `--fanout-max-namespaces`. For a list, one upstream request is open for the length of that request. For a watch, one upstream connection stays open until the stream ends, and each client of the caller has its own set of connections.
+1. The service opens every upstream watch at the same time, on the namespaced path of the kind, with the credentials of the caller. `--fanout-max-watch-namespaces` is the maximum size of that set of watches. A caller with more allowed namespaces than that maximum gets a 403 error, and the service opens no upstream watch. By default, that maximum is lower than `--fanout-max-namespaces`. For a list, one upstream request is open for the length of that request. For a watch, one upstream connection stays open until the stream ends, and each client of the caller has its own set of connections.
 2. At the start of the stream, the service keeps the query of the caller on each upstream watch, with its `resourceVersion` and its `timeoutSeconds`. The merged list has the lowest `resourceVersion` of its answers, so a watch from that value loses no event. When the list answer of a namespace had a higher revision, the upstream watch of that namespace repeats the events between the two revisions. A client treats a repeated event as an update of an object that it already has.
 3. When the upstream watch of a namespace gets a status other than 200, the service leaves that namespace out of the stream. For a 404 error, the caller gets the native 403 error, because the kind then has no namespace scope. When RBAC denies the watch in every namespace of the allowed set, the caller also gets the native answer. The reason is that an open stream without an upstream watch does not show that the caller really has no permission.
 4. A caller that can see no namespace gets an open stream without an event. On the list path, such a caller gets a collection without an element.
 5. The service sends no `BOOKMARK` event on the merged stream, and it drops `allowWatchBookmarks` from the upstream requests. A bookmark contains the revision of one namespace. A client that resumes the merge from that bookmark loses the events of every other namespace. A watch-list, a watch with `sendInitialEvents=true`, is the exception. For a watch-list, the service keeps `allowWatchBookmarks` on each upstream watch, and the client gets the initial events of each upstream watch.
 
    After every upstream watch sent its own `BOOKMARK`, the service sends one `BOOKMARK` on the merged stream. That `BOOKMARK` has the annotation `k8s.io/initial-events-end` and the lowest `resourceVersion` of the upstream bookmarks. A caller with no allowed namespace gets that `BOOKMARK` at once, with no `resourceVersion`.
-6. A timer re-reads the allowed set of the caller once per cache TTL. The timer reads the set from the cache of a plain list, so it adds no request.
+6. A timer re-reads the allowed set of the caller once per cache TTL. The timer reads the set from the cache of a plain list, so it adds at most one fetch per cache TTL.
 7. The service adds a namespace that the caller gains to the open stream. The upstream watch of that namespace has no `resourceVersion`. The client therefore gets an `ADDED` event for each object that exists in that namespace. After these events, the client gets the live events of that namespace. The service also drops `resourceVersionMatch`, `sendInitialEvents`, and `allowWatchBookmarks` from that request. The stream does not end when the caller gains a namespace.
 
    After an end of the stream, a client watches again from its last `resourceVersion`, without a new list. The client then misses an object that was in the namespace before that new watch. When the watch of a gained namespace does not open, the service tries again at the next re-read. The service does this because Rancher creates the role bindings of a new namespace some seconds after the namespace.
@@ -124,7 +124,7 @@ With `--fanout` on, the service also answers a cluster-wide watch, for example `
 
 ## Requirements
 
-1. A Rancher service user with `list` and `watch` on `namespaces` in every cluster whose tenants use the service. A `cluster-owner` binding also grants these permissions.
+1. A Rancher service user with `get`, `list`, and `watch` on `namespaces` in every cluster whose tenants use the service. A `cluster-owner` binding also grants these permissions.
 2. An API token of that service user. The token has no scope.
 3. The token in a Secret that is mounted into the service.
 4. Route rules on the Rancher hostname for these requests:
@@ -185,7 +185,7 @@ The service always answers `GET /healthz` with status 200 and body `ok`. It answ
 
 | Difference | Detail |
 | --- | --- |
-| Cache delay | A role change becomes visible after the delay of Rancher plus the cache TTL. |
+| Cache delay | A role change becomes visible after the delay of Rancher plus the cache TTL. On an open watch, the delay of the service can reach two cache TTLs, because the timer can read a cached set that is one TTL old. |
 | Field selector | The answer to a field selector on a name outside the allowed set is an empty list. The answer to a `get` on that name is Forbidden. |
 | Namespace cap | A caller with more than 20,000 allowed namespace names gets an error, not a list. |
 | Fan-out cap | A cluster-wide list gets a 403 error, with no fan-out, when the caller has more than `--fanout-max-namespaces` allowed namespaces. |
@@ -207,7 +207,7 @@ The service writes JSON logs to stderr. It writes one line per intercepted reque
 
 A log line for a namespace list and a log line for a collection have the fields `cluster`, `outcome`, `status`, `count`, `watch`, and `duration_ms`. The value of `outcome` is `native`, `filtered`, `passthrough`, `denied`, `fanout`, `empty`, `capped`, or `error`. The field `count` is present only for the outcome `filtered`, `fanout`, `empty`, or `capped`. A Status body that the service writes for an error contains no internal address and no file path. The log line contains the full error. A log line for a collection also has the field `resource`, with the kind of the requested collection.
 
-A log line for a review has the fields `cluster`, `outcome`, and `status`. The value of `outcome` is `passthrough`, `native`, or `granted`.
+A log line for a review has the fields `cluster`, `outcome`, and `status`. The value of `outcome` is `passthrough`, `native`, `granted`, or `error`.
 
 Both kinds of log line have the field `user`, with the Rancher user id of the caller from a SelfSubjectReview. The field is present only when the service resolves that id. For a ServiceAccount caller, `user` is the subject of the token, for example `system:serviceaccount:<namespace>:<name>`. The API server verified that subject with the rules review. No metric attribute contains the user name, because a user name has an unbounded value set. An attribute with an unbounded value set makes the cardinality of the metric unbounded.
 
@@ -218,7 +218,7 @@ The service never logs a token, a cookie, a header value, or a request body. It 
 
 The service writes an `info` line with `cluster`, `lost`, and `gained` when it gives a namespace watch a new upstream watch. The fields `lost` and `gained` are the counts of the changed names. The service writes an `info` line with `cluster` when it ends a namespace watch after the allowed set of the caller changes. That line has the field `error` when the new upstream watch failed.
 
-The service writes a `debug` line with `cluster`, `type`, and `namespace` for each watch event that it writes itself. It writes a `debug` line with `cluster`, `namespace`, and `status` when it keeps a watch open on a lost namespace. This applies to a watch that takes no event of the service, when the upstream watch sent the `DELETED` event.
+The service writes a `debug` line with `cluster`, `type`, and `namespace` for each `ADDED` or `DELETED` event that it writes itself. It writes a `debug` line with `cluster`, `namespace`, and `status` when it keeps a watch open on a lost namespace. This applies to a watch that takes no event of the service, when the upstream watch sent the `DELETED` event.
 
 The service writes a `warn` line when the privileged list request gets a 403 error. The cause is that the service user has no permission to list namespaces.
 
@@ -238,7 +238,7 @@ The service replaces the cluster id, a namespace name, and an object name with a
 
 Search a trace on `resource.service.name`, not on the span name. The service takes the value of that attribute from `--service-name`.
 
-The service records `url.full` on a client span without the query, because the query of the privileged list contains every allowed namespace of the caller.
+The service records `url.full` on a client span with the query. The query of the privileged list can name every allowed namespace of the caller, so the trace backend gets those names.
 
 With `--otlp-endpoint` set, the service also exports these metrics:
 
@@ -256,7 +256,7 @@ With `--otlp-endpoint` set, the service also exports these metrics:
 
 In `drover.filter.watches.rejected`, the service counts each watch that it refuses with a 503 error because of a watch limit. The `limit` attribute is `shared` for `--max-watches`, and `caller` for `--max-watches-per-caller`. The service also counts in this metric an upgraded stream that it ends because of a websocket extension. The service records that count without a `limit` attribute.
 
-The value of the `cluster` attribute of the two request metrics is the cluster id only after Steve answered a namespace list for that cluster. For every other request, the value is `unknown`, because a client can put any string in the path, also before authentication. A metric attribute with an unbounded value set makes the cardinality of the metric unbounded.
+The value of the `cluster` attribute of the two request metrics is the cluster id only for a known cluster. A cluster is known after Steve answers a namespace list for it, or after a rules review names a namespace in it. For every other request, the value is `unknown`, because a client can put any string in the path, also before authentication. A metric attribute with an unbounded value set makes the cardinality of the metric unbounded.
 
 The `limit` attribute of `drover.filter.fetch.throttled` is `caller` for the limit per caller, and `shared` for the shared limit.
 
