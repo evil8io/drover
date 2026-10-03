@@ -69,8 +69,9 @@ func TestParseTrustFixtures(t *testing.T) {
 	if valid < 4 {
 		t.Errorf("valid cases = %d, want at least 4", valid)
 	}
-	// The fixture rules enable the AWS method, and only a write sets
-	// WriteFailed, so neither reason has a fixture.
+	// No fixture has the reason MethodDisabled, because the AWS method is on
+	// in the fixture rules. No fixture has the reason WriteFailed, because the
+	// parser never sets it.
 	for reason := range trustMessages {
 		if reason != reasonWriteFailed && reason != reasonMethodDisabled && !reasons[reason] {
 			t.Errorf("the fixture set has no case for the reason %s", reason)

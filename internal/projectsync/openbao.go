@@ -102,9 +102,9 @@ type openbaoWriter struct {
 	sessionUntil time.Time
 	retried      bool
 
-	// mu guards written, verified, the time of the last read or write of
-	// each role and policy, by cluster and object key, and logins, the last
-	// write of each login role.
+	// mu guards written, verified, and logins. verified has the time of the
+	// last read or write of each role and policy, by cluster and object key.
+	// logins has the last write of each login role.
 	mu       sync.Mutex
 	written  map[string]openbaoEntry
 	verified map[string]map[string]time.Time
@@ -418,8 +418,8 @@ func (s *Syncer) refreshOpenBao(ctx context.Context, token string, names []strin
 		defer mu.Unlock()
 		run.errors += errs
 	})
-	// The login roles name the ACL policies of the project roles, so they
-	// come after those.
+	// Each login role contains the name of the ACL policy of a project role,
+	// so the service writes the login roles after the policies.
 	if rules := s.trustRules(); rules != nil {
 		run.errors += s.refreshTrust(ctx, token, names, ready, projects, rules)
 	}

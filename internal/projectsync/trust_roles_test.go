@@ -343,15 +343,15 @@ func TestReconcileDeletesTheStaleLoginRoles(t *testing.T) {
 	policyOf := func(project, role string) map[string]any {
 		return map[string]any{"token_policies": []any{"kubernetes-c-1-" + project + "-" + role}}
 	}
-	// A role of a known project without a statement of that name.
+	// The project of this role is known, but it has no statement of that name.
 	setup.bao.setLogin(githubMount, "p-alpha-old", policyOf("p-alpha", "read-only"))
-	// A role of a project that Rancher answers 404 for.
+	// Rancher answers 404 for the project of this role.
 	setup.bao.setLogin(githubMount, "p-gone-ci", policyOf("p-gone", "project-owner"))
-	// A role of a project that the list does not have, but that exists.
+	// The project of this role exists, but the project list does not have it.
 	setup.bao.setLogin(githubMount, "p-new-ci", policyOf("p-new", "read-only"))
-	// A role of a known project that the run does not check.
+	// The project of this role is known, but the run does not check it.
 	setup.bao.setLogin(awsAuthPath, "p-acct-ci", policyOf("p-acct", "read-only"))
-	// A role of another writer.
+	// Another writer owns this role.
 	setup.bao.setLogin(awsAuthPath, "admin-deploy", map[string]any{"token_policies": []any{"admin"}})
 
 	setup.syncer.reconcile(context.Background())

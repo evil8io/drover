@@ -20,14 +20,16 @@ import (
 const (
 	// maxTrustValue is the byte limit of the trust annotation.
 	maxTrustValue = 16384
-	// maxTrustStatusValue bounds the status annotation that the service keeps
-	// in memory. The status that the service writes is far shorter.
+	// maxTrustStatusValue is the byte limit of a status annotation that the
+	// service keeps in memory. The status that the service writes is far
+	// shorter.
 	maxTrustStatusValue = 128 << 10
-	// oversizeStatus replaces a status annotation above maxTrustStatusValue.
-	// It is not JSON, so it never equals the status that the service writes.
+	// oversizeStatus is the value that the service keeps in place of a status
+	// annotation above maxTrustStatusValue. It is not JSON, so it never equals
+	// the status that the service writes.
 	oversizeStatus = "oversize"
-	// maxStatusName bounds the name of a statement in the status, because an
-	// invalid name is tenant text of any length.
+	// maxStatusName is the byte limit of a statement name in the status,
+	// because an invalid name is tenant text of any length.
 	maxStatusName = 63
 
 	maxStatementsCap = 100
@@ -37,8 +39,8 @@ const (
 	trustHashPrefix  = "sha256:"
 )
 
-// The reason codes of the trust status. The order of the statement codes is
-// the order of the checks.
+// These constants are the reason codes of the status annotation. The order of
+// the statement codes is the order of the checks.
 const (
 	reasonInvalidName          = "InvalidName"
 	reasonDuplicateName        = "DuplicateName"
@@ -84,8 +86,8 @@ var (
 	statementName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,30}[a-z0-9])?$`)
 	roleARN       = regexp.MustCompile(`^arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$`)
 	awsAccountID  = regexp.MustCompile(`^[0-9]{12}$`)
-	// issuerName keeps an issuer name usable as one segment of an OpenBao
-	// path.
+	// issuerName matches an issuer name that is valid as one segment of an
+	// OpenBao path.
 	issuerName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
 )
 
@@ -109,8 +111,8 @@ type trustIssuer struct {
 	allowed  map[string][]string
 }
 
-// trustRulesFile is the JSON form of trustRules. Unknown keys are ignored, so
-// that the chart can render more keys.
+// trustRulesFile is the JSON form of trustRules. The service ignores an
+// unknown key, so that the chart can render more keys.
 type trustRulesFile struct {
 	Annotation       string `json:"annotation"`
 	StatusAnnotation string `json:"statusAnnotation"`
@@ -237,8 +239,8 @@ func newTrustValue(value string) trustValue {
 
 func (v trustValue) present() bool { return v.hash != "" }
 
-// pruneTrustStatus returns the status annotation that the service keeps of
-// value.
+// pruneTrustStatus returns the value that the service keeps in memory for the
+// status annotation value.
 func pruneTrustStatus(value string) string {
 	if len(value) > maxTrustStatusValue {
 		return oversizeStatus
@@ -247,7 +249,7 @@ func pruneTrustStatus(value string) string {
 }
 
 // trustDocument is a parsed trust annotation. reason is the reason of a
-// document error, and "" when the statements parsed.
+// document error. It is "" when the document breaks no document rule.
 type trustDocument struct {
 	reason     string
 	statements []trustStatement
@@ -597,7 +599,7 @@ func statusName(name string) string {
 	return name[:cut]
 }
 
-// sameTrustStatus reports whether the status current equals want, without
+// sameTrustStatus reports whether the status current equals want. It ignores
 // observedAt. A current value that is not a JSON object differs.
 func sameTrustStatus(current string, want trustStatus) bool {
 	var have map[string]any
@@ -618,7 +620,7 @@ func sameTrustStatus(current string, want trustStatus) bool {
 }
 
 // previousLogins returns the login roles of the ready statements of the
-// status value. A value that does not parse lists none.
+// status value. It returns nil when it cannot decode the value.
 func previousLogins(value string) []loginRef {
 	var status struct {
 		Statements []struct {
