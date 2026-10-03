@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.24.0](https://github.com/evil8io/drover/compare/v0.23.0...v0.24.0) (2026-10-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* **project-sync:** name a login role <project>_<name> and harden the trust reconcile ([#129](https://github.com/evil8io/drover/issues/129))
+
+### Bug Fixes
+
+* **project-sync:** name a login role &lt;project&gt;_&lt;name&gt; and harden the trust reconcile ([#129](https://github.com/evil8io/drover/issues/129)) ([8d36f19](https://github.com/evil8io/drover/commit/8d36f192226c8f7d5427b8a75806af5b5af7fd2e))
+
 ## [0.23.0](https://github.com/evil8io/drover/compare/v0.22.2...v0.23.0) (2026-10-03)
 
 
