@@ -69,7 +69,8 @@ func (f *accountsFake) projectAnnotation(name, key string) (string, bool) {
 }
 
 // patchProject applies a merge patch of the annotations of a project. The
-// status write has this form. The patch deletes a key with a null value.
+// status write has this form. For a key with a null value, patchProject
+// deletes the key.
 func (f *accountsFake) patchProject(w http.ResponseWriter, r *http.Request, name string) {
 	body, _ := io.ReadAll(r.Body)
 	var patch struct {
