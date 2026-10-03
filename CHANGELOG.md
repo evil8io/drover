@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.23.0](https://github.com/evil8io/drover/compare/v0.22.2...v0.23.0) (2026-10-03)
+
+
+### Features
+
+* **project-sync:** write the OpenBao login roles of the project trust statements ([#126](https://github.com/evil8io/drover/issues/126)) ([5d5fe1c](https://github.com/evil8io/drover/commit/5d5fe1c92e5eb3400e7f4b95432b2b087f12c66c))
+
+
+### Bug Fixes
+
+* **deps:** update opentelemetry-go-contrib monorepo to v0.72.0 ([#124](https://github.com/evil8io/drover/issues/124)) ([be94d95](https://github.com/evil8io/drover/commit/be94d9505f631cdec4517bdb52648b99d59e9777))
+
 ## [0.22.2](https://github.com/evil8io/drover/compare/v0.22.1...v0.22.2) (2026-09-28)
 
 
