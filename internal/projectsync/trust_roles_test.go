@@ -3,7 +3,10 @@ package projectsync
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -69,13 +72,18 @@ func TestReconcileWritesTheLoginRolesOfTheValidStatements(t *testing.T) {
 		"bound_audiences": []any{"https://openbao.example.com"},
 		// The statement does not contain ref, so the service binds the role
 		// to every allowed value of it.
-		"bound_claims":      map[string]any{"repository_id": "123456789", "ref": []any{"refs/heads/main", "refs/heads/release"}},
-		"bound_claims_type": "string",
-		"bound_subject":     "",
-		"user_claim":        "repository_id",
-		"claim_mappings":    map[string]any{},
+		"bound_claims":            map[string]any{"repository_id": "123456789", "ref": []any{"refs/heads/main", "refs/heads/release"}},
+		"bound_claims_type":       "string",
+		"bound_subject":           "",
+		"user_claim":              "repository_id",
+		"user_claim_json_pointer": false,
+		"groups_claim":            "",
+		"claim_mappings":          map[string]any{},
+		"expiration_leeway":       float64(0),
+		"not_before_leeway":       float64(0),
+		"clock_skew_leeway":       float64(0),
 	})
-	if got, _ := setup.bao.login(githubMount, "p-alpha-deploy"); !reflect.DeepEqual(got, jwtWant) {
+	if got, _ := setup.bao.login(githubMount, "p-alpha_deploy"); !reflect.DeepEqual(got, jwtWant) {
 		t.Errorf("JWT role =\n%v\nwant\n%v", got, jwtWant)
 	}
 	awsWant := withFields(loginTokenWant("p-alpha", "read-only"), map[string]any{
@@ -84,11 +92,11 @@ func TestReconcileWritesTheLoginRolesOfTheValidStatements(t *testing.T) {
 		"resolve_aws_unique_ids":  false,
 		"inferred_entity_type":    "",
 	})
-	if got, _ := setup.bao.login(awsAuthPath, "p-alpha-rotator"); !reflect.DeepEqual(got, awsWant) {
+	if got, _ := setup.bao.login(awsAuthPath, "p-alpha_rotator"); !reflect.DeepEqual(got, awsWant) {
 		t.Errorf("AWS role =\n%v\nwant\n%v", got, awsWant)
 	}
-	if got := setup.bao.loginNames(githubMount); !slices.Equal(got, []string{"p-alpha-deploy"}) {
-		t.Errorf("JWT roles = %v, want only p-alpha-deploy", got)
+	if got := setup.bao.loginNames(githubMount); !slices.Equal(got, []string{"p-alpha_deploy"}) {
+		t.Errorf("JWT roles = %v, want only p-alpha_deploy", got)
 	}
 
 	policyAt, roleAt := -1, -1
@@ -96,7 +104,7 @@ func TestReconcileWritesTheLoginRolesOfTheValidStatements(t *testing.T) {
 		if req.method == http.MethodPut && req.path == "/v1/sys/policies/acl/kubernetes-c-1-p-alpha-project-member" {
 			policyAt = i
 		}
-		if req.method == http.MethodPost && req.path == "/v1/"+githubMount+"/role/p-alpha-deploy" {
+		if req.method == http.MethodPost && req.path == "/v1/"+githubMount+"/role/p-alpha_deploy" {
 			roleAt = i
 		}
 	}
@@ -106,8 +114,8 @@ func TestReconcileWritesTheLoginRolesOfTheValidStatements(t *testing.T) {
 
 	status, _ := fake.projectAnnotation("p-alpha", trustStatusKey)
 	want := `{"observedHash":"` + trustHash(document) + `","observedAt":"2026-01-01T00:00:00Z","statements":[` +
-		`{"name":"deploy","ready":true,"login":{"path":"auth/jwt/github","role":"p-alpha-deploy"}},` +
-		`{"name":"rotator","ready":true,"login":{"path":"auth/aws","role":"p-alpha-rotator"}},` +
+		`{"name":"deploy","ready":true,"login":{"path":"auth/jwt/github","role":"p-alpha_deploy"}},` +
+		`{"name":"rotator","ready":true,"login":{"path":"auth/aws","role":"p-alpha_rotator"}},` +
 		`{"name":"bad","ready":false,"reason":"InvalidRole","message":"the role is not project-owner, project-member, or read-only"}]}`
 	if status != want {
 		t.Errorf("status =\n%s\nwant\n%s", status, want)
@@ -161,17 +169,17 @@ func TestReconcileWritesTheTrustStatusOnlyOnADifference(t *testing.T) {
 	}
 	third, _ := fake.projectAnnotation("p-alpha", trustStatusKey)
 	want := `{"observedHash":"` + trustHash(oneStatement) + `","observedAt":"2026-01-01T00:02:00Z","statements":[` +
-		`{"name":"deploy","ready":true,"login":{"path":"auth/jwt/github","role":"p-alpha-deploy"}}]}`
+		`{"name":"deploy","ready":true,"login":{"path":"auth/jwt/github","role":"p-alpha_deploy"}}]}`
 	if third != want {
 		t.Errorf("status =\n%s\nwant\n%s", third, want)
 	}
-	if _, ok := setup.bao.login(awsAuthPath, "p-alpha-rotator"); ok {
+	if _, ok := setup.bao.login(awsAuthPath, "p-alpha_rotator"); ok {
 		t.Error("the role of the removed statement exists, want it deleted")
 	}
-	if got := countRequests(setup.bao.all(), http.MethodDelete, "/v1/auth/aws/role/p-alpha-rotator"); got != 1 {
+	if got := countRequests(setup.bao.all(), http.MethodDelete, "/v1/auth/aws/role/p-alpha_rotator"); got != 1 {
 		t.Errorf("deletes of the role of the removed statement = %d, want 1", got)
 	}
-	if got := countRequests(setup.bao.all(), http.MethodPost, "/v1/"+githubMount+"/role/p-alpha-deploy"); got != 0 {
+	if got := countRequests(setup.bao.all(), http.MethodPost, "/v1/"+githubMount+"/role/p-alpha_deploy"); got != 0 {
 		t.Errorf("writes of an unchanged role inside the window = %d, want 0", got)
 	}
 }
@@ -204,7 +212,7 @@ func TestReconcileRefreshesAnUnchangedLoginRoleWithoutAChange(t *testing.T) {
 	if got := loginChanges(t, reader); got != 1 {
 		t.Fatalf("login role changes after the create = %d, want 1", got)
 	}
-	rolePath := "/v1/" + githubMount + "/role/p-alpha-deploy"
+	rolePath := "/v1/" + githubMount + "/role/p-alpha_deploy"
 
 	setup.bao.reset()
 	setup.clock.advance(openbaoVerifyAfter)
@@ -219,7 +227,7 @@ func TestReconcileRefreshesAnUnchangedLoginRoleWithoutAChange(t *testing.T) {
 		t.Errorf("no debug line for the refresh:\n%s", logs)
 	}
 	for _, line := range strings.Split(logs, "\n") {
-		if strings.Contains(line, "level=INFO") && strings.Contains(line, "p-alpha-deploy") {
+		if strings.Contains(line, "level=INFO") && strings.Contains(line, "p-alpha_deploy") {
 			t.Errorf("an info line for the refresh: %s", line)
 		}
 	}
@@ -232,7 +240,7 @@ func TestReconcileRefreshesAnUnchangedLoginRoleWithoutAChange(t *testing.T) {
 	offset = len(setup.logs.String())
 	setup.syncer.reconcile(context.Background())
 
-	if !strings.Contains(setup.logs.String()[offset:], `level=INFO msg="OpenBao object changed" cluster=c-1 kind=jwt-role action=write name=p-alpha-deploy`) {
+	if !strings.Contains(setup.logs.String()[offset:], `level=INFO msg="OpenBao object changed" cluster=c-1 kind=jwt-role action=write name=p-alpha_deploy`) {
 		t.Errorf("no change line for a changed body:\n%s", setup.logs.String()[offset:])
 	}
 	if got := loginChanges(t, reader); got != 2 {
@@ -252,10 +260,10 @@ func TestListProjectDeletesTheLoginRoleOfARemovedStatement(t *testing.T) {
 	setup.bao.reset()
 	listTrustProject(t, setup, "p-alpha")
 
-	if _, ok := setup.bao.login(awsAuthPath, "p-alpha-rotator"); ok {
+	if _, ok := setup.bao.login(awsAuthPath, "p-alpha_rotator"); ok {
 		t.Error("the role of the removed statement exists, want it deleted")
 	}
-	if _, ok := setup.bao.login(githubMount, "p-alpha-deploy"); !ok {
+	if _, ok := setup.bao.login(githubMount, "p-alpha_deploy"); !ok {
 		t.Error("the role of the kept statement is gone")
 	}
 	for _, req := range setup.bao.loginRequests() {
@@ -344,38 +352,51 @@ func TestReconcileDeletesTheStaleLoginRoles(t *testing.T) {
 		return map[string]any{"token_policies": []any{"kubernetes-c-1-" + project + "-" + role}}
 	}
 	// The project of this role is known, but it has no statement of that name.
-	setup.bao.setLogin(githubMount, "p-alpha-old", policyOf("p-alpha", "read-only"))
+	setup.bao.setLogin(githubMount, "p-alpha_old", policyOf("p-alpha", "read-only"))
 	// Rancher answers 404 for the project of this role.
-	setup.bao.setLogin(githubMount, "p-gone-ci", policyOf("p-gone", "project-owner"))
+	setup.bao.setLogin(githubMount, "p-gone_ci", policyOf("p-gone", "project-owner"))
 	// The project of this role exists, but the project list does not have it.
-	setup.bao.setLogin(githubMount, "p-new-ci", policyOf("p-new", "read-only"))
+	setup.bao.setLogin(githubMount, "p-new_ci", policyOf("p-new", "read-only"))
 	// The project of this role is known, but the run does not check it.
-	setup.bao.setLogin(awsAuthPath, "p-acct-ci", policyOf("p-acct", "read-only"))
-	// Another writer owns this role.
+	setup.bao.setLogin(awsAuthPath, "p-acct_ci", policyOf("p-acct", "read-only"))
+	// Another writer owns these roles. The first name is not a name of the
+	// service, and the policy of the second is not a policy of the service.
 	setup.bao.setLogin(awsAuthPath, "admin-deploy", map[string]any{"token_policies": []any{"admin"}})
+	setup.bao.setLogin(awsAuthPath, "admin_deploy", map[string]any{"token_policies": []any{"admin"}})
+	// The policy of this role names another project than the role name.
+	setup.bao.setLogin(githubMount, "p-other_ci", policyOf("p-gone", "project-owner"))
 
 	setup.syncer.reconcile(context.Background())
 
-	if got := setup.bao.loginNames(githubMount); !slices.Equal(got, []string{"p-alpha-deploy", "p-new-ci"}) {
-		t.Errorf("JWT roles = %v, want p-alpha-deploy and p-new-ci", got)
+	if got := setup.bao.loginNames(githubMount); !slices.Equal(got, []string{"p-alpha_deploy", "p-new_ci", "p-other_ci"}) {
+		t.Errorf("JWT roles = %v, want p-alpha_deploy, p-new_ci, and p-other_ci", got)
 	}
-	if got := setup.bao.loginNames(awsAuthPath); !slices.Equal(got, []string{"admin-deploy", "p-acct-ci"}) {
-		t.Errorf("AWS roles = %v, want admin-deploy and p-acct-ci", got)
+	if got := setup.bao.loginNames(awsAuthPath); !slices.Equal(got, []string{"admin-deploy", "admin_deploy", "p-acct_ci"}) {
+		t.Errorf("AWS roles = %v, want admin-deploy, admin_deploy, and p-acct_ci", got)
+	}
+	if got := countRequests(setup.bao.all(), http.MethodGet, "/v1/auth/aws/role/admin-deploy"); got != 0 {
+		t.Errorf("reads of admin-deploy = %d, want 0, because the name is not a name of the service", got)
 	}
 	for _, project := range []string{"p-gone", "p-new"} {
 		if got := fake.requestsOfPath(projectsPath + "/" + acctCluster + ":" + project); len(got) != 1 {
 			t.Errorf("project requests for %s = %d, want 1", project, len(got))
 		}
 	}
-	for _, name := range []string{"p-alpha-old", "p-acct-ci"} {
+	for _, name := range []string{"p-alpha_old", "p-acct_ci"} {
 		if got := countRequests(setup.bao.all(), http.MethodGet, "/v1/"+githubMount+"/role/"+name) +
 			countRequests(setup.bao.all(), http.MethodGet, "/v1/auth/aws/role/"+name); got != 0 {
 			t.Errorf("reads of %s = %d, want 0, because the name names a known project", name, got)
 		}
 	}
 	logs := setup.logs.String()
-	if !strings.Contains(logs, `msg="the login role has no policy of the service, so the service keeps it" mount=auth/aws name=admin-deploy`) {
-		t.Errorf("no debug line for the role of another writer:\n%s", logs)
+	for _, line := range []string{
+		`msg="the login role has no policy of the service, so the service keeps it" mount=auth/aws name=admin_deploy`,
+		`msg="the login role has no policy of the service, so the service keeps it" mount=auth/jwt/github name=p-other_ci`,
+		`level=DEBUG msg="the login roles have no name of the service, so the service keeps them" count=1`,
+	} {
+		if !strings.Contains(logs, line) {
+			t.Errorf("no line %s:\n%s", line, logs)
+		}
 	}
 	if !strings.Contains(logs, "errors=0") {
 		t.Errorf("the run has errors:\n%s", logs)
@@ -394,11 +415,11 @@ func TestReconcileGivesMethodDisabledForAMissingAuthMount(t *testing.T) {
 	status, _ := fake.projectAnnotation("p-alpha", trustStatusKey)
 	want := `{"observedHash":"` + trustHash(twoStatements) + `","observedAt":"2026-01-01T00:00:00Z","statements":[` +
 		`{"name":"deploy","ready":false,"reason":"MethodDisabled","message":"the login method is not enabled"},` +
-		`{"name":"rotator","ready":true,"login":{"path":"auth/aws","role":"p-alpha-rotator"}}]}`
+		`{"name":"rotator","ready":true,"login":{"path":"auth/aws","role":"p-alpha_rotator"}}]}`
 	if status != want {
 		t.Errorf("status =\n%s\nwant\n%s", status, want)
 	}
-	if got := countRequests(setup.bao.all(), http.MethodPost, "/v1/"+githubMount+"/role/p-alpha-deploy"); got != 0 {
+	if got := countRequests(setup.bao.all(), http.MethodPost, "/v1/"+githubMount+"/role/p-alpha_deploy"); got != 0 {
 		t.Errorf("writes to the missing mount = %d, want 0, because the list found no mount", got)
 	}
 	if !strings.Contains(setup.logs.String(), "errors=0") {
@@ -409,7 +430,7 @@ func TestReconcileGivesMethodDisabledForAMissingAuthMount(t *testing.T) {
 	setup.bao.reset()
 	listTrustProject(t, setup, "p-alpha")
 
-	if got := countRequests(setup.bao.all(), http.MethodPost, "/v1/"+githubMount+"/role/p-alpha-deploy"); got != 1 {
+	if got := countRequests(setup.bao.all(), http.MethodPost, "/v1/"+githubMount+"/role/p-alpha_deploy"); got != 1 {
 		t.Errorf("writes of the event path = %d, want 1", got)
 	}
 	if got := projectPatches(fake, "p-alpha"); len(got) != 0 {
@@ -479,25 +500,304 @@ func TestReconcileWritesTheReasonOfAnInvalidDocument(t *testing.T) {
 	}
 }
 
-func TestReconcileWritesNoLoginRoleWhoseNameFitsTwoProjects(t *testing.T) {
+func TestReconcileKeepsTheRoleOfAProjectWhoseNameStartsWithAnotherProjectName(t *testing.T) {
 	t.Parallel()
 	fake := newAccountsFake(t)
-	fake.addProject("p-a", trusted(`{"statements":[{"name":"x-ci","jwt":{"issuer":"github","claims":{"repository_id":"1"}},"role":"read-only"}]}`))
-	fake.addProject("p-a-x", trusted(`{"statements":[{"name":"ci","jwt":{"issuer":"github","claims":{"repository_id":"2"}},"role":"read-only"}]}`))
+	fake.addProject("p", trusted(`{"statements":[{"name":"alpha-deploy","jwt":{"issuer":"github","claims":{"repository_id":"1"}},"role":"read-only"}]}`))
+	fake.addProject("p-alpha", trusted(oneStatement))
 	setup := newTrustSetup(t, fake)
 
 	setup.syncer.reconcile(context.Background())
+	setup.clock.advance(openbaoVerifyAfter)
+	setup.syncer.reconcile(context.Background())
 
-	if got := setup.bao.loginNames(githubMount); len(got) != 0 {
-		t.Errorf("JWT roles = %v, want none", got)
+	if got := setup.bao.loginNames(githubMount); !slices.Equal(got, []string{"p-alpha_deploy", "p_alpha-deploy"}) {
+		t.Errorf("JWT roles = %v, want p-alpha_deploy and p_alpha-deploy", got)
 	}
-	for _, project := range []string{"p-a", "p-a-x"} {
-		status, _ := fake.projectAnnotation(project, trustStatusKey)
-		if !strings.Contains(status, `"reason":"WriteFailed"`) {
-			t.Errorf("status of %s = %s, want WriteFailed", project, status)
+	for _, req := range setup.bao.loginRequests() {
+		if req.method == http.MethodDelete {
+			t.Errorf("DELETE %s, want no delete", req.path)
 		}
+	}
+	for project, role := range map[string]string{"p": "p_alpha-deploy", "p-alpha": "p-alpha_deploy"} {
+		status, _ := fake.projectAnnotation(project, trustStatusKey)
+		if !strings.Contains(status, `"ready":true,"login":{"path":"auth/jwt/github","role":"`+role+`"}`) {
+			t.Errorf("status of %s = %s, want the ready role %s", project, status, role)
+		}
+	}
+	if logs := setup.logs.String(); strings.Contains(logs, "the login role name is not unique") || strings.Contains(logs, "errors=1") {
+		t.Errorf("the run found a name of two projects, or an error:\n%s", logs)
+	}
+}
+
+func TestRefreshTrustGivesWriteFailedForAProjectNameInTwoClusters(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", trusted(oneStatement))
+	setup := newTrustSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+	rolePath := "/v1/" + githubMount + "/role/p-alpha_deploy"
+	if _, ok := setup.bao.login(githubMount, "p-alpha_deploy"); !ok {
+		t.Fatal("the first run wrote no role")
+	}
+
+	// The cluster c-2 also has a project p-alpha.
+	projects := map[string]map[string]project{
+		acctCluster: setup.syncer.projectsOf(acctCluster),
+		"c-2":       {"p-alpha": {}},
+	}
+	ready := map[string]openbaoTarget{acctCluster: {tenants: []string{"p-alpha"}}}
+	setup.bao.reset()
+	errs := setup.syncer.refreshTrust(context.Background(), serviceToken, []string{acctCluster, "c-2"}, ready, projects, setup.syncer.trustRules())
+
+	if errs != 0 {
+		t.Errorf("errors = %d, want 0", errs)
+	}
+	status, _ := fake.projectAnnotation("p-alpha", trustStatusKey)
+	if !strings.Contains(status, `{"name":"deploy","ready":false,"reason":"WriteFailed"`) {
+		t.Errorf("status = %s, want WriteFailed for deploy", status)
+	}
+	if got := countRequests(setup.bao.all(), http.MethodPost, rolePath); got != 0 {
+		t.Errorf("writes of the role = %d, want 0", got)
+	}
+	// The stale pass takes the cluster of the role from its first token
+	// policy.
+	if got := countRequests(setup.bao.all(), http.MethodGet, rolePath); got != 1 {
+		t.Errorf("reads of the role = %d, want 1", got)
+	}
+	if _, ok := setup.bao.login(githubMount, "p-alpha_deploy"); ok {
+		t.Error("the role exists, want it deleted")
 	}
 	if !strings.Contains(setup.logs.String(), "the login role name is not unique") {
 		t.Errorf("no line for the name of two projects:\n%s", setup.logs.String())
+	}
+}
+
+func TestRefreshTrustTakesTheProjectFromTheSnapshot(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", trusted(twoStatements))
+	setup := newTrustSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+	listed := setup.syncer.snapshot()
+	ready := map[string]openbaoTarget{acctCluster: {tenants: []string{"p-alpha"}}}
+	rotatorPath := "/v1/auth/aws/role/p-alpha_rotator"
+
+	// A project event after the project list of the run narrows the
+	// document.
+	fake.editProject("p-alpha", func(p *storedProject) { p.annotations[trustKey] = oneStatement })
+	listTrustProject(t, setup, "p-alpha")
+	if _, ok := setup.bao.login(awsAuthPath, "p-alpha_rotator"); ok {
+		t.Fatal("the event kept the role of the removed statement")
+	}
+	// The project watch stores the status that the event wrote.
+	watchProject(t, setup, "p-alpha")
+	setup.bao.reset()
+	fake.resetRequests()
+
+	errs := setup.syncer.refreshTrust(context.Background(), serviceToken, []string{acctCluster}, ready, listed, setup.syncer.trustRules())
+
+	if errs != 0 {
+		t.Errorf("errors = %d, want 0", errs)
+	}
+	if got := countRequests(setup.bao.all(), http.MethodPost, rotatorPath); got != 0 {
+		t.Errorf("writes of the removed role = %d, want 0", got)
+	}
+	if _, ok := setup.bao.login(awsAuthPath, "p-alpha_rotator"); ok {
+		t.Error("the run wrote the role of the removed statement again")
+	}
+	if got := projectPatches(fake, "p-alpha"); len(got) != 0 {
+		t.Errorf("status patches = %d, want 0, because the event wrote the status", len(got))
+	}
+
+	// A project event deletes the project from the snapshot.
+	if !setup.syncer.deleteProject(acctCluster, "p-alpha") {
+		t.Fatalf("the snapshot has no cluster %s", acctCluster)
+	}
+	setup.bao.reset()
+	fake.resetRequests()
+
+	errs = setup.syncer.refreshTrust(context.Background(), serviceToken, []string{acctCluster}, ready, listed, setup.syncer.trustRules())
+
+	if errs != 0 {
+		t.Errorf("errors = %d, want 0", errs)
+	}
+	for _, req := range setup.bao.loginRequests() {
+		if req.method != http.MethodGet {
+			t.Errorf("%s %s for a project that the snapshot does not have", req.method, req.path)
+		}
+	}
+	if got := projectPatches(fake, "p-alpha"); len(got) != 0 {
+		t.Errorf("status patches = %d, want 0", len(got))
+	}
+}
+
+func TestProjectEventDeletesEachRoleOfALongStatusOnce(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", trusted(oneStatement))
+	setup := newTrustSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+
+	entries := make([]string, 0, 3000)
+	for i := range 3000 {
+		entries = append(entries, fmt.Sprintf(`{"name":"s","ready":true,"login":{"path":"auth/aws","role":"p-alpha_s%d"}}`, i%10))
+	}
+	// The status is above the size limit of a status from Rancher, so the
+	// test puts it into the snapshot directly.
+	item := setup.syncer.projectsOf(acctCluster)["p-alpha"]
+	item.trustStatus = `{"statements":[` + strings.Join(entries, ",") + `]}`
+	if !setup.syncer.setProject(acctCluster, "p-alpha", item) {
+		t.Fatalf("the snapshot has no cluster %s", acctCluster)
+	}
+	setup.bao.reset()
+	offset := len(setup.logs.String())
+
+	setup.syncer.keepProjectTrust(context.Background(), serviceToken, acctCluster, "p-alpha")
+
+	limit := setup.syncer.trustRules().maxStatements + 1
+	deletes := 0
+	for _, req := range setup.bao.loginRequests() {
+		if req.method == http.MethodDelete {
+			deletes++
+		}
+	}
+	if deletes == 0 || deletes > limit {
+		t.Errorf("delete requests = %d, want 1 to %d", deletes, limit)
+	}
+	if lines := strings.Count(setup.logs.String()[offset:], "kind=aws-role action=delete"); lines != deletes {
+		t.Errorf("delete lines = %d, want %d", lines, deletes)
+	}
+}
+
+func TestProjectEventKeepsTheRolesOfAStatusThatTheProjectDoesNotOwn(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", trusted(oneStatement))
+	fake.addProject("p-beta", trusted(oneStatement))
+	setup := newTrustSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+
+	keys := []loginKey{
+		// The role of another project.
+		{mount: githubMount, name: "p-beta_deploy"},
+		// A mount that the rules file does not have.
+		{mount: "auth/jwt/other", name: "p-alpha_deploy"},
+		// A role name with path text.
+		{mount: githubMount, name: "p-alpha_deploy/../../../../sys/policies/acl/admin"},
+	}
+	run := &trustRun{rules: setup.syncer.trustRules(), owners: newProjectNames(setup.syncer.snapshot())}
+	if !setup.syncer.ownsLogin(run, acctCluster, "p-alpha", loginKey{mount: githubMount, name: "p-alpha_deploy"}) {
+		t.Error("p-alpha does not own its own role, want it to own the role")
+	}
+	entries := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if setup.syncer.ownsLogin(run, acctCluster, "p-alpha", key) {
+			t.Errorf("p-alpha owns %s %s, want no owner", key.mount, key.name)
+		}
+		data, err := json.Marshal(statementStatus{Name: "x", Ready: true, Login: &loginRef{Path: key.mount, Role: key.name}})
+		if err != nil {
+			t.Fatalf("encode the entry: %v", err)
+		}
+		entries = append(entries, string(data))
+	}
+	status := `{"statements":[` + strings.Join(entries, ",") + `]}`
+	fake.editProject("p-alpha", func(p *storedProject) { p.annotations[trustStatusKey] = status })
+	setup.bao.reset()
+
+	listTrustProject(t, setup, "p-alpha")
+
+	for _, req := range setup.bao.all() {
+		if req.method == http.MethodDelete {
+			t.Errorf("DELETE %s, want no delete", req.path)
+		}
+	}
+	if _, ok := setup.bao.login(githubMount, "p-beta_deploy"); !ok {
+		t.Error("the role of p-beta is gone")
+	}
+}
+
+func TestReconcileKeepsTheRoleOfAFailedWrite(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", trusted(oneStatement))
+	setup := newTrustSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+	before, ok := setup.bao.login(githubMount, "p-alpha_deploy")
+	if !ok {
+		t.Fatal("the first run wrote no role")
+	}
+
+	changed := `{"statements":[{"name":"deploy","jwt":{"issuer":"github","claims":{"repository_id":"123456789","ref":"refs/heads/main"}},"role":"project-member"}]}`
+	fake.editProject("p-alpha", func(p *storedProject) { p.annotations[trustKey] = changed })
+	setup.bao.fail(githubMount+"/role/p-alpha_deploy", http.StatusInternalServerError)
+	setup.bao.reset()
+	offset := len(setup.logs.String())
+	setup.syncer.reconcile(context.Background())
+
+	status, _ := fake.projectAnnotation("p-alpha", trustStatusKey)
+	want := `{"observedHash":"` + trustHash(changed) + `","observedAt":"2026-01-01T00:00:00Z","statements":[` +
+		`{"name":"deploy","ready":false,"reason":"WriteFailed","message":"the login role write in OpenBao failed"}]}`
+	if status != want {
+		t.Errorf("status =\n%s\nwant\n%s", status, want)
+	}
+	if after, _ := setup.bao.login(githubMount, "p-alpha_deploy"); !reflect.DeepEqual(after, before) {
+		t.Errorf("role after the failed write =\n%v\nwant the role of the first run\n%v", after, before)
+	}
+	for _, req := range setup.bao.loginRequests() {
+		if req.method == http.MethodDelete {
+			t.Errorf("DELETE %s, want no delete", req.path)
+		}
+	}
+	logs := setup.logs.String()[offset:]
+	if !strings.Contains(logs, `msg="the OpenBao jwt-role write failed" cluster=c-1 name=p-alpha_deploy`) || !strings.Contains(logs, "errors=1") {
+		t.Errorf("no error line and no error count for the failed write:\n%s", logs)
+	}
+}
+
+func TestReconcileLeavesTheMountOfARemovedIssuer(t *testing.T) {
+	t.Parallel()
+	data, err := os.ReadFile(trustRulesPath)
+	if err != nil {
+		t.Fatalf("read the rules: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "rules.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write the rules: %v", err)
+	}
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", trusted(twoStatements))
+	setup := newTrustSetup(t, fake, withTrust(path))
+	setup.syncer.reconcile(context.Background())
+
+	var rules map[string]any
+	if err := json.Unmarshal(data, &rules); err != nil {
+		t.Fatalf("decode the rules: %v", err)
+	}
+	delete(rules["jwtIssuers"].(map[string]any), "github")
+	if err := os.WriteFile(path, must(json.Marshal(rules)), 0o600); err != nil {
+		t.Fatalf("write the rules: %v", err)
+	}
+	setup.bao.reset()
+	offset := len(setup.logs.String())
+	setup.syncer.reconcile(context.Background())
+
+	status, _ := fake.projectAnnotation("p-alpha", trustStatusKey)
+	want := `{"observedHash":"` + trustHash(twoStatements) + `","observedAt":"2026-01-01T00:00:00Z","statements":[` +
+		`{"name":"deploy","ready":false,"reason":"UnknownIssuer","message":"the JWT issuer is not configured"},` +
+		`{"name":"rotator","ready":true,"login":{"path":"auth/aws","role":"p-alpha_rotator"}}]}`
+	if status != want {
+		t.Errorf("status =\n%s\nwant\n%s", status, want)
+	}
+	for _, req := range setup.bao.all() {
+		if strings.HasPrefix(req.path, "/v1/"+githubMount+"/") {
+			t.Errorf("%s %s, want no request to the mount of the removed issuer", req.method, req.path)
+		}
+	}
+	if _, ok := setup.bao.login(githubMount, "p-alpha_deploy"); !ok {
+		t.Error("the role of the removed issuer is gone, want it kept")
+	}
+	if logs := setup.logs.String()[offset:]; !strings.Contains(logs, "errors=0") {
+		t.Errorf("the run has errors:\n%s", logs)
 	}
 }

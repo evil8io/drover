@@ -20,6 +20,10 @@ const (
 
 	kindJWTRole = "jwt-role"
 	kindAWSRole = "aws-role"
+
+	// loginSeparator is between the project name and the statement name of a
+	// login role name. Neither name can contain it.
+	loginSeparator = "_"
 )
 
 // loginKey is one login role: the path of its auth mount, and its name.
@@ -58,7 +62,7 @@ func (r *trustRules) mounts() []string {
 
 // loginKey returns the login role of the valid statement item of project.
 func (r *trustRules) loginKey(project string, item trustStatement) loginKey {
-	key := loginKey{mount: awsAuthPath, name: project + "-" + item.name}
+	key := loginKey{mount: awsAuthPath, name: project + loginSeparator + item.name}
 	if item.jwt != nil {
 		key.mount = jwtAuthPrefix + item.jwt.issuer
 	}
@@ -81,14 +85,22 @@ type loginToken struct {
 	TokenNoDefaultPolicy bool     `json:"token_no_default_policy"`
 }
 
+// jwtLoginRole is the body of a JWT login role. The zero values of
+// user_claim_json_pointer, groups_claim, and the three leeways replace a value
+// that another writer set.
 type jwtLoginRole struct {
-	RoleType        string            `json:"role_type"`
-	BoundAudiences  []string          `json:"bound_audiences"`
-	BoundClaims     map[string]any    `json:"bound_claims"`
-	BoundClaimsType string            `json:"bound_claims_type"`
-	BoundSubject    string            `json:"bound_subject"`
-	UserClaim       string            `json:"user_claim"`
-	ClaimMappings   map[string]string `json:"claim_mappings"`
+	RoleType             string            `json:"role_type"`
+	BoundAudiences       []string          `json:"bound_audiences"`
+	BoundClaims          map[string]any    `json:"bound_claims"`
+	BoundClaimsType      string            `json:"bound_claims_type"`
+	BoundSubject         string            `json:"bound_subject"`
+	UserClaim            string            `json:"user_claim"`
+	UserClaimJSONPointer bool              `json:"user_claim_json_pointer"`
+	GroupsClaim          string            `json:"groups_claim"`
+	ClaimMappings        map[string]string `json:"claim_mappings"`
+	ExpirationLeeway     int               `json:"expiration_leeway"`
+	NotBeforeLeeway      int               `json:"not_before_leeway"`
+	ClockSkewLeeway      int               `json:"clock_skew_leeway"`
 	loginToken
 }
 
@@ -199,9 +211,8 @@ type projectRef struct {
 }
 
 // projectNames maps a project name to the clusters that have a project with
-// that name. A login role name starts with a project name, and the auth
-// mounts are not per cluster. One role name can therefore fit several
-// projects.
+// that name. The auth mounts are not per cluster, so the project name of one
+// login role can fit a project in several clusters.
 type projectNames map[string][]string
 
 func newProjectNames(sets ...map[string]map[string]project) projectNames {
@@ -218,25 +229,36 @@ func newProjectNames(sets ...map[string]map[string]project) projectNames {
 	return out
 }
 
-// owners returns the projects whose name, followed by a dash, is a prefix of
-// role.
-func (n projectNames) owners(role string) []projectRef {
-	var out []projectRef
-	for i := range len(role) {
-		if role[i] != '-' {
-			continue
-		}
-		for _, cluster := range n[role[:i]] {
-			out = append(out, projectRef{cluster: cluster, name: role[:i]})
-		}
+// splitLoginName returns the project name and the statement name of the
+// login role name role. A project name is a DNS label and a statement name
+// matches statementName, so a name of the service has exactly one
+// loginSeparator. ok is false for every other name.
+func splitLoginName(role string) (project, statement string, ok bool) {
+	project, statement, ok = strings.Cut(role, loginSeparator)
+	if !ok || project == "" || !statementName.MatchString(statement) {
+		return "", "", false
 	}
-	return out
+	return project, statement, true
+}
+
+// owners returns the projects with the project name of the login role role,
+// one per cluster. ok is false when role is not a login role name of the
+// service.
+func (n projectNames) owners(role string) (out []projectRef, ok bool) {
+	project, _, ok := splitLoginName(role)
+	if !ok {
+		return nil, false
+	}
+	for _, cluster := range n[project] {
+		out = append(out, projectRef{cluster: cluster, name: project})
+	}
+	return out, true
 }
 
 // owns reports whether the project name of cluster is the only owner of
 // role.
 func (n projectNames) owns(role, cluster, name string) bool {
-	owners := n.owners(role)
+	owners, _ := n.owners(role)
 	return len(owners) == 1 && owners[0] == projectRef{cluster: cluster, name: name}
 }
 
@@ -290,7 +312,7 @@ func (s *Syncer) keepTrust(ctx context.Context, run *trustRun, cluster, name str
 	}
 	result.wanted = slices.Collect(maps.Keys(want))
 
-	for _, old := range previousLogins(item.trustStatus) {
+	for _, old := range previousLogins(item.trustStatus, run.rules.maxStatements+1) {
 		key := loginKey{mount: old.Path, name: old.Role}
 		if want[key] || !s.ownsLogin(run, cluster, name, key) {
 			continue
@@ -375,17 +397,14 @@ func (s *Syncer) keepLogin(ctx context.Context, run *trustRun, cluster, project 
 // ownsLogin reports whether the project name of cluster can own the login
 // role key. These conditions must be true:
 //   - The mount of key is a mount of the rules file.
-//   - The name of key is the project name, a dash, and a valid statement name.
-//   - No other known project fits the name of key.
+//   - The name of key is the project name, loginSeparator, and a valid
+//     statement name.
+//   - No other cluster has a project with the same name.
 //
 // The status is tenant input, so the service keeps a role when one of these
 // conditions is false.
 func (s *Syncer) ownsLogin(run *trustRun, cluster, name string, key loginKey) bool {
-	if !slices.Contains(run.rules.mounts(), key.mount) {
-		return false
-	}
-	statement, ok := strings.CutPrefix(key.name, name+"-")
-	return ok && statementName.MatchString(statement) && run.owners.owns(key.name, cluster, name)
+	return slices.Contains(run.rules.mounts(), key.mount) && run.owners.owns(key.name, cluster, name)
 }
 
 // deleteLogin deletes the login role key. A role that is gone is not an
@@ -491,7 +510,10 @@ func (s *Syncer) keepProjectTrust(ctx context.Context, token, cluster, name stri
 
 // refreshTrust runs the trust step of every tenant of ready, and then deletes
 // the stale login roles. names are the clusters of the run, and projects are
-// the projects of the run by cluster. It returns the count of errors.
+// the projects of the run by cluster. The trust step takes each project from
+// the snapshot, because the project watch can store a newer trust value after
+// the project list of the run. It skips a project that the snapshot no longer
+// has. refreshTrust returns the count of errors.
 func (s *Syncer) refreshTrust(ctx context.Context, token string, names []string, ready map[string]openbaoTarget, projects map[string]map[string]project, rules *trustRules) int {
 	w := s.openbao
 	run := &trustRun{
@@ -525,13 +547,10 @@ func (s *Syncer) refreshTrust(ctx context.Context, token string, names []string,
 	wanted := make(map[loginKey]bool)
 	deleted := make(map[loginKey]bool)
 	eachCluster(slices.Sorted(maps.Keys(ready)), func(cluster string) {
-		live := s.projectsOf(cluster)
 		for _, name := range ready[cluster].tenants {
-			item, ok := projects[cluster][name]
+			item, ok := s.projectsOf(cluster)[name]
 			if !ok {
-				if item, ok = live[name]; !ok {
-					continue
-				}
+				continue
 			}
 			result := s.keepTrust(ctx, run, cluster, name, item)
 			mu.Lock()
@@ -550,17 +569,19 @@ func (s *Syncer) refreshTrust(ctx context.Context, token string, names []string,
 }
 
 // dropStaleLogins deletes each listed login role that has no valid statement
-// in the run. A role whose name starts with the name of one known project
-// belongs to that project. For another role, the name of the first token
-// policy contains the project.
+// in the run. The service keeps a role whose name is not a login role name of
+// the service. When exactly one known project has the project name of a role,
+// the role belongs to that project. For another role, the name of the first
+// token policy contains the cluster and the project.
 //
-// The service deletes a role of a project that the run checked. When neither
-// the run nor the project watch has the project, the service deletes the role
-// only after Rancher answers 404 for that project. The service keeps a role
-// whose policy name does not have the form of a policy of the service.
+// The service deletes a role of a project only when the run checked the
+// project, and the project still has the trust value of that check. When
+// neither the run nor the project watch has the project, the service deletes
+// the role only after Rancher answers 404 for that project. The service keeps
+// a role whose policy name does not have the form of a policy of the service.
 // dropStaleLogins returns the count of errors.
 func (s *Syncer) dropStaleLogins(ctx context.Context, run *trustRun, names []string, projects map[string]map[string]project, wanted, deleted map[loginKey]bool, processed map[projectRef]trustValue) int {
-	errs := 0
+	errs, foreign := 0, 0
 	gone := make(map[projectRef]bool)
 	for _, mount := range slices.Sorted(maps.Keys(run.listed)) {
 		for _, role := range slices.Sorted(maps.Keys(run.listed[mount])) {
@@ -568,7 +589,11 @@ func (s *Syncer) dropStaleLogins(ctx context.Context, run *trustRun, names []str
 			if wanted[key] || deleted[key] {
 				continue
 			}
-			owners := run.owners.owners(role)
+			owners, ok := run.owners.owners(role)
+			if !ok {
+				foreign++
+				continue
+			}
 			if len(owners) == 1 {
 				if s.checkedAsIs(owners[0], processed) && !s.deleteLogin(ctx, owners[0].cluster, key) {
 					errs++
@@ -609,6 +634,9 @@ func (s *Syncer) dropStaleLogins(ctx context.Context, run *trustRun, names []str
 			}
 		}
 	}
+	if foreign > 0 {
+		s.logger.DebugContext(ctx, "the login roles have no name of the service, so the service keeps them", "count", foreign)
+	}
 	return errs
 }
 
@@ -628,7 +656,7 @@ func (s *Syncer) checkedAsIs(ref projectRef, processed map[projectRef]trustValue
 // loginOwner reads the login role key, and returns the project of its first
 // token policy. It returns false for a role that is gone. It also returns
 // false when the policy name does not have the form of a policy of the
-// service.
+// service, or when the policy names another project than the role name.
 func (s *Syncer) loginOwner(ctx context.Context, key loginKey, names []string) (projectRef, bool, error) {
 	var answer struct {
 		Data struct {
@@ -643,8 +671,9 @@ func (s *Syncer) loginOwner(ctx context.Context, key loginKey, names []string) (
 		s.logFailure(ctx, slog.LevelError, "the OpenBao login role read failed", err, "mount", key.mount, "name", key.name)
 		return projectRef{}, false, err
 	}
+	named, _, _ := splitLoginName(key.name)
 	if policies := answer.Data.TokenPolicies; len(policies) > 0 {
-		if cluster, project, _, ok := s.openbao.parsePolicyName(policies[0], names); ok {
+		if cluster, project, _, ok := s.openbao.parsePolicyName(policies[0], names); ok && project == named {
 			return projectRef{cluster: cluster, name: project}, true, nil
 		}
 	}
