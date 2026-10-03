@@ -68,8 +68,8 @@ func (f *accountsFake) projectAnnotation(name, key string) (string, bool) {
 	return value, ok
 }
 
-// patchProject applies a merge patch of the annotations of a project, the
-// shape of the trust status write. A null deletes the key.
+// patchProject applies a merge patch of the annotations of a project. The
+// status write has this form. The patch deletes a key with a null value.
 func (f *accountsFake) patchProject(w http.ResponseWriter, r *http.Request, name string) {
 	body, _ := io.ReadAll(r.Body)
 	var patch struct {
@@ -117,8 +117,8 @@ func watchProject(t *testing.T, setup *openbaoSetup, name string) {
 	}
 }
 
-// listTrustProject runs the lister for the project name, as after a project
-// event.
+// listTrustProject runs the lister for the project name, as the project watch
+// does after an event.
 func listTrustProject(t *testing.T, setup *openbaoSetup, name string) {
 	t.Helper()
 	watchProject(t, setup, name)
@@ -138,7 +138,7 @@ func splitAuthRoute(route string) (string, string) {
 }
 
 // serveLogin serves the roles of the JWT mounts under auth/jwt/ and of the
-// AWS mount at auth/aws. The AWS mount lists at roles.
+// AWS mount at auth/aws. The LIST path of the AWS mount is roles.
 func (f *fakeOpenBao) serveLogin(w http.ResponseWriter, r *http.Request, route string, list bool, body []byte) {
 	mount, rest := splitAuthRoute(route)
 	if !f.authMounts[mount] {

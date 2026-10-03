@@ -108,10 +108,9 @@ type Syncer struct {
 	// off.
 	openbao *openbaoWriter
 
-	// trustFile is the file of the trust rules, and "" when the trust
-	// feature is off. trust has the last valid rules. trustReserved are the
-	// annotation keys that the service copies, which a trust key must not
-	// be.
+	// trustFile is the rules file, and "" when the trust feature is off.
+	// trust has the last valid rules. trustReserved are the annotation keys
+	// that the service copies. A trust key must not be one of them.
 	trustFile     string
 	trustReserved []string
 	trust         atomic.Pointer[trustRules]
@@ -437,8 +436,8 @@ func (s *Syncer) setClusters(clusters map[string]map[string]project) {
 }
 
 // snapshot returns the projects of every cluster, by cluster and project name.
-// The maps are never written after a store, so the caller reads them without
-// the lock.
+// The service never writes to the maps after a store, so the caller reads
+// them without the lock.
 func (s *Syncer) snapshot() map[string]map[string]project {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

@@ -102,7 +102,8 @@ func (s *Syncer) pruneNamespace(item namespace) namespace {
 }
 
 // pruneProject returns item with only the labels and the annotations that the
-// sync copies, and the trust annotations in their own fields.
+// sync copies. It also puts the trust annotation and the status annotation
+// into their own fields.
 func (s *Syncer) pruneProject(item project) project {
 	item.reserved = item.Labels[systemProjectLabel] == "true" || item.Labels[defaultProjectLabel] == "true"
 	item.marked = item.Labels[accountProjectLabel] == "true"

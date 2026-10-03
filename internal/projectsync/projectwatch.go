@@ -132,8 +132,8 @@ func (s *Syncer) applyProject(ctx context.Context, watches *watchSet, eventType 
 		old.trust == item.project.trust &&
 		maps.Equal(old.Labels, item.project.Labels) &&
 		maps.Equal(old.Annotations, item.project.Annotations) {
-		// The service writes the status itself, so a new status is no
-		// change, and its event starts no work.
+		// The service writes the status itself, so a new status is not a
+		// change. The service starts no work for that event.
 		if old.trustStatus != item.project.trustStatus {
 			s.setProject(cluster, item.name, item.project)
 		}

@@ -80,20 +80,25 @@ The facts about the answer to a missing mount are from the source of OpenBao 2.7
 
 ## Login roles
 
-`trust.go` has the rules, the parser, and the status document of the trust annotation. `trust_roles.go` has the OpenBao writes and the status write. The integration tests of the private repository run a copy of `testdata/trust/` against the admission policy of the chart, so change a case in both places. No part of this section is checked live yet.
+`trust.go` has the rules, the parser of the trust annotation, and the format of the status annotation. `trust_roles.go` has the OpenBao writes and the status write. The integration tests of the private repository run a copy of `testdata/trust/` against the admission policy of the chart. Change a case in both places. No part of this section is checked live yet.
 
-- Never log the value of the trust annotation or of the status annotation. A tenant writes the document, and its claims can name private repositories or accounts. Log the project, the index of a statement, a statement name that matches the name pattern, and the reason.
-- Keep the four rules that stop a status write loop. The status write sends a `MODIFIED` event of the Project. When one rule breaks, every event writes the status again.
-  - Write the status only when it differs from the current value, without `observedAt`.
+- Never log the value of the trust annotation or of the status annotation. A tenant writes the document, and its claims can contain the names of private repositories or accounts. Log the project, the index of a statement, a statement name that matches the name pattern, and the reason.
+- Keep the four rules against a loop of status writes. After each status write, the project watch gets a `MODIFIED` event of the Project. When the code breaks one rule, the service writes the status again at every event.
+  - Write the status only when it differs from the current value. Do not compare `observedAt`.
   - Set `observedAt` only at that write.
   - Keep each message a fixed text per reason. Never put the parser output or tenant text into a message.
   - Patch only the status key, with a merge patch.
-- Exclude the status from the change compare of the project watch, but store it in the snapshot. Otherwise the next event compares against an old status and writes it again.
-- Delete a role of the last status only when its mount is a mount of the rules, its name is `<project>-<valid statement name>`, and no other known project fits the name. A tenant can edit the status when the admission policy is off, and an unchecked entry would delete the role of another project.
-- In the reconcile run, delete a role by its name only for a project that the run checked, and only when the snapshot still has the trust value of that check. A project event after the project list of the run can add a statement. A delete then stops its login until the next run.
-- Keep the role of a statement whose write failed. It is the last working role.
-- Write a role only when exactly one known project of all clusters fits its name. An auth mount is not per cluster, and Rancher keeps a project name unique per cluster only. Two projects that fit one name overwrite the role of each other at every run.
-- Write a role again after the 10-minute window, without a read. The read answer of a JWT role has other value types than the write body, for example seconds for `token_ttl`. A compare then needs a conversion per field. Log a write with the body of the last write at the debug level, and do not count it as a change, because it changes nothing.
-- Keep the status at most `maxStatements` + 1 statements long. A document of 16384 bytes can have thousands of empty statements, and a status entry per statement exceeds the annotation limit of the API server.
-- Reject a trust key in `--annotations` and `--name-annotation`, at the start and at each reload of the rules. Otherwise the namespace sync copies the document to every namespace of the project.
+- Exclude the status from the change compare of the project watch. Store the status in the snapshot. Otherwise, at the next event the service compares against an old status and writes the status again.
+- Delete a role of the last status only when these conditions are true:
+  - The mount of the role is a mount of the rules file.
+  - The name of the role is `<project>-<valid statement name>`.
+  - No other known project fits the name.
+
+  A tenant can edit the status when the admission policy is off. Without these checks, the service deletes the role of another project when a tenant adds that role to the status.
+- In the reconcile run, delete a role by its name only for a project that the run checked. The snapshot must also still have the trust value of that check. A project event after the project list of the run can add a statement. Without the check of the trust value, the run deletes the role of the new statement. A login with that role then fails until the next run.
+- Keep the role of a statement whose write failed. It is the last role that works.
+- Write a role only when exactly one known project of all clusters fits its name. An auth mount is not per cluster, and Rancher keeps a project name unique per cluster only. When two projects fit one name, the service overwrites the role at every run, once for each project.
+- Write a role again after the 10-minute window, without a read. The read answer of a JWT role has other value types than the write body, for example seconds for `token_ttl`. A compare then needs a conversion per field. Log a write with the body of the last write at the debug level. Do not count that write as a change, because it changes nothing.
+- Keep the status at most `maxStatements` + 1 statements long. A document of 16384 bytes can have thousands of empty statements. A status with an entry per statement is then larger than the annotation limit of the API server.
+- Reject a trust key in `--annotations` and `--name-annotation`, at the start and at each reload of the rules file. Otherwise the namespace sync copies the document to every namespace of the project.
 - Take a token of the cluster limiter before each OpenBao request of the trust step in the event path. A project owner can edit the trust annotation in a loop.

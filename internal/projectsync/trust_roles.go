@@ -37,8 +37,8 @@ func (k loginKey) kind() string {
 	return kindJWTRole
 }
 
-// listPath returns the LIST path of the roles of mount. The AWS method lists
-// at roles, and reads and writes at role/<name>.
+// listPath returns the LIST path of the roles of mount. The LIST path of the
+// AWS method is roles, and its read and write path is role/<name>.
 func listPath(mount string) string {
 	if mount == awsAuthPath {
 		return mount + "/roles"
@@ -66,8 +66,8 @@ func (r *trustRules) loginKey(project string, item trustStatement) loginKey {
 }
 
 // loginToken is the token part of a login role. The service sends every
-// field that can give a token more rights, also when it is empty, because
-// OpenBao keeps a field that a write does not send.
+// field that can give a token more rights, also when the field is empty. The
+// reason is that OpenBao keeps a field that is not in the body of a write.
 type loginToken struct {
 	TokenPolicies        []string `json:"token_policies"`
 	TokenType            string   `json:"token_type"`
@@ -190,7 +190,7 @@ func (w *openbaoWriter) forgetLogin(key loginKey) {
 	delete(w.logins, key)
 }
 
-// projectRef names one project of a cluster.
+// projectRef is the cluster and the name of one project.
 type projectRef struct {
 	cluster string
 	name    string
@@ -198,7 +198,8 @@ type projectRef struct {
 
 // projectNames maps a project name to the clusters that have a project with
 // that name. A login role name starts with a project name, and the auth
-// mounts are not per cluster, so one role name can fit several projects.
+// mounts are not per cluster. One role name can therefore fit several
+// projects.
 type projectNames map[string][]string
 
 func newProjectNames(sets ...map[string]map[string]project) projectNames {
@@ -215,7 +216,8 @@ func newProjectNames(sets ...map[string]map[string]project) projectNames {
 	return out
 }
 
-// owners returns the projects whose name followed by a dash starts role.
+// owners returns the projects whose name, followed by a dash, is a prefix of
+// role.
 func (n projectNames) owners(role string) []projectRef {
 	var out []projectRef
 	for i := range len(role) {
@@ -249,9 +251,9 @@ type trustRun struct {
 	missing map[string]bool
 }
 
-// trustResult is the outcome of the trust step of one project. wanted are the
+// trustResult is the result of the trust step of one project. wanted are the
 // login roles of the valid statements, and deleted are the roles that the
-// step deleted.
+// service deleted in the step.
 type trustResult struct {
 	wanted  []loginKey
 	deleted []loginKey
@@ -259,9 +261,9 @@ type trustResult struct {
 }
 
 // keepTrust brings the login roles and the status of one project up to date.
-// It writes the role of each valid statement, deletes each role of the last
-// status that no valid statement names, and writes the status when it
-// differs.
+// It writes the role of each valid statement. It deletes each role of the last
+// status when the role has no valid statement. It then writes the status when
+// the status differs.
 func (s *Syncer) keepTrust(ctx context.Context, run *trustRun, cluster, name string, item project) trustResult {
 	var result trustResult
 	want := make(map[loginKey]bool)
@@ -275,7 +277,7 @@ func (s *Syncer) keepTrust(ctx context.Context, run *trustRun, cluster, name str
 			entries := make([]statementStatus, 0, min(len(doc.statements), run.rules.maxStatements+1))
 			for index, statement := range doc.statements {
 				entry := s.keepLogin(ctx, run, cluster, name, statement, want, &result)
-				// The status lists one statement past the limit, so that its
+				// The status has one statement past the limit, so that its
 				// size does not depend on the count of statements.
 				if index <= run.rules.maxStatements {
 					entries = append(entries, entry)
@@ -303,7 +305,7 @@ func (s *Syncer) keepTrust(ctx context.Context, run *trustRun, cluster, name str
 }
 
 // keepLogin writes the login role of statement when it is valid, and returns
-// its status. A role that stays in OpenBao goes into want.
+// its status. It adds each role that stays in OpenBao to want.
 func (s *Syncer) keepLogin(ctx context.Context, run *trustRun, cluster, project string, statement trustStatement, want map[loginKey]bool, result *trustResult) statementStatus {
 	if statement.reason != "" {
 		return notReady(statement.name, statement.reason)
@@ -346,7 +348,8 @@ func (s *Syncer) keepLogin(ctx context.Context, run *trustRun, cluster, project 
 			"cluster", cluster, "project", project, "statement", statement.name, "mount", key.mount)
 		return notReady(statement.name, reasonMethodDisabled)
 	case err != nil:
-		// The role of an earlier write stays, so a failed write keeps it.
+		// After a failed write, the role of an earlier write is still in
+		// OpenBao, so the service keeps that role.
 		want[key] = true
 		result.errors++
 		s.openbaoObjectFailure(ctx, cluster, key.kind(), "write", key.name, err)
@@ -367,10 +370,14 @@ func (s *Syncer) keepLogin(ctx context.Context, run *trustRun, cluster, project 
 	return ready
 }
 
-// ownsLogin reports whether key is a login role that the project name of
-// cluster can own: a mount of the rules, the project name and a statement
-// name, and no other project whose name starts the role name. The status is
-// tenant input, so a key outside these rules stays.
+// ownsLogin reports whether the project name of cluster can own the login
+// role key. These conditions must be true:
+//   - The mount of key is a mount of the rules file.
+//   - The name of key is the project name, a dash, and a valid statement name.
+//   - No other known project fits the name of key.
+//
+// The status is tenant input, so the service keeps a role that breaks one of
+// these conditions.
 func (s *Syncer) ownsLogin(run *trustRun, cluster, name string, key loginKey) bool {
 	if !slices.Contains(run.rules.mounts(), key.mount) {
 		return false
@@ -398,8 +405,8 @@ func (s *Syncer) deleteLogin(ctx context.Context, cluster string, key loginKey) 
 }
 
 // writeTrustStatus writes status into the status annotation of the project
-// when it differs from current, without observedAt. A nil status removes the
-// annotation. It returns the count of errors.
+// when status differs from current. It ignores observedAt in that check. For
+// a nil status, it removes the annotation. It returns the count of errors.
 func (s *Syncer) writeTrustStatus(ctx context.Context, run *trustRun, cluster, name, current string, status *trustStatus) int {
 	var value *string
 	if status == nil {
@@ -442,7 +449,7 @@ func (s *Syncer) writeTrustStatus(ctx context.Context, run *trustRun, cluster, n
 
 // logTrustStatus logs a written status: one line per statement that is not
 // ready, and one summary line. It logs a statement name only when the name is
-// valid, and never the document.
+// valid. It never logs the trust document.
 func (s *Syncer) logTrustStatus(ctx context.Context, cluster, name string, status *trustStatus) {
 	if status.Error != nil {
 		s.logger.InfoContext(ctx, "the trust document is not valid",
@@ -540,13 +547,16 @@ func (s *Syncer) refreshTrust(ctx context.Context, token string, names []string,
 	return errs + s.dropStaleLogins(ctx, run, names, projects, wanted, deleted, processed)
 }
 
-// dropStaleLogins deletes each listed login role that no valid statement of
-// the run names. A role whose name starts with the name of one known project
-// belongs to that project. For another role, the first token policy names the
-// project. A role of a project that the run checked goes. A role of a project
-// that the run and the project watch do not know goes only after Rancher
-// answers 404 for that project. A role whose policy name does not parse
-// stays. It returns the count of errors.
+// dropStaleLogins deletes each listed login role that has no valid statement
+// in the run. A role whose name starts with the name of one known project
+// belongs to that project. For another role, the name of the first token
+// policy contains the project.
+//
+// The service deletes a role of a project that the run checked. When neither
+// the run nor the project watch has the project, the service deletes the role
+// only after Rancher answers 404 for that project. The service keeps a role
+// whose policy name does not have the form of a policy of the service.
+// dropStaleLogins returns the count of errors.
 func (s *Syncer) dropStaleLogins(ctx context.Context, run *trustRun, names []string, projects map[string]map[string]project, wanted, deleted map[loginKey]bool, processed map[projectRef]trustValue) int {
 	errs := 0
 	gone := make(map[projectRef]bool)
@@ -576,7 +586,7 @@ func (s *Syncer) dropStaleLogins(ctx context.Context, run *trustRun, names []str
 			_, live := s.projectsOf(owner.cluster)[owner.name]
 			switch {
 			case slices.Contains(owners, owner):
-				// No project writes a role name that fits several projects.
+				// The service writes no role whose name fits several projects.
 				if s.checkedAsIs(owner, processed) && !s.deleteLogin(ctx, owner.cluster, key) {
 					errs++
 				}
@@ -613,8 +623,9 @@ func (s *Syncer) checkedAsIs(ref projectRef, processed map[projectRef]trustValue
 }
 
 // loginOwner reads the login role key, and returns the project of its first
-// token policy. It returns false for a role that is gone, and for a role
-// whose policy name does not parse.
+// token policy. It returns false for a role that is gone. It also returns
+// false when the policy name does not have the form of a policy of the
+// service.
 func (s *Syncer) loginOwner(ctx context.Context, key loginKey, names []string) (projectRef, bool, error) {
 	var answer struct {
 		Data struct {
