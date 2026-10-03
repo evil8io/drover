@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -62,6 +63,10 @@ type Config struct {
 	// OpenBao writes the Kubernetes secrets engine config of every cluster
 	// into OpenBao. It needs ServiceAccounts. Nil turns it off.
 	OpenBao *OpenBaoConfig
+	// TrustFile is the JSON file of the trust rules. With it, the service
+	// writes an OpenBao login role for each valid statement of the trust
+	// annotation of a project. It needs OpenBao. Empty turns it off.
+	TrustFile string
 	// Interval is the time between two runs. Zero selects 60 s.
 	Interval time.Duration
 	// PatchRate bounds the requests to Rancher per second that the watches of
@@ -102,6 +107,14 @@ type Syncer struct {
 	// openbao writes the config of each cluster into OpenBao. Nil turns it
 	// off.
 	openbao *openbaoWriter
+
+	// trustFile is the file of the trust rules, and "" when the trust
+	// feature is off. trust has the last valid rules. trustReserved are the
+	// annotation keys that the service copies, which a trust key must not
+	// be.
+	trustFile     string
+	trustReserved []string
+	trust         atomic.Pointer[trustRules]
 
 	// readLabels and readAnnotations are the namespace keys that the sync
 	// reads. A decoded namespace keeps only these keys.
@@ -153,6 +166,9 @@ func New(cfg Config) (*Syncer, error) {
 	}
 	if cfg.OpenBao != nil && !cfg.ServiceAccounts {
 		return nil, errors.New("the OpenBao config needs the service accounts")
+	}
+	if cfg.TrustFile != "" && cfg.OpenBao == nil {
+		return nil, errors.New("the trust rules need the OpenBao config")
 	}
 	keys := slices.Concat(cfg.Labels, cfg.Annotations)
 	for _, key := range []string{cfg.NameLabel, cfg.NameAnnotation} {
@@ -225,7 +241,7 @@ func New(cfg Config) (*Syncer, error) {
 		}
 	}
 
-	return &Syncer{
+	syncer := &Syncer{
 		rancher:         &rancher,
 		tokenFile:       cfg.TokenFile,
 		labels:          slices.Clone(cfg.Labels),
@@ -234,6 +250,7 @@ func New(cfg Config) (*Syncer, error) {
 		nameAnnotation:  cfg.NameAnnotation,
 		serviceAccounts: cfg.ServiceAccounts,
 		openbao:         openbao,
+		trustFile:       cfg.TrustFile,
 		readLabels:      readLabels,
 		readAnnotations: readAnnotations,
 		itemCap:         maxItem,
@@ -245,7 +262,40 @@ func New(cfg Config) (*Syncer, error) {
 		client:          &http.Client{Transport: rancherclient.WrapTransport(transport, meterProvider)},
 		metrics:         m,
 		tracer:          tracerProvider.Tracer(tracerName),
-	}, nil
+	}
+	if cfg.TrustFile != "" {
+		syncer.trustReserved = slices.Clone(cfg.Annotations)
+		if cfg.NameAnnotation != "" {
+			syncer.trustReserved = append(syncer.trustReserved, cfg.NameAnnotation)
+		}
+		rules, err := loadTrustRules(cfg.TrustFile, syncer.trustReserved)
+		if err != nil {
+			return nil, err
+		}
+		syncer.trust.Store(rules)
+	}
+	return syncer, nil
+}
+
+// trustRules returns the last valid trust rules, or nil when the trust
+// feature is off.
+func (s *Syncer) trustRules() *trustRules {
+	return s.trust.Load()
+}
+
+// reloadTrust reads the trust rules file again. On an error it keeps the last
+// valid rules, and counts the error in run.
+func (s *Syncer) reloadTrust(ctx context.Context, run *counters) {
+	if s.trustFile == "" {
+		return
+	}
+	rules, err := loadTrustRules(s.trustFile, s.trustReserved)
+	if err != nil {
+		run.errors++
+		s.logFailure(ctx, slog.LevelError, "the trust rules are not valid, so the service keeps the last valid rules", err)
+		return
+	}
+	s.trust.Store(rules)
 }
 
 // Handler answers GET /healthz with 200 and the body ok.
@@ -319,6 +369,7 @@ func (s *Syncer) reconcile(ctx context.Context) {
 	start := time.Now()
 
 	var run counters
+	s.reloadTrust(ctx, &run)
 	projects, err := s.projects(ctx, token)
 	if err != nil {
 		run.errors++
@@ -383,6 +434,15 @@ func (s *Syncer) setClusters(clusters map[string]map[string]project) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.clusters = clusters
+}
+
+// snapshot returns the projects of every cluster, by cluster and project name.
+// The maps are never written after a store, so the caller reads them without
+// the lock.
+func (s *Syncer) snapshot() map[string]map[string]project {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.clusters
 }
 
 // projectsOf returns the projects of a cluster, by project name, from the last

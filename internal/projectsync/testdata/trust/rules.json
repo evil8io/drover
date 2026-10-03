@@ -1,0 +1,36 @@
+{
+  "annotation": "drover-trust",
+  "statusAnnotation": "drover-trust-status",
+  "maxStatements": 3,
+  "audience": "https://openbao.example.com",
+  "loginTokenTTL": "5m",
+  "jwtIssuers": {
+    "github": {
+      "requiredClaims": [
+        "repository_id"
+      ],
+      "allowedClaims": {
+        "ref": [
+          "refs/heads/main",
+          "refs/heads/release"
+        ]
+      }
+    },
+    "gitlab": {
+      "requiredClaims": [
+        "project_id"
+      ]
+    },
+    "cluster": {
+      "requiredClaims": [
+        "sub"
+      ]
+    }
+  },
+  "aws": {
+    "enabled": true,
+    "allowedAccounts": [
+      "123456789012"
+    ]
+  }
+}

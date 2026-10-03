@@ -1,0 +1,5 @@
+{
+  "valid": false,
+  "reason": "UnknownIssuer",
+  "document": "{\"statements\": [{\"name\": \"deploy\", \"jwt\": {\"issuer\": \"bitbucket\", \"claims\": {\"repository_id\": \"1\"}}, \"role\": \"project-member\"}]}"
+}

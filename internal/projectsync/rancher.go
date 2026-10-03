@@ -49,6 +49,12 @@ type project struct {
 	// before it drops the labels that the sync does not copy.
 	reserved bool
 	marked   bool
+
+	// trust is the trust annotation, and trustStatus is the status
+	// annotation. pruneProject sets both when the trust rules are on. The
+	// namespace sync never copies them.
+	trust       trustValue
+	trustStatus string
 }
 
 // pagination is the part of the pagination of a Rancher collection that the
@@ -96,10 +102,14 @@ func (s *Syncer) pruneNamespace(item namespace) namespace {
 }
 
 // pruneProject returns item with only the labels and the annotations that the
-// sync copies.
+// sync copies, and the trust annotations in their own fields.
 func (s *Syncer) pruneProject(item project) project {
 	item.reserved = item.Labels[systemProjectLabel] == "true" || item.Labels[defaultProjectLabel] == "true"
 	item.marked = item.Labels[accountProjectLabel] == "true"
+	if rules := s.trustRules(); rules != nil {
+		item.trust = newTrustValue(item.Annotations[rules.annotation])
+		item.trustStatus = pruneTrustStatus(item.Annotations[rules.statusAnnotation])
+	}
 	item.Labels = pick(item.Labels, s.labels)
 	item.Annotations = pick(item.Annotations, s.annotations)
 	return item

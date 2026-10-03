@@ -1,0 +1,5 @@
+{
+  "valid": false,
+  "reason": "InvalidAuth",
+  "document": "{\"statements\": [{\"name\": \"deploy\", \"jwt\": {\"issuer\": \"github\", \"claims\": {\"repository_id\": \"1\"}, \"audience\": \"x\"}, \"role\": \"project-member\"}]}"
+}

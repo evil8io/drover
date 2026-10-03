@@ -1,0 +1,4 @@
+{
+  "valid": true,
+  "document": "{\"statements\": [{\"name\": \"job\", \"jwt\": {\"issuer\": \"cluster\", \"claims\": {\"sub\": \"system:serviceaccount:ci:runner\"}}, \"role\": \"read-only\"}]}"
+}

@@ -958,7 +958,8 @@ func (s *Syncer) projectGone(ctx context.Context, token, cluster, name string) (
 // ensureProjectAccounts brings the accounts of one project up to date after a
 // project event: the account namespace, the ServiceAccounts, the cluster role
 // bindings, and, when the last run trusted the OpenBao namespace, the OpenBao
-// Role and RoleBinding, and the roles and policies in OpenBao. The worker then
+// Role and RoleBinding, the roles and policies in OpenBao, and the login roles
+// and the status of the trust annotation. The worker then
 // handles the role bindings of each namespace of the project. A namespace in
 // no project waits for the reconcile run, because only the run knows the
 // account projects for certain.
@@ -1002,6 +1003,7 @@ func (s *Syncer) ensureProjectAccounts(ctx context.Context, token, cluster, name
 	if s.openbao != nil && state.openbao != "" && s.openbaoNamespaceLive(ctx, token, cluster, state) {
 		s.ensureOpenBaoAccess(ctx, token, cluster, name, state.openbao, nil, nil, nil)
 		s.writeOpenBaoProject(ctx, cluster, name)
+		s.keepProjectTrust(ctx, token, cluster, name)
 	}
 	s.setAccountNamespace(cluster, name, uid)
 }

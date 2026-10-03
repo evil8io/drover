@@ -1,0 +1,5 @@
+{
+  "valid": false,
+  "reason": "InvalidName",
+  "document": "{\"statements\": [{\"jwt\": {\"issuer\": \"github\", \"claims\": {\"repository_id\": \"123456789\", \"ref\": \"refs/heads/main\"}}, \"role\": \"project-member\"}]}"
+}
