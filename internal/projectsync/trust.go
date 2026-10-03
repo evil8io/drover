@@ -86,8 +86,8 @@ var (
 	statementName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,30}[a-z0-9])?$`)
 	roleARN       = regexp.MustCompile(`^arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$`)
 	awsAccountID  = regexp.MustCompile(`^[0-9]{12}$`)
-	// issuerName matches an issuer name that is valid as one segment of an
-	// OpenBao path.
+	// issuerName is the pattern of an issuer name that is valid as one segment
+	// of an OpenBao path.
 	issuerName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
 )
 
@@ -112,7 +112,7 @@ type trustIssuer struct {
 }
 
 // trustRulesFile is the JSON form of trustRules. The service ignores an
-// unknown key, so that the chart can render more keys.
+// unknown key, so that Helm can render more keys from the chart.
 type trustRulesFile struct {
 	Annotation       string `json:"annotation"`
 	StatusAnnotation string `json:"statusAnnotation"`
@@ -249,7 +249,8 @@ func pruneTrustStatus(value string) string {
 }
 
 // trustDocument is a parsed trust annotation. reason is the reason of a
-// document error. It is "" when the document breaks no document rule.
+// document error. It is "" when the document is valid under every document
+// rule.
 type trustDocument struct {
 	reason     string
 	statements []trustStatement
@@ -448,7 +449,8 @@ func (item *trustStatement) checkAWS(raw json.RawMessage, rules *trustRules) str
 }
 
 // parseClaims returns the claims object of a statement, with a string or a
-// []string per claim, and false when it breaks a rule.
+// []string per claim, and false when the claims object is not valid under a
+// rule.
 func parseClaims(raw json.RawMessage) (map[string]any, bool) {
 	fields, ok := jsonObject(raw)
 	if !ok || len(fields) == 0 {

@@ -257,7 +257,7 @@ The names are the same as the names of the earlier operator objects, so a client
 
 With `--trust-file`, a project owner can let an outside workload, for example a CI job, log in to OpenBao with a project role. The owner writes trust statements into the annotation `drover-trust` of the Project object. A statement is one entry of the JSON document in that annotation.
 
-The service writes one OpenBao login role per valid statement. A login role is a role of the JWT auth method or of the AWS auth method of OpenBao. Its token gets the ACL policy of one project role, see [Mounts, roles, and policies](#mounts-roles-and-policies). The service reports the result in the annotation `drover-trust-status`.
+The service writes one OpenBao login role per valid statement. A login role is a role of the JWT auth method or of the AWS auth method of OpenBao. OpenBao gives the token of a login role the ACL policy of one project role, see [Mounts, roles, and policies](#mounts-roles-and-policies). The service reports the result in the annotation `drover-trust-status`.
 
 The rules file contains both annotation keys, so a deployer can choose other keys. The service never copies the two annotations to a namespace. It does not accept them in `--annotations` and `--name-annotation`.
 
@@ -323,24 +323,24 @@ The service reads the rules from the file of `--trust-file`, at the start and at
 | --- | --- |
 | `annotation`, `statusAnnotation` | Two different valid annotation keys. |
 | `maxStatements` | 1 to 100. |
-| `audience` | Not empty. Every JWT login role binds this audience. |
+| `audience` | Not empty. The service binds every JWT login role to this audience. |
 | `loginTokenTTL` | A Go duration from `1m` to `24h`. It is the lifetime of a token of a login role. |
 | `jwtIssuers` | A map from an issuer name to its rules. The name is a lowercase DNS label, because the path of the auth mount, `auth/jwt/<issuer>`, contains it. |
-| `jwtIssuers.<issuer>.requiredClaims` | A list that is not empty. Every statement of the issuer binds these claims. The first claim is the `user_claim` of every login role of the issuer. |
+| `jwtIssuers.<issuer>.requiredClaims` | A list that is not empty. Every statement of the issuer must contain these claims. The first claim is the `user_claim` of every login role of the issuer. |
 | `jwtIssuers.<issuer>.allowedClaims` | Optional. A map from a claim name to a list of allowed values. |
-| `aws.enabled` | When the value is `false`, every `aws` statement gets `MethodDisabled`. |
+| `aws.enabled` | When the value is `false`, the service gives every `aws` statement the reason `MethodDisabled`. |
 | `aws.allowedAccounts` | A list of 12-digit account ids. When the list is empty, the service allows every account. |
 
 ### The roles in OpenBao
 
-The name of a login role is `<project>-<statement name>`, for example `p-abc12-deploy-main`. A `jwt` statement gets the role `auth/jwt/<issuer>/role/<name>`. An `aws` statement gets the role `auth/aws/role/<name>`. Each role has these values:
+The name of a login role is `<project>-<statement name>`, for example `p-abc12-deploy-main`. For a `jwt` statement, the service writes the role `auth/jwt/<issuer>/role/<name>`. For an `aws` statement, the service writes the role `auth/aws/role/<name>`. Each role has these values:
 
 - `token_policies` has only the ACL policy `<prefix>-<cluster id>-<project>-<role>` of the project role of the statement.
 - The token is a batch token without the `default` policy. Its lifetime is `loginTokenTTL`, and it has no renewal.
-- A JWT role binds the audience of the rules file and the claims of the statement. OpenBao compares the claim values as strings. For each allowed claim of the issuer that the statement does not bind, the role binds the full list of allowed values. A JWT role has no `bound_subject` and no `claim_mappings`.
-- An AWS role binds the ARN with the `iam` auth type. The service removes the path from the ARN, so `role/team/rotator` becomes `role/rotator`. The reason is that the caller identity of an assumed role has no path.
+- The service binds a JWT role to the audience of the rules file and to the claims of the statement. OpenBao compares the claim values as strings. For each allowed claim of the issuer that the statement does not contain, the service binds the role to the full list of allowed values. A JWT role has no `bound_subject` and no `claim_mappings`.
+- The service binds an AWS role to the ARN, with the `iam` auth type. The service removes the path from the ARN, so `role/team/rotator` becomes `role/rotator`. The reason is that the caller identity of an assumed role has no path.
 
-The service sends every field that can give a token more rights, also when the field is empty. OpenBao keeps a field that is not in the body of a write.
+The service sends every field from which OpenBao can give a token more rights, also when the field is empty. OpenBao keeps a field that is not in the body of a write.
 
 ### The status annotation
 
@@ -357,7 +357,7 @@ The service writes `drover-trust-status` with a JSON merge patch of only that ke
 }
 ```
 
-When the trust document breaks a document rule, the status has the key `error` with a `reason` and a `message`, and no `statements`. The status contains at most `maxStatements` + 1 statements, so that the status does not become larger with a long list of invalid statements. The service cuts the name of a statement at 63 bytes. The reason of a statement is the reason of its first failed check. These are the reasons, in the order of the checks, with their fixed messages:
+When the trust document is not valid under a document rule, the status has the key `error` with a `reason` and a `message`, and no `statements`. The status contains at most `maxStatements` + 1 statements, so that the status does not become larger with a long list of invalid statements. The service cuts the name of a statement at 63 bytes. The reason of a statement is the reason of its first failed check. These are the reasons, in the order of the checks, with their fixed messages:
 
 | Reason | Message |
 | --- | --- |
@@ -382,14 +382,14 @@ The last three reasons are reasons of the document. `MethodDisabled` is also the
 
 ### Rules of the service
 
-- A project event and the reconcile run do the same work for a project. They parse the document and write the role of each valid statement. They delete each role that is in the last status and that has no valid statement. Then they write the status. The project watch does this work within seconds, after it writes the OpenBao roles and policies of the project.
+- The project watch, for a project event, and the reconcile run do the same work for a project. They parse the document and write the role of each valid statement. They delete each role that is in the last status and that has no valid statement. Then they write the status. The project watch does this work within seconds, after it writes the OpenBao roles and policies of the project.
 - The reconcile run does this work for every project whose OpenBao roles and policies it keeps. It also lists the roles of each auth mount of the rules file once. It then deletes each role whose name starts with the name of one known project, when that project has no valid statement for the role. For another role, it reads the first entry of `token_policies`, and takes the cluster and the project from that policy name. It deletes the role when Rancher answers 404 for that project. It keeps a role whose policy name does not have the form of a policy of the service.
-- An auth mount is not per cluster, and a project name is unique only in its cluster. So the service writes a role only when exactly one project of all clusters fits the role name. Otherwise, the statement gets `WriteFailed`, and the reconcile run deletes the role.
+- An auth mount is not per cluster, and a project name is unique only in its cluster. So the service writes a role only when exactly one project of all clusters fits the role name. Otherwise, the service gives the statement the reason `WriteFailed`, and the reconcile run deletes the role.
 - The service skips a write of a role that it wrote with the same body in the last 10 minutes. The reconcile run always writes a role that the list does not have.
-- When an auth mount is missing, the statement gets `MethodDisabled`, and the service reports no error. The service tries again at the next event or run.
+- When an auth mount is missing, the service gives the statement the reason `MethodDisabled`, and it reports no error. The service tries again at the next event or run.
 - When the trust annotation is absent or empty, the project has no login roles. The service then removes the status annotation with a merge patch of `null`.
 - The service writes the status only when it differs from the current value. The service ignores `observedAt` when it compares the values, and `observedAt` is the time of that write. Every message is a fixed text. The project watch ignores a change of the status annotation. Therefore, the project watch starts no new work after a status write.
-- A status patch that gets 404 or 409 is not an error.
+- A 404 or a 409 answer to a status patch is not an error.
 - The service logs the project, the index of a statement, a valid statement name, and the reason. It never logs the value of the trust annotation.
 - The project watch takes a token of the rate limiter of the cluster before each OpenBao request of this work.
 

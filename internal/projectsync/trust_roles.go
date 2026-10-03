@@ -66,8 +66,9 @@ func (r *trustRules) loginKey(project string, item trustStatement) loginKey {
 }
 
 // loginToken is the token part of a login role. The service sends every
-// field that can give a token more rights, also when the field is empty. The
-// reason is that OpenBao keeps a field that is not in the body of a write.
+// field from which OpenBao can give a token more rights, also when the field
+// is empty. The reason is that OpenBao keeps a field that is not in the body
+// of a write.
 type loginToken struct {
 	TokenPolicies        []string `json:"token_policies"`
 	TokenType            string   `json:"token_type"`
@@ -113,7 +114,8 @@ func (r *trustRules) token(policy string) loginToken {
 }
 
 // loginBody returns the role body of the valid statement item of project in
-// cluster. The token gets the ACL policy of the project role of item.
+// cluster. OpenBao gives the token the ACL policy of the project role of
+// item.
 func (s *Syncer) loginBody(rules *trustRules, cluster, project string, item trustStatement) any {
 	role, _ := accountRoleOf(item.role)
 	token := rules.token(s.openbao.policyName(cluster, project, role))
@@ -376,8 +378,8 @@ func (s *Syncer) keepLogin(ctx context.Context, run *trustRun, cluster, project 
 //   - The name of key is the project name, a dash, and a valid statement name.
 //   - No other known project fits the name of key.
 //
-// The status is tenant input, so the service keeps a role that breaks one of
-// these conditions.
+// The status is tenant input, so the service keeps a role when one of these
+// conditions is false.
 func (s *Syncer) ownsLogin(run *trustRun, cluster, name string, key loginKey) bool {
 	if !slices.Contains(run.rules.mounts(), key.mount) {
 		return false
@@ -611,8 +613,9 @@ func (s *Syncer) dropStaleLogins(ctx context.Context, run *trustRun, names []str
 }
 
 // checkedAsIs reports whether the run checked the project ref, and whether
-// the project still has the trust value of that check. A project event after
-// the project list of the run can add a statement.
+// the project still has the trust value of that check. After the project
+// list of the run, the project watch can get a project event with a new
+// statement.
 func (s *Syncer) checkedAsIs(ref projectRef, processed map[projectRef]trustValue) bool {
 	used, ok := processed[ref]
 	if !ok {

@@ -95,7 +95,7 @@ The facts about the answer to a missing mount are from the source of OpenBao 2.7
   - No other known project fits the name.
 
   A tenant can edit the status when the admission policy is off. Without these checks, the service deletes the role of another project when a tenant adds that role to the status.
-- In the reconcile run, delete a role by its name only for a project that the run checked. The snapshot must also still have the trust value of that check. A project event after the project list of the run can add a statement. Without the check of the trust value, the run deletes the role of the new statement. A login with that role then fails until the next run.
+- In the reconcile run, delete a role by its name only for a project that the run checked. The snapshot must also still have the trust value of that check. After the project list of the run, the project watch can get a project event with a new statement. Without the check of the trust value, the run deletes the role of the new statement. A login with that role then fails until the next run.
 - Keep the role of a statement whose write failed. It is the last role that works.
 - Write a role only when exactly one known project of all clusters fits its name. An auth mount is not per cluster, and Rancher keeps a project name unique per cluster only. When two projects fit one name, the service overwrites the role at every run, once for each project.
 - Write a role again after the 10-minute window, without a read. The read answer of a JWT role has other value types than the write body, for example seconds for `token_ttl`. A compare then needs a conversion per field. Log a write with the body of the last write at the debug level. Do not count that write as a change, because it changes nothing.

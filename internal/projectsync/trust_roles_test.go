@@ -67,8 +67,8 @@ func TestReconcileWritesTheLoginRolesOfTheValidStatements(t *testing.T) {
 	jwtWant := withFields(loginTokenWant("p-alpha", "project-member"), map[string]any{
 		"role_type":       "jwt",
 		"bound_audiences": []any{"https://openbao.example.com"},
-		// The statement does not bind ref, so the role gets every allowed
-		// value of it.
+		// The statement does not contain ref, so the service binds the role
+		// to every allowed value of it.
 		"bound_claims":      map[string]any{"repository_id": "123456789", "ref": []any{"refs/heads/main", "refs/heads/release"}},
 		"bound_claims_type": "string",
 		"bound_subject":     "",
