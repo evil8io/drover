@@ -1,0 +1,4 @@
+{
+  "valid": true,
+  "document": "{\"statements\": [{\"name\": \"ci\", \"jwt\": {\"issuer\": \"gitlab\", \"claims\": {\"project_id\": [\"11\", \"12\"]}}, \"role\": \"project-owner\"}]}"
+}

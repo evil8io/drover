@@ -10,6 +10,8 @@ With `--service-accounts`, the service also keeps three ServiceAccounts per proj
 
 With `--openbao-address` as well, the service writes the OpenBao state that follows from the Rancher objects. This state contains a mount of the Kubernetes secrets engine per cluster, with the config of that mount. It also contains a role and an ACL policy per project role. OpenBao then creates short-lived tokens of these ServiceAccounts. See [OpenBao config](#openbao-config).
 
+With `--trust-file` as well, the service writes an OpenBao login role for each valid trust statement in an annotation of a project. An outside workload, for example a CI job, then logs in to OpenBao with the rights of a project role. See [Login roles](#login-roles).
+
 ## Requirements
 
 1. The service needs a Rancher service user with `get`, `list`, `watch`, and `patch` on `namespaces`, in every cluster whose namespaces the service syncs. With a `cluster-owner` binding, the user also has these rights.
@@ -55,6 +57,23 @@ With `--openbao-address` as well, the service writes the OpenBao state that foll
    ```
 
    OpenBao connects to each cluster through the Rancher proxy, with a ServiceAccount token of that cluster. Rancher accepts such a token only for a cluster with `enabled: true` in its `ClusterProxyConfig`. See [the API filter document](api-filter.md).
+7. With `--trust-file`, the same service user also needs `patch` on `projects` of `management.cattle.io`, cluster-wide, in the Rancher cluster. Add this rule to the GlobalRole of the service user. The service writes the status annotation of a project with this right.
+8. With `--trust-file`, the ACL policy of item 6 also needs the paths that follow. OpenBao also needs a JWT auth mount at `auth/jwt/<issuer>` for each issuer of the rules file, and an AWS auth mount at `auth/aws` for the AWS method. The service does not create these auth mounts.
+
+   ```hcl
+   path "auth/jwt/+/role/*" {
+     capabilities = ["create", "read", "update", "delete", "list"]
+   }
+   path "auth/jwt/+/role" {
+     capabilities = ["list"]
+   }
+   path "auth/aws/role/*" {
+     capabilities = ["create", "read", "update", "delete", "list"]
+   }
+   path "auth/aws/roles" {
+     capabilities = ["list"]
+   }
+   ```
 
 ## Configuration
 
@@ -80,6 +99,7 @@ Start the service with `drover project-sync [flags]`.
 | `--openbao-token-ttl` | `24h` | Requested lifetime of the token of a cluster. The minimum is `10m`. The API server can shorten the lifetime. |
 | `--openbao-credential-ttl` | `15m` | Default lifetime of a credential of a project role. This value is the `token_default_ttl` of the role in OpenBao for that project role. The minimum is `10m`, because the API server rejects a TokenRequest with a shorter lifetime. |
 | `--openbao-credential-max-ttl` | `2h` | Longest lifetime of a credential of a project role. This value is the `token_max_ttl` of the role in OpenBao for that project role. It must not be shorter than `--openbao-credential-ttl`. |
+| `--trust-file` | | JSON file of the trust rules. With a file, the service writes the OpenBao login roles of the trust annotations. See [Login roles](#login-roles). When the value is empty, the login roles are off. |
 | `--interval` | `60s` | Time between two reconcile runs. |
 | `--patch-rate` | `10` | Limit per second for the requests to Rancher that the watches of one cluster send, together. A value of `0` or less selects `10`. The value must be a finite number. |
 | `--listen` | `:8080` | Address that the service listens on. |
@@ -89,7 +109,7 @@ Start the service with `drover project-sync [flags]`.
 | `--otlp-metrics` | `true` | When `true`, the service sends metrics to the OTLP endpoint. |
 | `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | Value of the `service.name` resource attribute. With an empty value, `--service-name=`, the service sets no `service.name`, so that a collector can derive it. The OpenTelemetry SDK still takes a `service.name` from `OTEL_SERVICE_NAME` or `OTEL_RESOURCE_ATTRIBUTES`. |
 
-The flags need at least one label key, annotation key, name label key, or name annotation key, or `--service-accounts`. Every `--openbao-` flag needs `--service-accounts`. A key must be a valid Kubernetes label or annotation key. A key is not valid when its prefix is `cattle.io`, `kubernetes.io`, or `k8s.io`, or a subdomain of one of them. The reason is that Rancher and Kubernetes own those domains.
+The flags need at least one label key, annotation key, name label key, or name annotation key, or `--service-accounts`. Every `--openbao-` flag needs `--service-accounts`. `--trust-file` needs `--openbao-address` and `--service-accounts`. A key must be a valid Kubernetes label or annotation key. A key is not valid when its prefix is `cattle.io`, `kubernetes.io`, or `k8s.io`, or a subdomain of one of them. The reason is that Rancher and Kubernetes own those domains.
 
 The keys of `--labels` and `--name-label`, joined with commas, must not be longer than 4096 bytes. The same limit applies to the keys of `--annotations` and `--name-annotation`. The reason is the limit of an ownership annotation, see [Design](#design).
 
@@ -117,7 +137,7 @@ The reconcile run lists every namespace of a cluster, also a namespace without t
 
 For each namespace, the service keeps in memory only the keys that it reads for the sync. These are the project label, the project annotation, the two ownership annotations, and the keys of `--labels`, `--annotations`, `--name-label`, and `--name-annotation`. The service keeps the metadata under other keys in memory only while it decodes that namespace. A tenant can fill an ownership annotation up to the size limit of the API server for annotations, 256 KiB. The service therefore treats an ownership annotation above 4096 bytes as absent, because a list that the service writes is a short list of keys. The service replaces that annotation in the next patch, when the new list of keys is not empty.
 
-The service also lists the projects in pages of 500. For each project, it keeps only the keys of `--labels` and `--annotations`. The service reads at most 4 MiB of one item of any list, and it sets no limit on a page. This limit is above the default object limit of etcd, 1.5 MiB. Many large namespaces of one tenant on one page thus do not stop the list of the cluster. When a namespace is larger, the reconcile run fails for that cluster only, with an error that contains the limit in bytes. When a project is larger, the whole reconcile run fails. When an item of another list is larger, only the work that needs that list fails.
+The service also lists the projects in pages of 500. For each project, it keeps only the keys of `--labels` and `--annotations`, and with `--trust-file` the two annotations of the [login roles](#login-roles). The service reads at most 4 MiB of one item of any list, and it sets no limit on a page. This limit is above the default object limit of etcd, 1.5 MiB. Many large namespaces of one tenant on one page thus do not stop the list of the cluster. When a namespace is larger, the reconcile run fails for that cluster only, with an error that contains the limit in bytes. When a project is larger, the whole reconcile run fails. When an item of another list is larger, only the work that needs that list fails.
 
 The service also keeps one namespace watch per cluster open, on `GET /k8s/clusters/<id>/api/v1/namespaces?watch=true`. The watch selects only the namespaces with the project label. Rancher sets that label about three seconds after the namespace is created, so the service acts on an `ADDED` event and on a `MODIFIED` event. When the project label is removed from a namespace, the namespace is no longer in the selection. The API server then sends a `DELETED` event for it, with the namespace from before the change. Unless the namespace is in deletion, the service reads the namespace again and handles its current state. When the read fails, the service drops the event, and the next reconcile run handles the namespace.
 
@@ -129,7 +149,7 @@ The worker and the lister of a cluster share one rate limiter, with `--patch-rat
 
 A patch of a namespace that no longer exists, or of a namespace in `Terminating`, is not an error. The service skips it, and the next reconcile run repeats the work.
 
-The service also keeps one project watch open, on `GET /k8s/clusters/local/apis/management.cattle.io/v3/projects?watch=true`, with the same timeout and backoff as the namespace watch. The watch decodes a Project object into the same fields that the service reads from the project list. These are the project id, the cluster id, the display name, and the allow-listed labels and annotations. When the watch starts again without a resource version, it gets the full project list again, as an `ADDED` event per project. For each such event, the service only compares the project with its copy in memory, so the service sends no request because of the restart.
+The service also keeps one project watch open, on `GET /k8s/clusters/local/apis/management.cattle.io/v3/projects?watch=true`, with the same timeout and backoff as the namespace watch. The watch decodes a Project object into the same fields that the service reads from the project list. These are the project id, the cluster id, the display name, the allow-listed labels and annotations, and the two annotations of the login roles. When the watch starts again without a resource version, it gets the full project list again, as an `ADDED` event per project. For each such event, the service only compares the project with its copy in memory, so the service sends no request because of the restart.
 
 The service skips a project of a cluster that the last reconcile run did not see. The next reconcile run handles that project. The service thus syncs a new cluster only in the next reconcile run, as it did before the project watch was added. The service skips a Project object whose `metadata.namespace` differs from its `spec.clusterName`, and it writes a warning. The service also skips a project whose name is not a valid label value, because no namespace can have that name in its project label.
 
@@ -231,6 +251,164 @@ The names are the same as the names of the earlier operator objects, so a client
 - Each reconcile run reads `GET <address>/v1/sys/mounts`, and finds the mounts of the Kubernetes secrets engine under the prefix. For a mount of a cluster outside the run, the service reads its config. When `kubernetes_host` is the Rancher URL of that cluster, the service reads `GET /k8s/clusters/local/apis/management.cattle.io/v3/clusters/<cluster id>`. After a 404, the service deletes the policies of that cluster, and then the mount. The delete of a mount also deletes its roles and its config in OpenBao. The service keeps the mount after any other answer, and after an error. It also keeps a mount without such a config, because another writer can own it.
 - When the list of the roles of a mount fails, the service skips the roles of that cluster. It deletes no role of that cluster, but it still deletes a policy of that cluster whose project is gone. When the list of the policies fails, the service skips the policies, and it deletes no OpenBao object. When the list of the mounts fails, the service deletes no mount.
 
+## Login roles
+
+With `--trust-file`, a project owner can let an outside workload, for example a CI job, log in to OpenBao with a role of the project. The owner writes trust statements into the annotation `drover-trust` of the Project object. A statement is one entry of that document. The service writes one OpenBao login role per valid statement. A login role is a role of the JWT auth method or of the AWS auth method of OpenBao. Its token gets the ACL policy of one project role, see [Mounts, roles, and policies](#mounts-roles-and-policies). The service reports the result in the annotation `drover-trust-status`.
+
+The rules file names both annotation keys, so a deployer can choose other keys. The service never copies the two annotations to a namespace. It does not accept them in `--annotations` and `--name-annotation`.
+
+### The trust annotation
+
+The value of the annotation is a JSON document:
+
+```json
+{
+  "statements": [
+    {
+      "name": "deploy-main",
+      "jwt": {
+        "issuer": "github",
+        "claims": {"repository_id": "123456789", "ref": "refs/heads/main"}
+      },
+      "role": "project-member"
+    },
+    {
+      "name": "rotator",
+      "aws": {"arn": "arn:aws:iam::123456789012:role/rotator"},
+      "role": "read-only"
+    }
+  ]
+}
+```
+
+The document has these rules:
+
+- The value has at most 16384 bytes.
+- The document is a JSON object with only the key `statements`. Its value is a list of objects.
+- The list has at most `maxStatements` entries.
+
+A statement has these rules:
+
+- `name` matches `^[a-z0-9]([-a-z0-9]{0,30}[a-z0-9])?$`, and no earlier statement has the same name.
+- The statement has exactly one of `jwt` and `aws`.
+- `jwt.issuer` is an issuer of the rules file. `jwt.claims` is an object that is not empty. Each key is a claim name that is not empty and is not `aud`. Each value is a string that is not empty, or a list of such strings that is not empty. The claims bind every required claim of the issuer. Each value of an allowed claim of the issuer is in the allowed list of that claim.
+- `aws.arn` matches `^arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$`, and it does not end with a slash. When the rules file has allowed accounts, the account of the ARN is one of them. The AWS method is on.
+- `role` is `project-owner`, `project-member`, or `read-only`.
+- A statement, its `jwt` object, and its `aws` object have no other keys.
+
+### The rules file
+
+The service reads the rules from the file of `--trust-file`, at the start and at each reconcile run. A bad file at the start stops the service. A bad file at a later run gives an error line, and the service keeps the last valid rules. The service ignores a key that it does not know.
+
+```json
+{
+  "annotation": "drover-trust",
+  "statusAnnotation": "drover-trust-status",
+  "maxStatements": 20,
+  "audience": "https://openbao.example.com",
+  "loginTokenTTL": "5m",
+  "jwtIssuers": {
+    "github": {"requiredClaims": ["repository_id"], "allowedClaims": {"ref": ["refs/heads/main"]}},
+    "cluster": {"requiredClaims": ["sub"]}
+  },
+  "aws": {"enabled": true, "allowedAccounts": ["123456789012"]}
+}
+```
+
+| Key | Rule |
+| --- | --- |
+| `annotation`, `statusAnnotation` | Two different valid annotation keys. |
+| `maxStatements` | 1 to 100. |
+| `audience` | Not empty. Every JWT login role binds this audience. |
+| `loginTokenTTL` | A Go duration from `1m` to `24h`. It is the lifetime of a token of a login role. |
+| `jwtIssuers` | A map from an issuer name to its rules. The name is a lowercase DNS label, because it is the path of the auth mount `auth/jwt/<issuer>`. |
+| `jwtIssuers.<issuer>.requiredClaims` | A list that is not empty. Every statement of the issuer binds these claims. The first claim is the `user_claim` of every login role of the issuer. |
+| `jwtIssuers.<issuer>.allowedClaims` | Optional. A map from a claim name to a list of allowed values. |
+| `aws.enabled` | When `false`, every `aws` statement gets `MethodDisabled`. |
+| `aws.allowedAccounts` | A list of 12-digit account ids. An empty list allows every account. |
+
+### The roles in OpenBao
+
+The name of a login role is `<project>-<statement name>`, for example `p-abc12-deploy-main`. A `jwt` statement gets the role `auth/jwt/<issuer>/role/<name>`. An `aws` statement gets the role `auth/aws/role/<name>`. Each role has these values:
+
+- `token_policies` has only the ACL policy `<prefix>-<cluster id>-<project>-<role>` of the statement role.
+- The token is a batch token without the `default` policy. Its lifetime is `loginTokenTTL`, and it has no renewal.
+- A JWT role binds the audience of the rules file and the claims of the statement, with string compare. For each allowed claim of the issuer that the statement does not bind, the role binds the full list of allowed values. A JWT role has no `bound_subject` and no `claim_mappings`.
+- An AWS role binds the ARN with the `iam` auth type. The service removes the path from the ARN, so `role/team/rotator` becomes `role/rotator`. The reason is that the caller identity of an assumed role has no path.
+
+The service sends every field that can give a token more rights, also when the field is empty. OpenBao keeps a field that a write does not send.
+
+### The status annotation
+
+The service writes `drover-trust-status` with a JSON merge patch of only that key. The request is `PATCH /k8s/clusters/local/apis/management.cattle.io/v3/namespaces/<cluster id>/projects/<project>`. The keys of the document have this order:
+
+```json
+{
+  "observedHash": "sha256:<hex of the annotation value>",
+  "observedAt": "2026-10-03T12:00:00Z",
+  "statements": [
+    {"name": "deploy-main", "ready": true, "login": {"path": "auth/jwt/github", "role": "p-abc12-deploy-main"}},
+    {"name": "rotator", "ready": false, "reason": "AccountNotAllowed", "message": "the account is not in the allowed accounts"}
+  ]
+}
+```
+
+When the document breaks a rule of the document, the status has the key `error` with a `reason` and a `message`, and no `statements`. The status lists at most `maxStatements` + 1 statements, so that a long list of invalid statements does not make the status larger. It cuts the name of a statement at 63 bytes. The first failed check of a statement sets its reason. These are the reasons, in the order of the checks, with their fixed messages:
+
+| Reason | Message |
+| --- | --- |
+| `InvalidName` | `the name is not 1 to 32 lowercase letters, digits, and dashes, with a letter or a digit at each end` |
+| `DuplicateName` | `an earlier statement has the same name` |
+| `InvalidAuth` | `the statement does not have exactly one of jwt and aws, or it has an unknown key` |
+| `UnknownIssuer` | `the JWT issuer is not configured` |
+| `InvalidClaims` | `the claims are not an object of non-empty strings or non-empty string lists, or a claim is aud` |
+| `MissingRequiredClaim` | `a required claim of the issuer is not bound` |
+| `ClaimNotAllowed` | `a bound value is not in the allowed values of its claim` |
+| `InvalidARN` | `the ARN is not the ARN of an IAM role without wildcards` |
+| `AccountNotAllowed` | `the account is not in the allowed accounts` |
+| `MethodDisabled` | `the login method is not enabled` |
+| `InvalidRole` | `the role is not project-owner, project-member, or read-only` |
+| `TooManyStatements` | `the document has more statements than the limit` |
+| `WriteFailed` | `the login role write in OpenBao failed` |
+| `TooLarge` | `the annotation value is larger than 16384 bytes` |
+| `InvalidJSON` | `the annotation value is not valid JSON` |
+| `InvalidDocument` | `the document is not an object with only a statements list of objects` |
+
+The last three reasons are reasons of the document. `MethodDisabled` is also the reason of a statement whose auth mount does not exist in OpenBao. `WriteFailed` is also the reason of a statement whose role name fits another project, see the rules below.
+
+### Rules of the service
+
+- A project event and the reconcile run do the same work for a project. They parse the document and write the role of each valid statement. They delete each role that the last status lists and that no valid statement names, and they write the status. The project watch does this work within seconds, after the OpenBao roles and policies of the project.
+- The reconcile run does this work for every project whose OpenBao roles and policies it keeps. It also lists the roles of each auth mount of the rules once. It then deletes each role whose name starts with the name of one known project, when no valid statement of that project names it. For another role, it reads the first entry of `token_policies`, and takes the cluster and the project from that policy name. It deletes the role when Rancher answers 404 for that project. It keeps a role whose policy name does not have the form of a policy of the service.
+- An auth mount is not per cluster, and a project name is unique only in its cluster. So the service writes a role only when exactly one project of all clusters fits the role name. Otherwise, the statement gets `WriteFailed`, and the reconcile run deletes the role.
+- The service skips a write of a role that it wrote with the same body in the last 10 minutes. The reconcile run always writes a role that the list does not have.
+- A missing auth mount gives `MethodDisabled`, and no error. The next event or run tries again.
+- When the trust annotation is absent or empty, the project has no login roles. The service then removes the status annotation with a merge patch of `null`.
+- The service writes the status only when it differs from the current value. The compare ignores `observedAt`, and `observedAt` is the time of that write. Every message is a fixed text. The project watch ignores a change of the status annotation. The status write therefore starts no new work.
+- A status patch that gets 404 or 409 is not an error.
+- The service logs the project, the index of a statement, a valid statement name, and the reason. It never logs the value of the annotation.
+- The project watch takes a token of the rate limiter of the cluster before each OpenBao request of this work.
+
+### Log lines
+
+| Line | Level | Fields |
+| --- | --- | --- |
+| `the trust status is written` | info | `cluster`, `project`, `statements`, `ready` |
+| `the trust statement is not ready` | info | `cluster`, `project`, `index`, `reason`, and `statement` for a valid name |
+| `the trust document is not valid` | info | `cluster`, `project`, `reason` |
+| `the trust status is removed` | info | `cluster`, `project` |
+| `the trust status patch failed` | warn | `cluster`, `project`, `error` |
+| `the login role name is not unique` | warn | `cluster`, `project`, `statement`, `mount` |
+| `the OpenBao auth mount does not exist` | info after a project event, debug in a reconcile run | `mount`, and after a project event also `cluster`, `project`, `statement` |
+| `the OpenBao jwt-role write failed`, and the same line for `aws-role` and for `delete` | error | `cluster`, `name`, `error` |
+| `the OpenBao login role list request failed` | error | `mount`, `error` |
+| `the OpenBao login role read failed` | error | `mount`, `name`, `error` |
+| `the login role has no policy of the service, so the service keeps it` | debug | `mount`, `name` |
+| `the login role is refreshed` | debug | `cluster`, `project`, `statement`, `mount` |
+| `the trust rules are not valid, so the service keeps the last valid rules` | error | `error` |
+
+The service writes the status lines only when it writes the status. With `--trust-file`, the line `project changed` of the project watch also has the field `trust_changed`.
+
 ## Telemetry
 
 When `--otlp-endpoint` is set, the service produces a span named `reconcile` for each reconcile run. It produces a span named `patch_namespace` for each patch request of a namespace. That span has the attributes `drover.cluster`, `drover.origin`, and `k8s.namespace.name`. The `drover.origin` value is `reconcile`, `watch`, or `project`.
@@ -256,4 +434,4 @@ The `kind` attribute of `drover.sync.accounts.changes` is `project`, `namespace`
 
 The `outcome` attribute of `drover.sync.openbao.writes` is `ok`, `missing_mount`, or `error`. For a failed login, the service counts one `error` for each cluster that needed a write. For a successful write, the service writes the line `the OpenBao config is written`, with the fields `cluster` and `expires`.
 
-The `kind` attribute of `drover.sync.openbao.changes` is `mount`, `role`, or `policy`. Its `action` attribute is `create`, `update`, `delete`, or `write`. The action `delete` of the kind `mount` is the delete of the mount of a removed cluster. The action `write` is a write by the project watch, which does not read the object first. For every change, the service writes the line `OpenBao object changed`.
+The `kind` attribute of `drover.sync.openbao.changes` is `mount`, `role`, `policy`, `jwt-role`, or `aws-role`. Its `action` attribute is `create`, `update`, `delete`, or `write`. The action `delete` of the kind `mount` is the delete of the mount of a removed cluster. The action `write` is a write by the project watch, which does not read the object first. For `jwt-role` and `aws-role`, the action `create` is a write of a login role that the list of the reconcile run does not have, and `write` is a write with a changed body. A write of the same body after the 10-minute window is not a change. The service logs it at the debug level, and does not count it. For every change, the service writes the line `OpenBao object changed`.

@@ -1,0 +1,5 @@
+{
+  "valid": false,
+  "reason": "InvalidAuth",
+  "document": "{\"statements\": [{\"name\": \"deploy\", \"role\": \"project-member\"}]}"
+}

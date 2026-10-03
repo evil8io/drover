@@ -46,6 +46,10 @@ type fakeOpenBao struct {
 	policies map[string]string
 	// denied are the routes that answer 403 to every client token.
 	denied map[string]bool
+	// authMounts are the auth mounts of the login roles, and loginRoles are their
+	// roles, by mount and name.
+	authMounts map[string]bool
+	loginRoles map[string]map[string]map[string]any
 }
 
 func newFakeOpenBao(t *testing.T) *fakeOpenBao {
@@ -57,6 +61,9 @@ func newFakeOpenBao(t *testing.T) *fakeOpenBao {
 		roles:    make(map[string]map[string]map[string]any),
 		policies: map[string]string{"default": "# default", "root": ""},
 		denied:   make(map[string]bool),
+
+		authMounts: make(map[string]bool),
+		loginRoles: make(map[string]map[string]map[string]any),
 	}
 	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.server.Close)
@@ -101,6 +108,8 @@ func (f *fakeOpenBao) serve(w http.ResponseWriter, r *http.Request) {
 		f.servePolicy(w, r, strings.TrimPrefix(route, "sys/policies/acl/"), body)
 	case strings.HasPrefix(route, "kubernetes/"):
 		f.serveEngine(w, r, strings.TrimPrefix(route, "kubernetes/"), list, body)
+	case strings.HasPrefix(route, "auth/"):
+		f.serveLogin(w, r, route, list, body)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string][]string{"errors": {}})
 	}

@@ -30,9 +30,10 @@ const (
 // storedProject is the Norman fields of one project that the accounts fake
 // keeps.
 type storedProject struct {
-	creatorID string
-	created   string
-	labels    map[string]string
+	creatorID   string
+	created     string
+	labels      map[string]string
+	annotations map[string]string
 }
 
 // listEnvelope is the list shape that every Kubernetes collection endpoint of
@@ -361,6 +362,8 @@ func (f *accountsFake) serve(w http.ResponseWriter, r *http.Request) {
 		f.serveCluster(w, strings.TrimPrefix(path, clustersPath))
 	case r.Method == http.MethodPost && path == clusterPath(rancherCluster)+managementProjects+acctCluster+"/projects":
 		f.createProject(w, r)
+	case r.Method == http.MethodPatch && strings.HasPrefix(path, clusterPath(rancherCluster)+managementProjects+acctCluster+"/projects/"):
+		f.patchProject(w, r, strings.TrimPrefix(path, clusterPath(rancherCluster)+managementProjects+acctCluster+"/projects/"))
 	case r.Method == http.MethodPost && strings.HasPrefix(path, "/k8s/clusters/") && strings.HasSuffix(path, "/token"):
 		f.serveTokenRequest(w, r)
 	case r.Method == http.MethodGet && path == acctRBACBase+"/roles":
@@ -488,7 +491,7 @@ func (f *accountsFake) serveCA(w http.ResponseWriter) {
 }
 
 func (f *accountsFake) toProject(name string, p storedProject) project {
-	return project{ID: acctCluster + ":" + name, ClusterID: acctCluster, Name: name, CreatorID: p.creatorID, Created: p.created, Labels: p.labels}
+	return project{ID: acctCluster + ":" + name, ClusterID: acctCluster, Name: name, CreatorID: p.creatorID, Created: p.created, Labels: p.labels, Annotations: p.annotations}
 }
 
 func (f *accountsFake) setListStatus(status int) {

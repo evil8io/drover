@@ -1,0 +1,5 @@
+{
+  "valid": false,
+  "reason": "MissingRequiredClaim",
+  "document": "{\"statements\": [{\"name\": \"deploy\", \"jwt\": {\"issuer\": \"github\", \"claims\": {\"ref\": \"refs/heads/main\"}}, \"role\": \"project-member\"}]}"
+}

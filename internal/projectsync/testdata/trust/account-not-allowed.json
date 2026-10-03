@@ -1,0 +1,5 @@
+{
+  "valid": false,
+  "reason": "AccountNotAllowed",
+  "document": "{\"statements\": [{\"name\": \"rotator\", \"aws\": {\"arn\": \"arn:aws:iam::210987654321:role/rotator\"}, \"role\": \"read-only\"}]}"
+}

@@ -1,0 +1,5 @@
+{
+  "valid": false,
+  "reason": "InvalidClaims",
+  "document": "{\"statements\": [{\"name\": \"deploy\", \"jwt\": {\"issuer\": \"github\", \"claims\": {}}, \"role\": \"project-member\"}]}"
+}

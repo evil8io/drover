@@ -102,11 +102,13 @@ type openbaoWriter struct {
 	sessionUntil time.Time
 	retried      bool
 
-	// mu guards written, and verified, the time of the last read or write of
-	// each role and policy, by cluster and object key.
+	// mu guards written, verified, the time of the last read or write of
+	// each role and policy, by cluster and object key, and logins, the last
+	// write of each login role.
 	mu       sync.Mutex
 	written  map[string]openbaoEntry
 	verified map[string]map[string]time.Time
+	logins   map[loginKey]loginWrite
 }
 
 // openbaoEntry is the token and the Rancher CA of the last successful write of
@@ -416,6 +418,11 @@ func (s *Syncer) refreshOpenBao(ctx context.Context, token string, names []strin
 		defer mu.Unlock()
 		run.errors += errs
 	})
+	// The login roles name the ACL policies of the project roles, so they
+	// come after those.
+	if rules := s.trustRules(); rules != nil {
+		run.errors += s.refreshTrust(ctx, token, names, ready, projects, rules)
+	}
 }
 
 // writeOpenBao requests a new token of the OpenBao ServiceAccount of cluster,

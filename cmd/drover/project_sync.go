@@ -32,6 +32,7 @@ type projectSyncConfig struct {
 	nameAnnotation     string
 	serviceAccounts    bool
 	openbao            *projectsync.OpenBaoConfig
+	trustFile          string
 	interval           time.Duration
 	patchRate          float64
 	logLevel           slog.Level
@@ -76,6 +77,7 @@ func runProjectSync(args []string) int {
 		NameAnnotation:     cfg.nameAnnotation,
 		ServiceAccounts:    cfg.serviceAccounts,
 		OpenBao:            cfg.openbao,
+		TrustFile:          cfg.trustFile,
 		Interval:           cfg.interval,
 		PatchRate:          cfg.patchRate,
 		Logger:             logger,
@@ -113,6 +115,7 @@ func runProjectSync(args []string) int {
 		"name_annotation", cfg.nameAnnotation,
 		"service_accounts", cfg.serviceAccounts,
 		"openbao_address", openbaoAddress(cfg.openbao),
+		"trust_file", cfg.trustFile,
 	)
 
 	syncDone := make(chan struct{})
@@ -184,6 +187,8 @@ func parseProjectSyncConfig(args []string, output io.Writer, getenv func(string)
 		"default lifetime of a credential of a project role that OpenBao creates")
 	flags.DurationVar(&openbao.CredentialMaxTTL, "openbao-credential-max-ttl", 2*time.Hour,
 		"longest lifetime of a credential of a project role that OpenBao creates")
+	flags.StringVar(&cfg.trustFile, "trust-file", "",
+		"JSON file of the trust rules, for the OpenBao login roles of the project trust annotation; empty turns it off")
 	flags.DurationVar(&cfg.interval, "interval", 60*time.Second, "time between two runs")
 	flags.Float64Var(&cfg.patchRate, "patch-rate", 10,
 		"requests to Rancher per second that the watches of one cluster send, together")
@@ -234,6 +239,9 @@ func parseProjectSyncConfig(args []string, output io.Writer, getenv func(string)
 	}
 	if cfg.openbao, err = parseOpenBao(flags, cfg.serviceAccounts, openbaoAddr, openbaoRancherURL, openbao); err != nil {
 		return projectSyncConfig{}, err
+	}
+	if cfg.trustFile != "" && cfg.openbao == nil {
+		return projectSyncConfig{}, errors.New("-trust-file needs -openbao-address and -service-accounts")
 	}
 	return cfg, nil
 }

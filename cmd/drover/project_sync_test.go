@@ -258,3 +258,46 @@ func TestParseProjectSyncConfigOpenBaoErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestParseProjectSyncConfigTrustFile(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := parseProjectSyncConfig(openbaoArgs("--trust-file", "/etc/drover/trust.json"), io.Discard, noEnvironment)
+	if err != nil {
+		t.Fatalf("parseProjectSyncConfig: %v", err)
+	}
+	if cfg.trustFile != "/etc/drover/trust.json" {
+		t.Errorf("trust file = %q, want /etc/drover/trust.json", cfg.trustFile)
+	}
+
+	cfg, err = parseProjectSyncConfig(openbaoArgs(), io.Discard, noEnvironment)
+	if err != nil {
+		t.Fatalf("parseProjectSyncConfig without a trust file: %v", err)
+	}
+	if cfg.trustFile != "" {
+		t.Errorf("trust file = %q, want empty", cfg.trustFile)
+	}
+
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"without OpenBao", []string{
+			"--rancher-url", "https://rancher.cattle-system", "--token-file", "/dev/null", "--service-accounts",
+			"--trust-file", "/etc/drover/trust.json",
+		}},
+		{"without service accounts", []string{
+			"--rancher-url", "https://rancher.cattle-system", "--token-file", "/dev/null", "--labels", "team",
+			"--trust-file", "/etc/drover/trust.json",
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := parseProjectSyncConfig(tt.args, io.Discard, noEnvironment)
+			if err == nil || !strings.Contains(err.Error(), "-trust-file needs -openbao-address and -service-accounts") {
+				t.Errorf("error = %v, want one about -trust-file", err)
+			}
+		})
+	}
+}

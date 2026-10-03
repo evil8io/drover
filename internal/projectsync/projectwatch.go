@@ -129,8 +129,14 @@ func (s *Syncer) applyProject(ctx context.Context, watches *watchSet, eventType 
 	if known && old.Name == item.project.Name &&
 		old.CreatorID == item.project.CreatorID &&
 		old.reserved == item.project.reserved && old.marked == item.project.marked &&
+		old.trust == item.project.trust &&
 		maps.Equal(old.Labels, item.project.Labels) &&
 		maps.Equal(old.Annotations, item.project.Annotations) {
+		// The service writes the status itself, so a new status is no
+		// change, and its event starts no work.
+		if old.trustStatus != item.project.trustStatus {
+			s.setProject(cluster, item.name, item.project)
+		}
 		s.logger.DebugContext(ctx, "project unchanged", "cluster", cluster, "project", id)
 		return
 	}
@@ -141,11 +147,14 @@ func (s *Syncer) applyProject(ctx context.Context, watches *watchSet, eventType 
 	}
 	nameChanged := old.Name != item.project.Name
 	s.metrics.projectChanged(ctx, cluster)
-	s.logger.InfoContext(ctx, "project changed",
-		"cluster", cluster, "project", id,
+	attrs := []any{"cluster", cluster, "project", id,
 		"labels", changedKeys(old.Labels, item.project.Labels),
 		"annotations", changedKeys(old.Annotations, item.project.Annotations),
-		"name_changed", nameChanged)
+		"name_changed", nameChanged}
+	if s.trustRules() != nil {
+		attrs = append(attrs, "trust_changed", old.trust != item.project.trust)
+	}
+	s.logger.InfoContext(ctx, "project changed", attrs...)
 
 	watch := watches.get(cluster)
 	if watch == nil {

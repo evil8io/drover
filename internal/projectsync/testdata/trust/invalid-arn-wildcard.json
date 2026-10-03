@@ -1,0 +1,5 @@
+{
+  "valid": false,
+  "reason": "InvalidARN",
+  "document": "{\"statements\": [{\"name\": \"rotator\", \"aws\": {\"arn\": \"arn:aws:iam::123456789012:role/*\"}, \"role\": \"read-only\"}]}"
+}
