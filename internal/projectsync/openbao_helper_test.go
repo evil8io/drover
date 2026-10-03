@@ -46,6 +46,8 @@ type fakeOpenBao struct {
 	policies map[string]string
 	// denied are the routes that answer 403 to every client token.
 	denied map[string]bool
+	// failing is the status that a route answers to every request.
+	failing map[string]int
 	// authMounts are the auth mounts of the login roles, and loginRoles are their
 	// roles, by mount and name.
 	authMounts map[string]bool
@@ -61,6 +63,7 @@ func newFakeOpenBao(t *testing.T) *fakeOpenBao {
 		roles:    make(map[string]map[string]map[string]any),
 		policies: map[string]string{"default": "# default", "root": ""},
 		denied:   make(map[string]bool),
+		failing:  make(map[string]int),
 
 		authMounts: make(map[string]bool),
 		loginRoles: make(map[string]map[string]map[string]any),
@@ -93,6 +96,10 @@ func (f *fakeOpenBao) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	if !slices.Contains(f.issued, r.Header.Get("X-Vault-Token")) || f.denied[route] {
 		writeJSON(w, http.StatusForbidden, map[string][]string{"errors": {"permission denied"}})
+		return
+	}
+	if status := f.failing[route]; status != 0 {
+		writeJSON(w, status, map[string][]string{"errors": {"internal error"}})
 		return
 	}
 	list := r.URL.Query().Get("list") == "true"
@@ -259,6 +266,13 @@ func (f *fakeOpenBao) deny(route string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.denied[route] = true
+}
+
+// fail answers every request of route with status.
+func (f *fakeOpenBao) fail(route string, status int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failing[route] = status
 }
 
 // revokeTokens makes every issued client token invalid, as an expiry does.

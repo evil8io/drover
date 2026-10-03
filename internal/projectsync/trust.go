@@ -84,7 +84,7 @@ var trustMessages = map[string]string{
 
 var (
 	statementName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,30}[a-z0-9])?$`)
-	roleARN       = regexp.MustCompile(`^arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$`)
+	roleARN       = regexp.MustCompile(`^arn:aws:iam::[0-9]{12}:role/([A-Za-z0-9+=,.@_-]+/)*[A-Za-z0-9+=,.@_-]+$`)
 	awsAccountID  = regexp.MustCompile(`^[0-9]{12}$`)
 	// issuerName is the pattern of an issuer name that is valid as one segment
 	// of an OpenBao path.
@@ -434,7 +434,7 @@ func (item *trustStatement) checkAWS(raw json.RawMessage, rules *trustRules) str
 		return reasonInvalidAuth
 	}
 	arn, ok := jsonString(fields["arn"])
-	if !ok || !roleARN.MatchString(arn) || strings.HasSuffix(arn, "/") {
+	if !ok || !roleARN.MatchString(arn) {
 		return reasonInvalidARN
 	}
 	account := strings.Split(arn, ":")[4]
@@ -622,8 +622,10 @@ func sameTrustStatus(current string, want trustStatus) bool {
 }
 
 // previousLogins returns the login roles of the ready statements of the
-// status value. It returns nil when it cannot decode the value.
-func previousLogins(value string) []loginRef {
+// status value, each role once. It reads at most limit statements, because
+// the service never writes more. It returns nil when it cannot decode the
+// value.
+func previousLogins(value string, limit int) []loginRef {
 	var status struct {
 		Statements []struct {
 			Ready bool      `json:"ready"`
@@ -634,8 +636,13 @@ func previousLogins(value string) []loginRef {
 		return nil
 	}
 	var out []loginRef
-	for _, item := range status.Statements {
-		if item.Ready && item.Login != nil {
+	seen := make(map[loginRef]bool)
+	for index, item := range status.Statements {
+		if index >= limit {
+			break
+		}
+		if item.Ready && item.Login != nil && !seen[*item.Login] {
+			seen[*item.Login] = true
 			out = append(out, *item.Login)
 		}
 	}
