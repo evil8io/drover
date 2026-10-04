@@ -29,7 +29,7 @@ Write a rule in the imperative. Give the reason for the rule. Delete a line when
 
 ## Telemetry
 
-- Name the cluster attribute of a new metric `drover.cluster`, not `cluster`. A metrics backend that promotes the resource attribute `cluster` adds it only to a point without an attribute `cluster`. So a point attribute `cluster` hides the cluster of the telemetry pipeline.
+- Name the cluster attribute of a metric `drover.cluster`, not `cluster`. A metrics backend that promotes the resource attribute `cluster` adds it only to a point without an attribute `cluster`. So a point attribute `cluster` hides the cluster of the telemetry pipeline.
 
 ## Docs
 

@@ -109,7 +109,7 @@ func (m *metrics) recordRequest(ctx context.Context, result listResult, cluster 
 	attrs := metric.WithAttributes(
 		attribute.String("path", result.path),
 		attribute.String("outcome", result.outcome),
-		attribute.String("cluster", cluster),
+		attribute.String("drover.cluster", cluster),
 		attribute.Bool("watch", result.watch),
 	)
 	m.requests.Add(ctx, 1, attrs)
@@ -131,21 +131,21 @@ func (m *metrics) watchClosed(ctx context.Context) {
 // watchRejected records one upgraded watch stream that the filter ends at
 // once, for the cluster.
 func (m *metrics) watchRejected(ctx context.Context, cluster string) {
-	m.watchesRejected.Add(ctx, 1, metric.WithAttributes(attribute.String("cluster", cluster)))
+	m.watchesRejected.Add(ctx, 1, metric.WithAttributes(attribute.String("drover.cluster", cluster)))
 }
 
 // watchCapped records one watch that a watch limit refuses with 503, for the
 // cluster, with limit limitShared or limitCaller.
 func (m *metrics) watchCapped(ctx context.Context, cluster, limit string) {
 	m.watchesRejected.Add(ctx, 1, metric.WithAttributes(
-		attribute.String("cluster", cluster),
+		attribute.String("drover.cluster", cluster),
 		attribute.String("limit", limit),
 	))
 }
 
 // eventDropped records one dropped watch event, for the cluster.
 func (m *metrics) eventDropped(ctx context.Context, cluster string) {
-	m.eventsDropped.Add(ctx, 1, metric.WithAttributes(attribute.String("cluster", cluster)))
+	m.eventsDropped.Add(ctx, 1, metric.WithAttributes(attribute.String("drover.cluster", cluster)))
 }
 
 // fetchThrottled records one fetch that a rate limit throttles, with a 429
@@ -156,15 +156,15 @@ func (m *metrics) fetchThrottled(ctx context.Context, limit string) {
 
 // fanoutNamespaces records the namespace count of one fan-out, for the cluster.
 func (m *metrics) fanoutNamespaces(ctx context.Context, cluster string, count int) {
-	m.fanoutNS.Record(ctx, int64(count), metric.WithAttributes(attribute.String("cluster", cluster)))
+	m.fanoutNS.Record(ctx, int64(count), metric.WithAttributes(attribute.String("drover.cluster", cluster)))
 }
 
 // fanoutCapped records one cluster-wide list above the fan-out limit, for the cluster.
 func (m *metrics) fanoutCapped(ctx context.Context, cluster string) {
-	m.fanoutsCapped.Add(ctx, 1, metric.WithAttributes(attribute.String("cluster", cluster)))
+	m.fanoutsCapped.Add(ctx, 1, metric.WithAttributes(attribute.String("drover.cluster", cluster)))
 }
 
 // fanoutSkipped records one namespace that the merged answer leaves out, for the cluster.
 func (m *metrics) fanoutSkipped(ctx context.Context, cluster string) {
-	m.fanoutsSkipped.Add(ctx, 1, metric.WithAttributes(attribute.String("cluster", cluster)))
+	m.fanoutsSkipped.Add(ctx, 1, metric.WithAttributes(attribute.String("drover.cluster", cluster)))
 }

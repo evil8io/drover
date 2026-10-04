@@ -436,15 +436,15 @@ With `--openbao-address`, the service also produces a span named `openbao_login`
 | `drover.sync.namespaces.patched` | Counter | `1` | `origin` |
 | `drover.sync.errors` | Counter | `1` | |
 | `drover.sync.duration` | Histogram | `s` | |
-| `drover.sync.events` | Counter | `1` | `cluster`, `kind`, `type` |
-| `drover.sync.watches.open` | UpDownCounter | `1` | `cluster`, `kind` |
-| `drover.sync.projects.changed` | Counter | `1` | `cluster` |
+| `drover.sync.events` | Counter | `1` | `drover.cluster`, `kind`, `type` |
+| `drover.sync.watches.open` | UpDownCounter | `1` | `drover.cluster`, `kind` |
+| `drover.sync.projects.changed` | Counter | `1` | `drover.cluster` |
 | `drover.sync.accounts.changes` | Counter | `1` | `kind`, `action` |
-| `drover.sync.openbao.writes` | Counter | `1` | `cluster`, `outcome` |
+| `drover.sync.openbao.writes` | Counter | `1` | `drover.cluster`, `outcome` |
 | `drover.sync.openbao.changes` | Counter | `1` | `kind`, `action` |
 | `drover.sync.trust.statements.ready` | Gauge | `1` | `drover.cluster`, `project`, `statement`, `reason` |
 
-The `kind` attribute of the watch metrics is `namespace` or `project`. For the project watch, `cluster` is always `local`.
+The `kind` attribute of the watch metrics is `namespace` or `project`. For the project watch, `drover.cluster` is always `local`.
 
 The `kind` attribute of `drover.sync.accounts.changes` is `project`, `namespace`, `serviceaccount`, `role`, `rolebinding`, or `clusterrolebinding`. Its `action` attribute is `create`, `update`, `move`, or `delete`. With `--service-accounts`, the summary line of a reconcile run contains the field `accounts_changed`. For every write of an account object, the service writes the line `account object changed`.
 

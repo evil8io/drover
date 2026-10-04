@@ -260,19 +260,19 @@ With `--otlp-endpoint` set, the service also exports these metrics:
 
 | Metric | Kind | Unit | Attributes |
 | --- | --- | --- | --- |
-| `drover.filter.requests` | Counter | `1` | `path`, `outcome`, `cluster`, `watch` |
-| `drover.filter.request.duration` | Histogram | `s` | `path`, `outcome`, `cluster`, `watch` |
+| `drover.filter.requests` | Counter | `1` | `path`, `outcome`, `drover.cluster`, `watch` |
+| `drover.filter.request.duration` | Histogram | `s` | `path`, `outcome`, `drover.cluster`, `watch` |
 | `drover.filter.watches.open` | UpDownCounter | `1` | |
-| `drover.filter.watches.rejected` | Counter | `1` | `cluster`, `limit` |
-| `drover.filter.events.dropped` | Counter | `1` | `cluster` |
+| `drover.filter.watches.rejected` | Counter | `1` | `drover.cluster`, `limit` |
+| `drover.filter.events.dropped` | Counter | `1` | `drover.cluster` |
 | `drover.filter.fetch.throttled` | Counter | `1` | `limit` |
-| `drover.filter.fanout.namespaces` | Histogram | `1` | `cluster` |
-| `drover.filter.fanout.capped` | Counter | `1` | `cluster` |
+| `drover.filter.fanout.namespaces` | Histogram | `1` | `drover.cluster` |
+| `drover.filter.fanout.capped` | Counter | `1` | `drover.cluster` |
 | `drover.filter.fanout.skipped` | Counter | `1` | `cluster` |
 
 In `drover.filter.watches.rejected`, the service counts each watch that it refuses with a 503 error because of a watch limit. The `limit` attribute is `shared` for `--max-watches`, and `caller` for `--max-watches-per-caller`. The service also counts in this metric an upgraded stream that it ends because of a websocket extension. The service records that count without a `limit` attribute.
 
-The value of the `cluster` attribute of the two request metrics is the cluster id only for a known cluster. A cluster is known after Steve answers a namespace list for it, or after a rules review names a namespace in it. For every other request, the value is `unknown`, because a client can put any string in the path, also before authentication. A metric attribute with an unbounded value set makes the cardinality of the metric unbounded.
+The value of the `drover.cluster` attribute of the two request metrics is the cluster id only for a known cluster. A cluster is known after Steve answers a namespace list for it, or after a rules review names a namespace in it. For every other request, the value is `unknown`, because a client can put any string in the path, also before authentication. A metric attribute with an unbounded value set makes the cardinality of the metric unbounded.
 
 The `limit` attribute of `drover.filter.fetch.throttled` is `caller` for the limit per caller, and `shared` for the shared limit.
 

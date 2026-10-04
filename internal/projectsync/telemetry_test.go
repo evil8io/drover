@@ -263,12 +263,12 @@ func TestProjectWatchRecordsTheChangeAndTheKind(t *testing.T) {
 	if len(changed.DataPoints) != 1 || changed.DataPoints[0].Value != 1 {
 		t.Fatalf("drover.sync.projects.changed points = %v, want one point with value 1", changed.DataPoints)
 	}
-	if cluster, _ := changed.DataPoints[0].Attributes.Value(attribute.Key("cluster")); cluster.AsString() != "c-1" {
+	if cluster, _ := changed.DataPoints[0].Attributes.Value(attribute.Key("drover.cluster")); cluster.AsString() != "c-1" {
 		t.Errorf("cluster of the change = %q, want c-1", cluster.AsString())
 	}
 
 	want := attribute.NewSet(
-		attribute.String("cluster", rancherCluster),
+		attribute.String("drover.cluster", rancherCluster),
 		attribute.String("kind", kindProject),
 		attribute.String("type", watchModified))
 	var events int64
@@ -282,7 +282,7 @@ func TestProjectWatchRecordsTheChangeAndTheKind(t *testing.T) {
 	}
 
 	wantOpen := attribute.NewSet(
-		attribute.String("cluster", rancherCluster),
+		attribute.String("drover.cluster", rancherCluster),
 		attribute.String("kind", kindProject))
 	open := findSum(t, data, "drover.sync.watches.open")
 	if len(open.DataPoints) != 1 || !open.DataPoints[0].Attributes.Equals(&wantOpen) || open.DataPoints[0].Value != 0 {
