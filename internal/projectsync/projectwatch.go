@@ -118,6 +118,7 @@ func (s *Syncer) applyProject(ctx context.Context, watches *watchSet, eventType 
 	switch eventType {
 	case watchDeleted:
 		s.deleteProject(cluster, item.name)
+		s.metrics.forgetTrust(cluster, item.name)
 		s.logger.DebugContext(ctx, "project deleted", "cluster", cluster, "project", id)
 		return
 	case watchAdded, watchModified:

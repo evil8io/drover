@@ -41,6 +41,9 @@ type Config struct {
 	ServiceName string
 	// Version is the service.version resource attribute.
 	Version string
+	// ObservableGaugeCardinalityLimit is the cardinality limit of each
+	// observable gauge. Zero keeps the default of the SDK.
+	ObservableGaugeCardinalityLimit int
 }
 
 // Telemetry has the providers that Setup starts. Shutdown stops them.
@@ -90,7 +93,7 @@ func Setup(ctx context.Context, cfg Config) (*Telemetry, error) {
 	}
 
 	if cfg.Metrics {
-		if tel.meterProvider, err = setupMetrics(ctx, target, secure, res); err != nil {
+		if tel.meterProvider, err = setupMetrics(ctx, target, secure, res, cfg.ObservableGaugeCardinalityLimit); err != nil {
 			return nil, err
 		}
 		otel.SetMeterProvider(tel.meterProvider)
@@ -142,7 +145,10 @@ func setupTraces(ctx context.Context, target string, secure bool, res *resource.
 	), nil
 }
 
-func setupMetrics(ctx context.Context, target string, secure bool, res *resource.Resource) (*sdkmetric.MeterProvider, error) {
+// setupMetrics starts the metric provider. A gaugeLimit above zero is the
+// cardinality limit of each observable gauge. Every other kind keeps the limit
+// of the provider.
+func setupMetrics(ctx context.Context, target string, secure bool, res *resource.Resource, gaugeLimit int) (*sdkmetric.MeterProvider, error) {
 	options := []otlpmetricgrpc.Option{otlpmetricgrpc.WithEndpoint(target)}
 	if secure {
 		options = append(options, otlpmetricgrpc.WithTLSCredentials(credentials.NewTLS(&tls.Config{})))
@@ -153,7 +159,16 @@ func setupMetrics(ctx context.Context, target string, secure bool, res *resource
 	if err != nil {
 		return nil, fmt.Errorf("start the metric exporter: %w", err)
 	}
-	reader := sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(metricInterval))
+	readerOptions := []sdkmetric.PeriodicReaderOption{sdkmetric.WithInterval(metricInterval)}
+	if gaugeLimit > 0 {
+		readerOptions = append(readerOptions, sdkmetric.WithCardinalityLimitSelector(func(kind sdkmetric.InstrumentKind) (int, bool) {
+			if kind == sdkmetric.InstrumentKindObservableGauge {
+				return gaugeLimit, false
+			}
+			return 0, true
+		}))
+	}
+	reader := sdkmetric.NewPeriodicReader(exporter, readerOptions...)
 	return sdkmetric.NewMeterProvider(
 		sdkmetric.WithReader(reader),
 		sdkmetric.WithResource(res),

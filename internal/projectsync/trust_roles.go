@@ -324,6 +324,11 @@ func (s *Syncer) keepTrust(ctx context.Context, run *trustRun, cluster, name str
 		}
 	}
 
+	// The project watch can change or delete the project during the step.
+	s.metrics.setTrust(cluster, name, status, func() bool {
+		live, ok := s.projectsOf(cluster)[name]
+		return ok && live.trust == item.trust
+	})
 	result.errors += s.writeTrustStatus(ctx, run, cluster, name, item.trustStatus, status)
 	return result
 }
@@ -506,6 +511,15 @@ func (s *Syncer) keepProjectTrust(ctx context.Context, token, cluster, name stri
 	}
 	run := &trustRun{rules: rules, token: token, owners: newProjectNames(s.snapshot())}
 	s.keepTrust(ctx, run, cluster, name, item)
+}
+
+// dropGoneTrustPoints removes the trust points of each project that the
+// snapshot does not have.
+func (s *Syncer) dropGoneTrustPoints() {
+	s.metrics.pruneTrust(func(ref projectRef) bool {
+		_, ok := s.projectsOf(ref.cluster)[ref.name]
+		return !ok
+	})
 }
 
 // refreshTrust runs the trust step of every tenant of ready, and then deletes

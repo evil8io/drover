@@ -442,6 +442,7 @@ With `--openbao-address`, the service also produces a span named `openbao_login`
 | `drover.sync.accounts.changes` | Counter | `1` | `kind`, `action` |
 | `drover.sync.openbao.writes` | Counter | `1` | `cluster`, `outcome` |
 | `drover.sync.openbao.changes` | Counter | `1` | `kind`, `action` |
+| `drover.sync.trust.statements.ready` | Gauge | `1` | `drover.cluster`, `project`, `statement`, `reason` |
 
 The `kind` attribute of the watch metrics is `namespace` or `project`. For the project watch, `cluster` is always `local`.
 
@@ -452,3 +453,11 @@ The `outcome` attribute of `drover.sync.openbao.writes` is `ok`, `missing_mount`
 The `kind` attribute of `drover.sync.openbao.changes` is `mount`, `role`, `policy`, `jwt-role`, or `aws-role`. Its `action` attribute is `create`, `update`, `delete`, or `write`. The action `delete` of the kind `mount` is the delete of the mount of a removed cluster. The action `write` is a write by the project watch, which does not read the object first. For every change, the service writes the line `OpenBao object changed`.
 
 For `jwt-role` and `aws-role`, the action `create` is a write of a login role that the list of the reconcile run does not have. The action `write` is a write with a changed body. A write of the same body after the 10-minute window is not a change. The service logs it at the debug level, and does not count it.
+
+With `--trust-file`, the service exports `drover.sync.trust.statements.ready` for each project whose OpenBao roles and policies it keeps. Such a project has one data point for each statement of the status that the service computes. The status has at most `maxStatements` + 1 statements. Two statements with an invalid name and the same reason share one data point.
+
+The value is 1 for a ready statement and 0 for a statement that is not ready. A data point has the attribute `statement` only for a valid statement name, and it has the attribute `reason` only for the value 0. For a document error, the project has one data point with the value 0, the reason of the document, and no `statement`. `drover.cluster` is the cluster id of the project, and `project` is the project name.
+
+The service replaces the data points of a project each time that it computes the status, after a project event or in a reconcile run. So it removes the data point of a removed statement, and every data point of a project without the trust annotation. After a `DELETED` event of the project watch, the service removes the data points of the project. A reconcile run removes the data points of each project that its project list does not have. The run keeps the data points of every other project, also when it writes no OpenBao state for the project or its cluster.
+
+The service sets the cardinality limit of its observable gauges to 10000 data points. So the OpenTelemetry SDK exports at most 9999 attribute sets of this gauge per collection. It puts the values of every later attribute set into one data point with the attribute `otel.metric.overflow` set to `true`. The service observes the projects sorted by cluster id and project name, so the same projects are in that data point at each collection.

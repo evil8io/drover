@@ -20,6 +20,10 @@ import (
 	"github.com/evil8io/drover/internal/telemetry"
 )
 
+// project-sync raises the cardinality limit of each observable gauge to
+// gaugeCardinalityLimit, because a tenant controls the count of trust points.
+const gaugeCardinalityLimit = 10000
+
 type projectSyncConfig struct {
 	listen             string
 	rancherURL         *url.URL
@@ -205,6 +209,7 @@ func parseProjectSyncConfig(args []string, output io.Writer, getenv func(string)
 	}
 	cfg.logLevel = level
 	cfg.telemetry = tf.config()
+	cfg.telemetry.ObservableGaugeCardinalityLimit = gaugeCardinalityLimit
 
 	target, err := parseRancherURL("-rancher-url", rancherURL)
 	if err != nil {

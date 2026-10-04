@@ -2,6 +2,7 @@ package projectsync
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -117,6 +118,65 @@ func findSum(t *testing.T, data metricdata.ResourceMetrics, name string) metricd
 	}
 	t.Fatalf("no metric named %s", name)
 	return metricdata.Sum[int64]{}
+}
+
+// findGauge returns the metricdata.Gauge[int64] of the metric named name,
+// from the first scope that has it. It returns false when no scope has the
+// metric, because the SDK leaves out a metric without points.
+func findGauge(t *testing.T, data metricdata.ResourceMetrics, name string) (metricdata.Gauge[int64], bool) {
+	t.Helper()
+	for _, scope := range data.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if m.Name != name {
+				continue
+			}
+			gauge, ok := m.Data.(metricdata.Gauge[int64])
+			if !ok {
+				t.Fatalf("metric %s has type %T, want metricdata.Gauge[int64]", name, m.Data)
+			}
+			return gauge, true
+		}
+	}
+	return metricdata.Gauge[int64]{}, false
+}
+
+// TestTrustGaugeOverflowsTheSameProjectsAtEachCollection checks that the
+// projects below the cardinality limit are the first projects in the order of
+// cluster and project, at each collection.
+func TestTrustGaugeOverflowsTheSameProjectsAtEachCollection(t *testing.T) {
+	t.Parallel()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader), sdkmetric.WithCardinalityLimit(3))
+	m, err := newMetrics(provider)
+	if err != nil {
+		t.Fatalf("build the metrics: %v", err)
+	}
+	statements := []statementStatus{{Name: "deploy", Ready: true}}
+	for _, name := range []string{"p-f", "p-c", "p-a", "p-e", "p-b", "p-d"} {
+		m.setTrust(acctCluster, name, &trustStatus{Statements: &statements}, func() bool { return true })
+	}
+
+	want := []string{"overflow", "p-a", "p-b"}
+	for range 5 {
+		var data metricdata.ResourceMetrics
+		if err := reader.Collect(context.Background(), &data); err != nil {
+			t.Fatalf("collect metrics: %v", err)
+		}
+		gauge, _ := findGauge(t, data, "drover.sync.trust.statements.ready")
+		var got []string
+		for _, point := range gauge.DataPoints {
+			if _, ok := point.Attributes.Value("otel.metric.overflow"); ok {
+				got = append(got, "overflow")
+				continue
+			}
+			project, _ := point.Attributes.Value("project")
+			got = append(got, project.AsString())
+		}
+		slices.Sort(got)
+		if !slices.Equal(got, want) {
+			t.Fatalf("points = %v, want %v", got, want)
+		}
+	}
 }
 
 // TestWatchRecordsTheEventAndTheOpenStream checks that one namespace watch
