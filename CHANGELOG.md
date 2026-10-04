@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.25.0](https://github.com/evil8io/drover/compare/v0.24.0...v0.25.0) (2026-10-04)
+
+
+### Features
+
+* **project-sync:** export the readiness of each trust statement as a gauge ([#131](https://github.com/evil8io/drover/issues/131)) ([4133dfd](https://github.com/evil8io/drover/commit/4133dfd1e18900472af35014641dccf881e90c8d))
+
 ## [0.24.0](https://github.com/evil8io/drover/compare/v0.23.0...v0.24.0) (2026-10-03)
 
 
