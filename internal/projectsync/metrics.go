@@ -51,12 +51,12 @@ type metrics struct {
 	openbao    metric.Int64Counter
 	openbaoSet metric.Int64Counter
 
-	// trustMu guards trust, the points of the trust gauge by project.
+	// trustMu guards trust, the data points of the trust gauge by project.
 	trustMu sync.Mutex
 	trust   map[projectRef][]trustPoint
 }
 
-// trustPoint is one point of the trust gauge.
+// trustPoint is one data point of the trust gauge.
 type trustPoint struct {
 	value int64
 	attrs attribute.Set
@@ -143,7 +143,7 @@ func newMetrics(provider metric.MeterProvider) (*metrics, error) {
 		trust:      make(map[projectRef][]trustPoint),
 	}
 	if _, err := meter.Int64ObservableGauge("drover.sync.trust.statements.ready",
-		metric.WithDescription("The readiness of each trust statement of a project: 1 for a ready statement, 0 for a statement that is not ready."),
+		metric.WithDescription("The readiness of each trust statement of a project. The value is 1 for a ready statement and 0 for a statement that is not ready."),
 		metric.WithUnit("1"),
 		metric.WithInt64Callback(m.observeTrust)); err != nil {
 		return nil, err
@@ -222,9 +222,9 @@ func (m *metrics) openbaoChanged(ctx context.Context, kind, action string) {
 		attribute.String("action", action)))
 }
 
-// observeTrust reports the points of every project to the trust gauge, sorted
-// by cluster and project. Past its cardinality limit, the SDK puts each new
-// attribute set into one overflow point. So observeTrust reports the same
+// observeTrust reports the data points of every project to the trust gauge,
+// sorted by cluster and project. Past its cardinality limit, the SDK puts each
+// new attribute set into one overflow data point. So observeTrust reports the same
 // projects below that limit at each collection.
 func (m *metrics) observeTrust(_ context.Context, observer metric.Int64Observer) error {
 	m.trustMu.Lock()
@@ -234,18 +234,19 @@ func (m *metrics) observeTrust(_ context.Context, observer metric.Int64Observer)
 	})
 	for _, ref := range refs {
 		for _, point := range m.trust[ref] {
-			// Two invalid names with the same reason have the same attributes,
-			// so the SDK keeps the last value.
+			// The data points of two statements with an invalid name and the
+			// same reason have the same attributes, so the SDK keeps the last
+			// value.
 			observer.Observe(point.value, metric.WithAttributeSet(point.attrs))
 		}
 	}
 	return nil
 }
 
-// setTrust stores the points of the trust status of the project name of
-// cluster. For a nil status, it removes the points. It does nothing when
-// current returns false. It holds the lock of the points from the call of
-// current to the store, so that the check is still true at the store.
+// setTrust stores the data points of the trust status of the project name of
+// cluster. For a nil status, it removes the data points. It does nothing when
+// current returns false. It holds the lock of the data points from the call of
+// current to the store. So the check is still true at the store.
 func (m *metrics) setTrust(cluster, name string, status *trustStatus, current func() bool) {
 	var points []trustPoint
 	if status != nil {
@@ -263,14 +264,14 @@ func (m *metrics) setTrust(cluster, name string, status *trustStatus, current fu
 	}
 }
 
-// forgetTrust removes the points of the project name of cluster.
+// forgetTrust removes the data points of the project name of cluster.
 func (m *metrics) forgetTrust(cluster, name string) {
 	m.trustMu.Lock()
 	defer m.trustMu.Unlock()
 	delete(m.trust, projectRef{cluster: cluster, name: name})
 }
 
-// pruneTrust removes the points of each project for which drop returns true.
+// pruneTrust removes the data points of each project for which drop returns true.
 func (m *metrics) pruneTrust(drop func(projectRef) bool) {
 	m.trustMu.Lock()
 	defer m.trustMu.Unlock()
@@ -281,10 +282,10 @@ func (m *metrics) pruneTrust(drop func(projectRef) bool) {
 	}
 }
 
-// trustPoints returns one point per statement of status, or one point for a
-// document error. It adds the attribute statement only for a valid name,
-// because an invalid name is tenant text. It adds the attribute reason only
-// for a statement that is not ready.
+// trustPoints returns one data point per statement of status, or one data
+// point for a document error. It adds the attribute statement only for a valid
+// name, because an invalid name can be any tenant text. It adds the attribute
+// reason only to a data point with the value 0.
 func trustPoints(cluster, name string, status *trustStatus) []trustPoint {
 	point := func(ready bool, statement, reason string) trustPoint {
 		attrs := []attribute.KeyValue{attribute.String("drover.cluster", cluster), attribute.String("project", name)}

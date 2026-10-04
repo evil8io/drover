@@ -513,8 +513,8 @@ func (s *Syncer) keepProjectTrust(ctx context.Context, token, cluster, name stri
 	s.keepTrust(ctx, run, cluster, name, item)
 }
 
-// dropGoneTrustPoints removes the trust points of each project that the
-// snapshot does not have.
+// dropGoneTrustPoints removes the data points of the trust gauge of each
+// project that the snapshot does not have.
 func (s *Syncer) dropGoneTrustPoints() {
 	s.metrics.pruneTrust(func(ref projectRef) bool {
 		_, ok := s.projectsOf(ref.cluster)[ref.name]

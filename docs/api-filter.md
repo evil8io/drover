@@ -268,7 +268,7 @@ With `--otlp-endpoint` set, the service also exports these metrics:
 | `drover.filter.fetch.throttled` | Counter | `1` | `limit` |
 | `drover.filter.fanout.namespaces` | Histogram | `1` | `drover.cluster` |
 | `drover.filter.fanout.capped` | Counter | `1` | `drover.cluster` |
-| `drover.filter.fanout.skipped` | Counter | `1` | `cluster` |
+| `drover.filter.fanout.skipped` | Counter | `1` | `drover.cluster` |
 
 In `drover.filter.watches.rejected`, the service counts each watch that it refuses with a 503 error because of a watch limit. The `limit` attribute is `shared` for `--max-watches`, and `caller` for `--max-watches-per-caller`. The service also counts in this metric an upgraded stream that it ends because of a websocket extension. The service records that count without a `limit` attribute.
 

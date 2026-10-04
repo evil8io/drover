@@ -5,7 +5,7 @@
 
 ### ⚠ BREAKING CHANGES
 
-* a query or a dashboard that selects a drover metric by the attribute `cluster` must select `drover.cluster`.
+* change each query that selects a drover metric by the attribute `cluster` to `drover.cluster`, also in a dashboard.
 
 ### Features
 

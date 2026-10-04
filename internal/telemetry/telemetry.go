@@ -42,7 +42,7 @@ type Config struct {
 	// Version is the service.version resource attribute.
 	Version string
 	// ObservableGaugeCardinalityLimit is the cardinality limit of each
-	// observable gauge. Zero keeps the default of the SDK.
+	// observable gauge. With zero or a negative value, the limit is the default of the SDK.
 	ObservableGaugeCardinalityLimit int
 }
 
@@ -146,8 +146,8 @@ func setupTraces(ctx context.Context, target string, secure bool, res *resource.
 }
 
 // setupMetrics starts the metric provider. A gaugeLimit above zero is the
-// cardinality limit of each observable gauge. Every other kind keeps the limit
-// of the provider.
+// cardinality limit of each observable gauge. An instrument of every other kind
+// has the limit of the provider.
 func setupMetrics(ctx context.Context, target string, secure bool, res *resource.Resource, gaugeLimit int) (*sdkmetric.MeterProvider, error) {
 	options := []otlpmetricgrpc.Option{otlpmetricgrpc.WithEndpoint(target)}
 	if secure {
