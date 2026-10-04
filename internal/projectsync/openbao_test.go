@@ -427,7 +427,7 @@ func TestReconcileWritesTheConfigOfAClusterIntoOpenBao(t *testing.T) {
 	if v, _ := attrs.Value(attribute.Key("outcome")); v.AsString() != outcomeOK {
 		t.Errorf("outcome = %q, want %q", v.AsString(), outcomeOK)
 	}
-	if v, _ := attrs.Value(attribute.Key("cluster")); v.AsString() != acctCluster {
+	if v, _ := attrs.Value(attribute.Key("drover.cluster")); v.AsString() != acctCluster {
 		t.Errorf("cluster = %q, want %q", v.AsString(), acctCluster)
 	}
 }

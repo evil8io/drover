@@ -226,7 +226,7 @@ func clusterAttribute(t *testing.T, sum metricdata.Sum[int64], outcome string) s
 		if !ok || value.AsString() != outcome {
 			continue
 		}
-		cluster, ok := dp.Attributes.Value(attribute.Key("cluster"))
+		cluster, ok := dp.Attributes.Value(attribute.Key("drover.cluster"))
 		if !ok {
 			t.Fatalf("the data point with outcome %q has no cluster attribute", outcome)
 		}

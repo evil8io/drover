@@ -168,7 +168,7 @@ func (m *metrics) namespacePatched(ctx context.Context, origin string) {
 // stream, and kind names its objects.
 func (m *metrics) watchEvent(ctx context.Context, cluster, kind, eventType string) {
 	m.events.Add(ctx, 1, metric.WithAttributes(
-		attribute.String("cluster", cluster),
+		attribute.String("drover.cluster", cluster),
 		attribute.String("kind", kind),
 		attribute.String("type", eventType)))
 }
@@ -177,20 +177,20 @@ func (m *metrics) watchEvent(ctx context.Context, cluster, kind, eventType strin
 // kind.
 func (m *metrics) watchOpened(ctx context.Context, cluster, kind string) {
 	m.watches.Add(ctx, 1, metric.WithAttributes(
-		attribute.String("cluster", cluster),
+		attribute.String("drover.cluster", cluster),
 		attribute.String("kind", kind)))
 }
 
 func (m *metrics) watchClosed(ctx context.Context, cluster, kind string) {
 	m.watches.Add(ctx, -1, metric.WithAttributes(
-		attribute.String("cluster", cluster),
+		attribute.String("drover.cluster", cluster),
 		attribute.String("kind", kind)))
 }
 
 // projectChanged records one project change that the project watch applies.
 // cluster is the cluster of the project.
 func (m *metrics) projectChanged(ctx context.Context, cluster string) {
-	m.changed.Add(ctx, 1, metric.WithAttributes(attribute.String("cluster", cluster)))
+	m.changed.Add(ctx, 1, metric.WithAttributes(attribute.String("drover.cluster", cluster)))
 }
 
 // syncError records one error that a reconcile run logs.
@@ -210,7 +210,7 @@ func (m *metrics) accountChanged(ctx context.Context, kind, action string) {
 // missing_mount, or error.
 func (m *metrics) openbaoWritten(ctx context.Context, cluster, outcome string) {
 	m.openbao.Add(ctx, 1, metric.WithAttributes(
-		attribute.String("cluster", cluster),
+		attribute.String("drover.cluster", cluster),
 		attribute.String("outcome", outcome)))
 }
 
