@@ -801,3 +801,228 @@ func TestReconcileLeavesTheMountOfARemovedIssuer(t *testing.T) {
 		t.Errorf("the run has errors:\n%s", logs)
 	}
 }
+
+// newTrustGaugeSetup returns a trust setup whose meter provider has a manual
+// reader.
+func newTrustGaugeSetup(t *testing.T, fake *accountsFake) (*openbaoSetup, *sdkmetric.ManualReader) {
+	t.Helper()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	return newTrustSetup(t, fake, func(cfg *Config) { cfg.MeterProvider = provider }), reader
+}
+
+// trustReadiness returns the points of drover.sync.trust.statements.ready of
+// the project name, each as its encoded attributes and its value, sorted.
+func trustReadiness(t *testing.T, reader *sdkmetric.ManualReader, name string) []string {
+	t.Helper()
+	var data metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &data); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	gauge, _ := findGauge(t, data, "drover.sync.trust.statements.ready")
+	var out []string
+	for _, point := range gauge.DataPoints {
+		if project, _ := point.Attributes.Value("project"); project.AsString() == name {
+			out = append(out, fmt.Sprintf("%s %d", point.Attributes.Encoded(attribute.DefaultEncoder()), point.Value))
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+func TestReconcileExportsOneTrustPointPerStatement(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", trusted(twoStatements))
+	setup, reader := newTrustGaugeSetup(t, fake)
+
+	setup.syncer.reconcile(context.Background())
+
+	want := []string{
+		"drover.cluster=c-1,project=p-alpha,statement=deploy 1",
+		"drover.cluster=c-1,project=p-alpha,statement=rotator 1",
+	}
+	if got := trustReadiness(t, reader, "p-alpha"); !slices.Equal(got, want) {
+		t.Errorf("trust points =\n%v\nwant\n%v", got, want)
+	}
+}
+
+func TestReconcileExportsTheReasonOfATrustStatementThatIsNotReady(t *testing.T) {
+	t.Parallel()
+	document := `{"statements":[` + deployStatement +
+		`,{"name":"other","jwt":{"issuer":"unknown","claims":{"sub":"1"}},"role":"read-only"}` +
+		`,{"name":"Secret Value","aws":{"arn":"arn:aws:iam::123456789012:role/x"},"role":"read-only"}]}`
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", trusted(document))
+	setup, reader := newTrustGaugeSetup(t, fake)
+
+	setup.syncer.reconcile(context.Background())
+
+	want := []string{
+		"drover.cluster=c-1,project=p-alpha,reason=InvalidName 0",
+		"drover.cluster=c-1,project=p-alpha,reason=UnknownIssuer,statement=other 0",
+		"drover.cluster=c-1,project=p-alpha,statement=deploy 1",
+	}
+	if got := trustReadiness(t, reader, "p-alpha"); !slices.Equal(got, want) {
+		t.Errorf("trust points =\n%v\nwant\n%v", got, want)
+	}
+}
+
+func TestReconcileExportsOneTrustPointForADocumentError(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", trusted(`{"statements": [{"name": "secret-value"`))
+	setup, reader := newTrustGaugeSetup(t, fake)
+
+	setup.syncer.reconcile(context.Background())
+
+	want := []string{"drover.cluster=c-1,project=p-alpha,reason=InvalidJSON 0"}
+	if got := trustReadiness(t, reader, "p-alpha"); !slices.Equal(got, want) {
+		t.Errorf("trust points =\n%v\nwant\n%v", got, want)
+	}
+}
+
+func TestReconcileRemovesTheTrustPointsOfARemovedStatementAndAnnotation(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", trusted(twoStatements))
+	setup, reader := newTrustGaugeSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+	if got := trustReadiness(t, reader, "p-alpha"); len(got) != 2 {
+		t.Fatalf("trust points after the first run = %v, want 2", got)
+	}
+
+	fake.editProject("p-alpha", func(p *storedProject) { p.annotations[trustKey] = oneStatement })
+	setup.syncer.reconcile(context.Background())
+
+	want := []string{"drover.cluster=c-1,project=p-alpha,statement=deploy 1"}
+	if got := trustReadiness(t, reader, "p-alpha"); !slices.Equal(got, want) {
+		t.Errorf("trust points after the statement remove =\n%v\nwant\n%v", got, want)
+	}
+
+	fake.editProject("p-alpha", func(p *storedProject) { delete(p.annotations, trustKey) })
+	setup.syncer.reconcile(context.Background())
+
+	if got := trustReadiness(t, reader, "p-alpha"); len(got) != 0 {
+		t.Errorf("trust points without the trust annotation = %v, want none", got)
+	}
+}
+
+func TestReconcileRemovesTheTrustPointsOfAProjectThatIsGone(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", trusted(oneStatement))
+	fake.addProject("p-beta", trusted(oneStatement))
+	setup, reader := newTrustGaugeSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+	if got := trustReadiness(t, reader, "p-alpha"); len(got) != 1 {
+		t.Fatalf("trust points of p-alpha after the first run = %v, want 1", got)
+	}
+
+	fake.removeProject("p-alpha")
+	setup.syncer.reconcile(context.Background())
+
+	if got := trustReadiness(t, reader, "p-alpha"); len(got) != 0 {
+		t.Errorf("trust points of the removed project = %v, want none", got)
+	}
+	want := []string{"drover.cluster=c-1,project=p-beta,statement=deploy 1"}
+	if got := trustReadiness(t, reader, "p-beta"); !slices.Equal(got, want) {
+		t.Errorf("trust points of p-beta =\n%v\nwant\n%v", got, want)
+	}
+}
+
+func TestProjectWatchRemovesTheTrustPointsOfADeletedProject(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", trusted(oneStatement))
+	setup, reader := newTrustGaugeSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+	if got := trustReadiness(t, reader, "p-alpha"); len(got) != 1 {
+		t.Fatalf("trust points after the run = %v, want 1", got)
+	}
+
+	item, err := setup.syncer.decodeProject(trustProjectFrame(t, map[string]string{trustKey: oneStatement}))
+	if err != nil {
+		t.Fatalf("decode the project: %v", err)
+	}
+	setup.syncer.applyProject(context.Background(), setup.syncer.newWatchSet(), watchDeleted, item)
+
+	if got := trustReadiness(t, reader, "p-alpha"); len(got) != 0 {
+		t.Errorf("trust points after the DELETED event = %v, want none", got)
+	}
+}
+
+func TestReconcileRemovesTheTrustPointsOfAClusterThatIsGone(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", trusted(oneStatement))
+	setup, reader := newTrustGaugeSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+	if got := trustReadiness(t, reader, "p-alpha"); len(got) != 1 {
+		t.Fatalf("trust points after the first run = %v, want 1", got)
+	}
+
+	fake.mu.Lock()
+	names := sortedKeys(fake.projects)
+	fake.mu.Unlock()
+	for _, name := range names {
+		fake.removeProject(name)
+	}
+	setup.syncer.reconcile(context.Background())
+
+	if got := trustReadiness(t, reader, "p-alpha"); len(got) != 0 {
+		t.Errorf("trust points of a cluster without projects = %v, want none", got)
+	}
+}
+
+func TestReconcileKeepsTheTrustPointsOfAClusterThatFailed(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", trusted(twoStatements))
+	setup, reader := newTrustGaugeSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+
+	fake.fail(http.MethodGet, namespacesPath(acctCluster), http.StatusForbidden)
+	setup.syncer.reconcile(context.Background())
+
+	want := []string{
+		"drover.cluster=c-1,project=p-alpha,statement=deploy 1",
+		"drover.cluster=c-1,project=p-alpha,statement=rotator 1",
+	}
+	if got := trustReadiness(t, reader, "p-alpha"); !slices.Equal(got, want) {
+		t.Errorf("trust points of the failed cluster =\n%v\nwant\n%v", got, want)
+	}
+}
+
+func TestKeepTrustStoresNoTrustPointsOfAnOldProject(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", trusted(twoStatements))
+	setup, reader := newTrustGaugeSetup(t, fake)
+	setup.syncer.reconcile(context.Background())
+	old := setup.syncer.projectsOf(acctCluster)["p-alpha"]
+	run := &trustRun{rules: setup.syncer.trustRules(), token: serviceToken, owners: newProjectNames(setup.syncer.snapshot())}
+
+	// The project watch stores a narrower document while the run has the old
+	// project.
+	fake.editProject("p-alpha", func(p *storedProject) { p.annotations[trustKey] = oneStatement })
+	listTrustProject(t, setup, "p-alpha")
+	setup.syncer.keepTrust(context.Background(), run, acctCluster, "p-alpha", old)
+
+	want := []string{"drover.cluster=c-1,project=p-alpha,statement=deploy 1"}
+	if got := trustReadiness(t, reader, "p-alpha"); !slices.Equal(got, want) {
+		t.Errorf("trust points after the run with the old document =\n%v\nwant\n%v", got, want)
+	}
+
+	// The project watch removes the project while the run has it.
+	item, err := setup.syncer.decodeProject(trustProjectFrame(t, map[string]string{trustKey: oneStatement}))
+	if err != nil {
+		t.Fatalf("decode the project: %v", err)
+	}
+	setup.syncer.applyProject(context.Background(), setup.syncer.newWatchSet(), watchDeleted, item)
+	setup.syncer.keepTrust(context.Background(), run, acctCluster, "p-alpha", old)
+
+	if got := trustReadiness(t, reader, "p-alpha"); len(got) != 0 {
+		t.Errorf("trust points after the run with the deleted project = %v, want none", got)
+	}
+}

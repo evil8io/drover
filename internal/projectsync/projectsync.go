@@ -379,6 +379,7 @@ func (s *Syncer) reconcile(ctx context.Context) {
 
 	clusters := s.byCluster(ctx, projects)
 	s.setClusters(clusters)
+	s.dropGoneTrustPoints()
 	run.clusters = len(clusters)
 
 	names := slices.Sorted(maps.Keys(clusters))
