@@ -811,7 +811,7 @@ func newTrustGaugeSetup(t *testing.T, fake *accountsFake) (*openbaoSetup, *sdkme
 	return newTrustSetup(t, fake, func(cfg *Config) { cfg.MeterProvider = provider }), reader
 }
 
-// trustReadiness returns the points of drover.sync.trust.statements.ready of
+// trustReadiness returns the data points of drover.sync.trust.statements.ready of
 // the project name, each as its encoded attributes and its value, sorted.
 func trustReadiness(t *testing.T, reader *sdkmetric.ManualReader, name string) []string {
 	t.Helper()

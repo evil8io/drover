@@ -20,8 +20,9 @@ import (
 	"github.com/evil8io/drover/internal/telemetry"
 )
 
-// project-sync raises the cardinality limit of each observable gauge to
-// gaugeCardinalityLimit, because a tenant controls the count of trust points.
+// gaugeCardinalityLimit is the cardinality limit of each observable gauge of
+// project-sync. It is above the SDK default, because a tenant controls the
+// count of data points of drover.sync.trust.statements.ready.
 const gaugeCardinalityLimit = 10000
 
 type projectSyncConfig struct {

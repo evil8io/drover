@@ -122,7 +122,7 @@ func findSum(t *testing.T, data metricdata.ResourceMetrics, name string) metricd
 
 // findGauge returns the metricdata.Gauge[int64] of the metric named name,
 // from the first scope that has it. It returns false when no scope has the
-// metric, because the SDK leaves out a metric without points.
+// metric, because the SDK leaves out a metric without data points.
 func findGauge(t *testing.T, data metricdata.ResourceMetrics, name string) (metricdata.Gauge[int64], bool) {
 	t.Helper()
 	for _, scope := range data.ScopeMetrics {

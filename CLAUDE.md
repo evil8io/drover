@@ -27,9 +27,7 @@ Write a rule in the imperative. Give the reason for the rule. Delete a line when
 
 `internal/rancherclient` has the HTTP transport to Rancher of `api-filter` and `project-sync`, and the trace and metric wrapper of that transport. `rotate-token` uses only the wrapper, with its own transport from `internal/rotate/client.go`. `internal/telemetry` is the shared setup for logging, tracing, and metrics.
 
-## Telemetry
-
-- Name the cluster attribute of a metric `drover.cluster`, not `cluster`. A metrics backend that promotes the resource attribute `cluster` adds it only to a point without an attribute `cluster`. So a point attribute `cluster` hides the cluster of the telemetry pipeline.
+- Name the cluster attribute of a metric `drover.cluster`, not `cluster`. A metrics backend that promotes the resource attribute `cluster` adds it only to a data point without an attribute `cluster`. So the cluster of the telemetry pipeline is missing from a data point that has the attribute `cluster`.
 
 ## Docs
 
