@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.26.0](https://github.com/evil8io/drover/compare/v0.25.0...v0.26.0) (2026-10-04)
+
+
+### ⚠ BREAKING CHANGES
+
+* a query or a dashboard that selects a drover metric by the attribute `cluster` must select `drover.cluster`.
+
+### Features
+
+* name the cluster attribute of every metric drover.cluster ([#133](https://github.com/evil8io/drover/issues/133)) ([5c540ed](https://github.com/evil8io/drover/commit/5c540edbc2ac514c97a035a52494b9404bf6ac2b))
+
 ## [0.25.0](https://github.com/evil8io/drover/compare/v0.24.0...v0.25.0) (2026-10-04)
 
 
