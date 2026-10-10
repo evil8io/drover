@@ -42,13 +42,11 @@ Write a rule in the imperative. Give the reason for the rule. Delete a line when
 
 ## Rancher facts
 
-These facts were verified against Rancher 2.14.5. The facts about the API surface of each component are in the `CLAUDE.md` of that component.
+These facts were verified against Rancher 2.14.6. The facts about the API surface of each component are in the `CLAUDE.md` and in the document of that component.
 
-- Rancher answers `400 Use HTTPS` to a login over plain HTTP. In the Rancher cluster, `rancher.<namespace>` is in the certificate that Rancher serves, and `rancher.<namespace>.svc` is not in that certificate.
+- In the Rancher cluster, `rancher.<namespace>` is in the certificate that Rancher serves, and `rancher.<namespace>.svc` is not in that certificate.
 - The CA of that certificate is in the key `tls.crt` of the Secret `tls-rancher`, in the Rancher namespace. `tls-rancher-internal-ca` is a different CA. A client cannot verify the certificate with that CA.
-- Rancher grants a project member `get` on the namespaces of the member's projects. Rancher does not grant `list` on these namespaces. The api-filter exists for this reason.
 - When a binding grants `list` on `namespaces` to `system:cattle:authenticated`, the native list succeeds. The api-filter then never filters, because it acts on a 403 only. Look for such a binding first when a tenant sees every namespace.
-- In the `local` cluster, the cluster-wide `list` and `watch` on `projects` of `management.cattle.io` need a `ClusterRoleTemplateBinding` on the `local` cluster. The service user gets only the per-cluster RoleBindings from its GlobalRole. The service user never gets this cluster-wide right from the GlobalRole.
 
 ## Releases
 
@@ -65,6 +63,6 @@ Do not propose these designs again:
 | A bare path rewrite of the namespace list to Steve | Steve is the Rancher API server in the cluster agent. Steve has no `labelSelector`, and it has no watch. |
 | A `--clusters` allow list on `api-filter` | The route set is dynamic. Kyverno creates one HTTPRoute per Rancher Cluster object from a policy in the chart. |
 | A principal or user filter | A directory search inside the organisation is accepted, because a project owner adds members as a self-service task. |
-| Admin tokens for the api-filter, or a daily rotation schedule | The api-filter uses one service user with one token. The token rotation is check-and-renew, and it runs every 10 minutes. |
+| Admin tokens for the api-filter, or a daily rotation schedule | The api-filter uses one service user with one token. The token rotation is check-and-renew, so a frequent run is cheap, and a missed run is harmless. The default schedule of the chart is every 10 minutes. |
 | A widened union selector on a namespace watch | The set of extra namespaces is unbounded. See `internal/filter/CLAUDE.md`. |
 | A chart in this repository | See the Wiring section. |
