@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.26.1](https://github.com/evil8io/drover/compare/v0.26.0...v0.26.1) (2026-10-10)
+
+
+### Bug Fixes
+
+* **deps:** update opentelemetry-go monorepo to v1.47.0 ([#123](https://github.com/evil8io/drover/issues/123)) ([a87a2de](https://github.com/evil8io/drover/commit/a87a2de67c536f796e7e1a24b9ec43c2247eb7f1))
+
 ## [0.26.0](https://github.com/evil8io/drover/compare/v0.25.0...v0.26.0) (2026-10-04)
 
 
