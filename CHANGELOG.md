@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.27.1](https://github.com/evil8io/drover/compare/v0.27.0...v0.27.1) (2026-10-11)
+
+
+### Bug Fixes
+
+* **project-sync:** warn for a bound Role without its namespace, and keep the lister going after a failed list ([#140](https://github.com/evil8io/drover/issues/140)) ([b6773d0](https://github.com/evil8io/drover/commit/b6773d0834ef9ecd4c44926c938f36061faac681))
+
 ## [0.27.0](https://github.com/evil8io/drover/compare/v0.26.0...v0.27.0) (2026-10-11)
 
 
