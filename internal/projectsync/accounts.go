@@ -377,6 +377,8 @@ func (s *Syncer) syncAccounts(ctx context.Context, token, cluster string, projec
 	roleBindingsIn := groupBy(roleBindings, func(item binding) string { return item.Metadata.Namespace })
 	roleBindingsOf := groupBy(roleBindings, func(item binding) string { return item.Metadata.Labels[accountProjectKey] })
 
+	s.warnMissingBoundNamespaces(ctx, cluster, byName, run)
+
 	trusted := make(map[string]string)
 	pending := make(map[string]bool)
 	denied := make(map[string]bool)
@@ -1005,12 +1007,13 @@ func (s *Syncer) ensureProjectAccounts(ctx context.Context, token, cluster, name
 	}
 	s.ensureAccounts(ctx, token, cluster, name, accounts, nil)
 	s.ensureClusterBindings(ctx, token, cluster, name, uid, clusterBindings, nil)
+	// A failed list leaves the role bindings nil, so the bound RoleBindings
+	// get a create each, and the reconcile run sweeps a stale one.
 	var roleBindings []binding
 	if s.hasBoundRoleBinding() {
 		roleBindings, err = listAll(ctx, s, token, roleBindingsPath(cluster, ""), accountProjectKey+"="+name, pruneBinding)
 		if err != nil {
 			s.accountFailure(ctx, nil, "the role binding list request failed", err, "cluster", cluster, "project", name)
-			return
 		}
 	}
 	s.ensureBoundRoles(ctx, token, cluster, name, uid, clusterBindings, roleBindings, nil)

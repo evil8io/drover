@@ -208,3 +208,44 @@ func TestNewRejectsAnInvalidBoundRole(t *testing.T) {
 		t.Errorf("New with the bound roles = %v, want no error", err)
 	}
 }
+
+func TestReconcileWarnsForABoundRoleNamespaceThatDoesNotExist(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", nil)
+	fake.addNamespace(tenantNamespace("ns-a", "p-alpha"))
+	syncer, logs := newAccountsSyncer(t, fake, withBoundRoles([]BoundRole{{Namespace: "kube-publc", Name: "drover:public-read"}}))
+
+	syncer.reconcile(context.Background())
+
+	want := `msg="the namespace of a bound role does not exist, so its role bindings are not created" cluster=c-1 namespace=kube-publc role=drover:public-read`
+	if strings.Count(logs.String(), want) != 1 {
+		t.Errorf("warning lines = %d, want 1:\n%s", strings.Count(logs.String(), want), logs.String())
+	}
+	if !strings.Contains(logs.String(), "errors=1") {
+		t.Errorf("no summary line with errors=1:\n%s", logs.String())
+	}
+}
+
+func TestListProjectKeepsTheViewWhenTheRoleBindingListFails(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	markedProject(fake, "p-acct")
+	fake.fail(http.MethodGet, roleBindingsPath(acctCluster, ""), http.StatusInternalServerError)
+	syncer, _ := newAccountsSyncer(t, fake, withBoundRoles(publicRead))
+	syncer.setAccounts(acctCluster, accountState{projects: []string{"p-acct"}})
+	syncer.setClusters(map[string]map[string]project{
+		acctCluster: {"p-new": {ID: acctCluster + ":p-new", ClusterID: acctCluster, Name: "p-new"}},
+	})
+
+	watch := newClusterWatch(10)
+	syncer.listProject(context.Background(), acctCluster, "p-new", watch.patches)
+
+	if got := filterMethod(fake.requestsOfPath(roleBindingsPath(acctCluster, "kube-public")), http.MethodPost); len(got) != 3 {
+		t.Errorf("role binding create requests in kube-public = %d, want 3", len(got))
+	}
+	state, _ := syncer.accountsOf(acctCluster)
+	if _, ok := state.namespaces["p-new"]; !ok {
+		t.Error("the account state has no namespace uid for p-new")
+	}
+}

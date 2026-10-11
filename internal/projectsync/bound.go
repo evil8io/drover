@@ -134,6 +134,28 @@ func (s *Syncer) ensureBoundRoles(ctx context.Context, token, cluster, name, uid
 	}
 }
 
+// warnMissingBoundNamespaces warns once per run for each bound Role whose
+// namespace is not in byName, the namespaces of cluster, and counts it as an
+// error of run. The create of such a RoleBinding answers 404, which the
+// account writes skip at the debug level, because a tenant namespace can be
+// gone. The namespace of a bound Role is a platform namespace, so a 404 there
+// is a wrong flag value.
+func (s *Syncer) warnMissingBoundNamespaces(ctx context.Context, cluster string, byName map[string]namespace, run *counters) {
+	for _, bound := range s.boundRoles {
+		if bound.Namespace == "" {
+			continue
+		}
+		if _, ok := byName[bound.Namespace]; ok {
+			continue
+		}
+		if run != nil {
+			run.errors++
+		}
+		s.logger.WarnContext(ctx, "the namespace of a bound role does not exist, so its role bindings are not created",
+			"cluster", cluster, "namespace", bound.Namespace, "role", bound.Name)
+	}
+}
+
 // hasBoundRoleBinding reports whether a bound role is a Role, so that the
 // lister needs the role bindings of a project.
 func (s *Syncer) hasBoundRoleBinding() bool {
