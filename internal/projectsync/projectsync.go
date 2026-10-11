@@ -60,6 +60,9 @@ type Config struct {
 	// ServiceAccounts keeps one ServiceAccount per project role for every
 	// project, in an account project of each cluster.
 	ServiceAccounts bool
+	// BoundRoles are the roles that the service binds to the ServiceAccounts
+	// of every project, next to the project roles. It needs ServiceAccounts.
+	BoundRoles []BoundRole
 	// OpenBao writes the Kubernetes secrets engine config of every cluster
 	// into OpenBao. It needs ServiceAccounts. Nil turns it off.
 	OpenBao *OpenBaoConfig
@@ -104,6 +107,9 @@ type Syncer struct {
 
 	// serviceAccounts turns the accounts on.
 	serviceAccounts bool
+	// boundRoles are the roles that every project ServiceAccount gets next
+	// to its project role.
+	boundRoles []BoundRole
 	// openbao writes the config of each cluster into OpenBao. Nil turns it
 	// off.
 	openbao *openbaoWriter
@@ -162,6 +168,12 @@ func New(cfg Config) (*Syncer, error) {
 	}
 	if len(cfg.Labels)+len(cfg.Annotations) == 0 && cfg.NameLabel == "" && cfg.NameAnnotation == "" && !cfg.ServiceAccounts {
 		return nil, errors.New("at least one label key, annotation key, name label key, or name annotation key, or the service accounts, is required")
+	}
+	if len(cfg.BoundRoles) > 0 && !cfg.ServiceAccounts {
+		return nil, errors.New("the bound roles need the service accounts")
+	}
+	if err := checkBoundRoles(cfg.BoundRoles); err != nil {
+		return nil, err
 	}
 	if cfg.OpenBao != nil && !cfg.ServiceAccounts {
 		return nil, errors.New("the OpenBao config needs the service accounts")
@@ -248,6 +260,7 @@ func New(cfg Config) (*Syncer, error) {
 		nameLabel:       cfg.NameLabel,
 		nameAnnotation:  cfg.NameAnnotation,
 		serviceAccounts: cfg.ServiceAccounts,
+		boundRoles:      slices.Clone(cfg.BoundRoles),
 		openbao:         openbao,
 		trustFile:       cfg.TrustFile,
 		readLabels:      readLabels,

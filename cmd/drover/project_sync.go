@@ -36,6 +36,7 @@ type projectSyncConfig struct {
 	nameLabel          string
 	nameAnnotation     string
 	serviceAccounts    bool
+	boundRoles         []projectsync.BoundRole
 	openbao            *projectsync.OpenBaoConfig
 	trustFile          string
 	interval           time.Duration
@@ -81,6 +82,7 @@ func runProjectSync(args []string) int {
 		NameLabel:          cfg.nameLabel,
 		NameAnnotation:     cfg.nameAnnotation,
 		ServiceAccounts:    cfg.serviceAccounts,
+		BoundRoles:         cfg.boundRoles,
 		OpenBao:            cfg.openbao,
 		TrustFile:          cfg.trustFile,
 		Interval:           cfg.interval,
@@ -119,6 +121,7 @@ func runProjectSync(args []string) int {
 		"name_label", cfg.nameLabel,
 		"name_annotation", cfg.nameAnnotation,
 		"service_accounts", cfg.serviceAccounts,
+		"bound_roles", boundRoleNames(cfg.boundRoles),
 		"openbao_address", openbaoAddress(cfg.openbao),
 		"trust_file", cfg.trustFile,
 	)
@@ -178,6 +181,22 @@ func parseProjectSyncConfig(args []string, output io.Writer, getenv func(string)
 		"annotation key on the namespace that gets the display name of the project")
 	flags.BoolVar(&cfg.serviceAccounts, "service-accounts", false,
 		"keep one ServiceAccount per project role for every project, in an account project of each cluster")
+	flags.Func("bind-cluster-role",
+		"ClusterRole that every project ServiceAccount gets through a ClusterRoleBinding; repeat the flag for each ClusterRole",
+		func(value string) error {
+			cfg.boundRoles = append(cfg.boundRoles, projectsync.BoundRole{Name: value})
+			return nil
+		})
+	flags.Func("bind-role",
+		"Role, as <namespace>/<name>, that every project ServiceAccount gets through a RoleBinding in that namespace; repeat the flag for each Role",
+		func(value string) error {
+			namespace, name, ok := strings.Cut(value, "/")
+			if !ok || namespace == "" || name == "" {
+				return fmt.Errorf("%q is not <namespace>/<name>", value)
+			}
+			cfg.boundRoles = append(cfg.boundRoles, projectsync.BoundRole{Namespace: namespace, Name: name})
+			return nil
+		})
 	flags.StringVar(&openbaoAddr, "openbao-address", "",
 		"OpenBao URL, http:// or https://, that gets the Kubernetes secrets engine config of every cluster; empty turns it off")
 	flags.StringVar(&openbao.AuthPath, "openbao-auth-path", "kubernetes", "Kubernetes auth mount of OpenBao that the service logs in to")
@@ -243,6 +262,9 @@ func parseProjectSyncConfig(args []string, output io.Writer, getenv func(string)
 	if len(cfg.labels)+len(cfg.annotations) == 0 && cfg.nameLabel == "" && cfg.nameAnnotation == "" && !cfg.serviceAccounts {
 		return projectSyncConfig{}, errors.New("-labels, -annotations, -name-label or -name-annotation needs at least one key, or -service-accounts must be set")
 	}
+	if len(cfg.boundRoles) > 0 && !cfg.serviceAccounts {
+		return projectSyncConfig{}, errors.New("-bind-cluster-role and -bind-role need -service-accounts")
+	}
 	if cfg.openbao, err = parseOpenBao(flags, cfg.serviceAccounts, openbaoAddr, openbaoRancherURL, openbao); err != nil {
 		return projectSyncConfig{}, err
 	}
@@ -300,6 +322,16 @@ func parseOpenBao(flags *flag.FlagSet, serviceAccounts bool, address, rancherURL
 		return nil, fmt.Errorf("-openbao-credential-max-ttl %s is shorter than -openbao-credential-ttl %s", cfg.CredentialMaxTTL, cfg.CredentialTTL)
 	}
 	return &cfg, nil
+}
+
+// boundRoleNames returns the bound roles for the start line, as the values of
+// the flags.
+func boundRoleNames(roles []projectsync.BoundRole) []string {
+	names := make([]string, 0, len(roles))
+	for _, role := range roles {
+		names = append(names, role.String())
+	}
+	return names
 }
 
 // openbaoAddress returns the OpenBao address for the start line, or "" when
