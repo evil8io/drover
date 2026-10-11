@@ -24,6 +24,7 @@ With `--trust-file` as well, the service writes an OpenBao login role for each v
    - `get`, `list`, `watch`, `create`, and `delete` on `serviceaccounts`.
    - `get`, `list`, `watch`, `create`, `update`, and `delete` on `rolebindings` and `clusterrolebindings`.
    - `bind` on the ClusterRoles `admin`, `edit`, `view`, and `create-ns`, with `resourceNames`. Do not grant `bind` on every ClusterRole, because that right is equal to the rights of a cluster admin.
+   - `bind` on each ClusterRole of `--bind-cluster-role`, and `bind` on each Role of `--bind-role`, with `resourceNames`. The API server allows the create of a binding only when the creator has `bind` on the role, or every rule of the role.
 
    Give the service its own service user. The API filter is on the request path of every tenant. The service user of the API filter needs only the rights for the namespace list.
 5. With `--openbao-address`, the same service user also needs these rights in every cluster, and in the Rancher cluster through a `ClusterRoleTemplateBinding`:
@@ -90,6 +91,8 @@ Start the service with `drover project-sync [flags]`.
 | `--name-label` | | Label key on the namespace that gets the display name of the project. |
 | `--name-annotation` | | Annotation key on the namespace that gets the display name of the project. |
 | `--service-accounts` | `false` | When `true`, the service keeps three ServiceAccounts per project, one per project role. |
+| `--bind-cluster-role` | | A ClusterRole that every project ServiceAccount gets through a ClusterRoleBinding. Repeat the flag for each ClusterRole. The flag needs `--service-accounts`. |
+| `--bind-role` | | A Role, as `<namespace>/<name>`, that every project ServiceAccount gets through a RoleBinding in that namespace. Repeat the flag for each Role. The flag needs `--service-accounts`. |
 | `--openbao-address` | | URL of OpenBao. Use `http://` or `https://`. The path must be empty or `/`. When the value is empty, the OpenBao config is off. |
 | `--openbao-auth-path` | `kubernetes` | Kubernetes auth mount of OpenBao that the service logs in to. |
 | `--openbao-role` | `project-sync` | Role of that auth mount. |
@@ -173,12 +176,13 @@ With `--service-accounts`, the service keeps these objects in every cluster that
 4. In every namespace of the tenant project, the RoleBindings `drover-project-owner`, `drover-project-member`, and `drover-read-only`, to the ClusterRoles `admin`, `edit`, and `view`.
 5. Per project role, the ClusterRoleBinding `drover-<project>-<role>-namespaces`, to the Rancher ClusterRole `<project>-namespaces-edit` for `project-owner` and `project-member`, and to `<project>-namespaces-readonly` for `read-only`. Rancher keeps the `resourceNames` of these ClusterRoles equal to the namespaces of the project. The API filter uses these `resourceNames` to answer a namespace list of the ServiceAccount.
 6. For `project-owner` and `project-member`, the ClusterRoleBinding `drover-<project>-<role>-create-ns`, to the Rancher ClusterRole `create-ns`.
+7. Per project role and per `--bind-cluster-role`, the ClusterRoleBinding `drover-<project>-<role>-clusterrole-<name>` to that ClusterRole. Per project role and per `--bind-role`, the RoleBinding `drover-<project>-<role>-role-<name>` in the namespace of the flag, to that Role. An operator gives every project ServiceAccount the same extra rights with these flags, for example the read of the platform objects that every tenant may see. The service does not read the roles, because a binding to a role that does not exist is valid. When a flag value is removed, the next reconcile run deletes its bindings.
 
 Every ServiceAccount and every binding has the labels `drover-project: <project>` and `drover-role: <role>`, and every binding has one subject. The account namespace has the label `drover-project: <project>`, without `drover-role`. The account namespace is the owner of the bindings, so the garbage collector deletes them together with the namespace.
 
 A tenant project is a project that is not the System project, the Default project, or an account project. The service finds the System project and the Default project by the labels `authz.management.cattle.io/system-project` and `authz.management.cattle.io/default-project`.
 
-The ServiceAccounts get the Kubernetes rights of a project role through `admin`, `edit`, and `view`. They do not get the extra rules of the Rancher role templates. Examples are the rules for the monitoring resources and the rule to read nodes.
+The ServiceAccounts get the Kubernetes rights of a project role through `admin`, `edit`, and `view`. They do not get the extra rules of the Rancher role templates. Examples are the rules for the monitoring resources and the rule to read nodes. An operator adds such rules through `--bind-cluster-role` and `--bind-role`.
 
 The service applies these rules:
 

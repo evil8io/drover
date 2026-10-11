@@ -398,6 +398,7 @@ func (s *Syncer) syncAccounts(ctx context.Context, token, cluster string, projec
 		trusted[name] = uid
 		s.ensureAccounts(ctx, token, cluster, name, accountsIn[accountNamespace(name)], run)
 		s.ensureClusterBindings(ctx, token, cluster, name, uid, clusterBindingsOf[name], run)
+		s.ensureBoundRoles(ctx, token, cluster, name, uid, clusterBindingsOf[name], roleBindingsOf[name], run)
 		for _, member := range members[name] {
 			if member.Metadata.DeletionTimestamp != "" {
 				continue
@@ -822,12 +823,13 @@ func managedClusterBinding(item binding, name string) bool {
 func (s *Syncer) dropAccountBindings(ctx context.Context, token, cluster, name string, clusterBindings, roleBindings []binding, run *counters) int {
 	failed := 0
 	for _, item := range clusterBindings {
-		if managedClusterBinding(item, name) && !s.dropBinding(ctx, token, cluster, clusterRoleBindingsPath(cluster), item, name, run) {
+		if (managedClusterBinding(item, name) || isBoundBinding(item, name)) &&
+			!s.dropBinding(ctx, token, cluster, clusterRoleBindingsPath(cluster), item, name, run) {
 			failed++
 		}
 	}
 	for _, item := range roleBindings {
-		if (managedRoleBinding(item) || isOpenBaoBinding(item)) &&
+		if (managedRoleBinding(item) || isOpenBaoBinding(item) || isBoundBinding(item, name)) &&
 			!s.dropBinding(ctx, token, cluster, roleBindingsPath(cluster, item.Metadata.Namespace), item, name, run) {
 			failed++
 		}
@@ -1003,6 +1005,15 @@ func (s *Syncer) ensureProjectAccounts(ctx context.Context, token, cluster, name
 	}
 	s.ensureAccounts(ctx, token, cluster, name, accounts, nil)
 	s.ensureClusterBindings(ctx, token, cluster, name, uid, clusterBindings, nil)
+	var roleBindings []binding
+	if s.hasBoundRoleBinding() {
+		roleBindings, err = listAll(ctx, s, token, roleBindingsPath(cluster, ""), accountProjectKey+"="+name, pruneBinding)
+		if err != nil {
+			s.accountFailure(ctx, nil, "the role binding list request failed", err, "cluster", cluster, "project", name)
+			return
+		}
+	}
+	s.ensureBoundRoles(ctx, token, cluster, name, uid, clusterBindings, roleBindings, nil)
 	if s.openbao != nil && state.openbao != "" && s.openbaoNamespaceLive(ctx, token, cluster, state) {
 		s.ensureOpenBaoAccess(ctx, token, cluster, name, state.openbao, nil, nil, nil)
 		s.writeOpenBaoProject(ctx, cluster, name)

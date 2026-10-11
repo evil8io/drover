@@ -2,9 +2,12 @@ package main
 
 import (
 	"io"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/evil8io/drover/internal/projectsync"
 )
 
 func TestParseProjectSyncConfigTelemetryDefaults(t *testing.T) {
@@ -297,6 +300,55 @@ func TestParseProjectSyncConfigTrustFile(t *testing.T) {
 			_, err := parseProjectSyncConfig(tt.args, io.Discard, noEnvironment)
 			if err == nil || !strings.Contains(err.Error(), "-trust-file needs -openbao-address and -service-accounts") {
 				t.Errorf("error = %v, want one about -trust-file", err)
+			}
+		})
+	}
+}
+
+func TestParseProjectSyncConfigBoundRoles(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := parseProjectSyncConfig([]string{
+		"--rancher-url", "https://rancher.cattle-system", "--token-file", "/dev/null", "--service-accounts",
+		"--bind-cluster-role", "drover:public-read",
+		"--bind-role", "kube-public/drover:public-read",
+		"--bind-cluster-role", "other",
+	}, io.Discard, noEnvironment)
+	if err != nil {
+		t.Fatalf("parseProjectSyncConfig: %v", err)
+	}
+	want := []projectsync.BoundRole{
+		{Name: "drover:public-read"},
+		{Namespace: "kube-public", Name: "drover:public-read"},
+		{Name: "other"},
+	}
+	if !slices.Equal(cfg.boundRoles, want) {
+		t.Errorf("bound roles = %v, want %v", cfg.boundRoles, want)
+	}
+
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"a role without a namespace", []string{
+			"--rancher-url", "https://rancher.cattle-system", "--token-file", "/dev/null", "--service-accounts",
+			"--bind-role", "drover:public-read",
+		}, `"drover:public-read" is not <namespace>/<name>`},
+		{"a cluster role without the service accounts", []string{
+			"--rancher-url", "https://rancher.cattle-system", "--token-file", "/dev/null", "--labels", "team",
+			"--bind-cluster-role", "drover:public-read",
+		}, "-bind-cluster-role and -bind-role need -service-accounts"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := parseProjectSyncConfig(tt.args, io.Discard, noEnvironment)
+			if err == nil {
+				t.Fatal("parseProjectSyncConfig = nil error, want an error")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.want)
 			}
 		})
 	}
