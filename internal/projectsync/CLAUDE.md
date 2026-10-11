@@ -30,6 +30,7 @@ The facts in this section are verified live against Rancher 2.14.5, and against 
 - Never set `blockOwnerDeletion` on an owner reference. It needs a right on the owner that the service user does not have.
 - Rancher creates `<project>-namespaces-edit` and `<project>-namespaces-readonly` shortly after the project is created, also when the project has no member and no namespace.
 - Send a PATCH as `application/merge-patch+json`. The API server answers 415 to `application/json`.
+- The sweep of the bound bindings in `ensureBoundRoles` deletes a RoleBinding in any namespace when its name has the bound prefix of the project and its labels are the labels of the service. A tenant can write such a binding in its own namespace, and the service then deletes it. This matches `managedRoleBinding`, and the cost is one delete per such tenant write.
 
 ## OpenBao
 
