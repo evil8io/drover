@@ -983,6 +983,89 @@ func TestCollectionWithEveryNamespaceForbiddenAnswersAnEmptyList(t *testing.T) {
 	}
 }
 
+// TestCollectionWithEveryNamespaceInErrorKeepsNative checks that a caller
+// keeps the native answer when the upstream does not answer 200 or 403 for
+// any namespace. An example is an outage.
+func TestCollectionWithEveryNamespaceInErrorKeepsNative(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		fail http.HandlerFunc
+	}{
+		{"upstream error status", errorStatus},
+		{"closed connection", closeConnection},
+		{"too many requests", func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "throttled", http.StatusTooManyRequests)
+		}},
+		{"a 200 that is not a collection", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", jsonContentType)
+			_, _ = io.WriteString(w, `{"kind":"Status","apiVersion":"v1","status":"Success"}`)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarnessOpt(t, collectionUpstreamWithDiscovery(
+				steveHandler("a", "b"), test.fail, coreDiscovery(),
+			), withFanout)
+
+			resp, body := h.do(t, h.request(t, http.MethodGet, podsPath, nil, callerHeader()))
+			if resp.StatusCode != http.StatusForbidden {
+				t.Errorf("status = %d, want 403", resp.StatusCode)
+			}
+			if string(body) != nativeForbidden {
+				t.Errorf("body = %q, want the native answer", body)
+			}
+			// The transport sends a GET again after a closed connection, so
+			// the count can be above one per namespace.
+			if got := len(namespacedRecords(h.upstream)); got < 2 {
+				t.Errorf("namespaced requests = %d, want at least 2", got)
+			}
+			wantLog(t, h, `msg="the fan-out got no collection, and a namespace failed"`, "resource=pods", "failed=2")
+		})
+	}
+}
+
+// TestCollectionWithOneNamespaceForbiddenAndOneInErrorKeepsNative checks that
+// a caller keeps the native answer when the upstream answers 403 for one
+// namespace and 500, or nothing, for the other. The caller gets an empty
+// collection only when the upstream answers 403 for every namespace.
+func TestCollectionWithOneNamespaceForbiddenAndOneInErrorKeepsNative(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		fail http.HandlerFunc
+	}{
+		{"upstream error status", errorStatus},
+		{"closed connection", closeConnection},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			lists := namespaceLists(nil)
+			h := newHarnessOpt(t, collectionUpstreamWithDiscovery(steveHandler("a", "b"), func(w http.ResponseWriter, r *http.Request) {
+				if namespace, _, _ := splitNamespaced(r.URL.Path); namespace == "b" {
+					test.fail(w, r)
+					return
+				}
+				lists(w, r)
+			}, coreDiscovery()), withFanout)
+
+			resp, body := h.do(t, h.request(t, http.MethodGet, podsPath, nil, callerHeader()))
+			if resp.StatusCode != http.StatusForbidden {
+				t.Errorf("status = %d, want 403", resp.StatusCode)
+			}
+			if string(body) != nativeForbidden {
+				t.Errorf("body = %q, want the native answer", body)
+			}
+			if got := len(namespacedRecords(h.upstream)); got < 2 {
+				t.Errorf("namespaced requests = %d, want at least 2", got)
+			}
+			wantLog(t, h, `msg="the fan-out got no collection, and a namespace failed"`, "resource=pods", "failed=1")
+		})
+	}
+}
+
 func TestCollectionWithANotFoundNamespaceKeepsNative(t *testing.T) {
 	t.Parallel()
 	h := newHarnessOpt(t, collectionUpstreamWithDiscovery(
