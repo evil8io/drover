@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.27.2](https://github.com/evil8io/drover/compare/v0.27.1...v0.27.2) (2026-10-15)
+
+
+### Bug Fixes
+
+* **api-filter:** give an empty collection a resourceVersion and keep an all-denied watch open ([#143](https://github.com/evil8io/drover/issues/143)) ([e384628](https://github.com/evil8io/drover/commit/e384628f43f9a6f63fc3e1b0bb4cffbdb8ac6344))
+
 ## [0.27.1](https://github.com/evil8io/drover/compare/v0.27.0...v0.27.1) (2026-10-11)
 
 
