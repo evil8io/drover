@@ -885,6 +885,10 @@ func coreDiscovery() map[string]http.HandlerFunc {
 	}
 }
 
+// TestCollectionWithoutAnAllowedNamespaceAnswersAnEmptyList checks that a
+// caller without an allowed namespace gets an empty collection. It also checks
+// that the collection has the resourceVersion 0, so that a client can start
+// its watch from the list.
 func TestCollectionWithoutAnAllowedNamespaceAnswersAnEmptyList(t *testing.T) {
 	t.Parallel()
 	h := newHarnessOpt(t, collectionUpstreamWithDiscovery(
@@ -904,6 +908,9 @@ func TestCollectionWithoutAnAllowedNamespaceAnswersAnEmptyList(t *testing.T) {
 	}
 	if !strings.Contains(string(body), `"items":[]`) {
 		t.Errorf("body = %s, want an empty array, not null", body)
+	}
+	if list.Metadata.ResourceVersion != "0" {
+		t.Errorf("resourceVersion = %q, want 0", list.Metadata.ResourceVersion)
 	}
 	if got := len(namespacedRecords(h.upstream)); got != 0 {
 		t.Errorf("namespaced requests = %d, want 0", got)
@@ -967,6 +974,9 @@ func TestCollectionWithEveryNamespaceForbiddenAnswersAnEmptyList(t *testing.T) {
 	list := parseList(t, body)
 	if list.Kind != "PodList" || len(list.Items) != 0 {
 		t.Errorf("kind = %q with %d items, want PodList with 0", list.Kind, len(list.Items))
+	}
+	if list.Metadata.ResourceVersion != "0" {
+		t.Errorf("resourceVersion = %q, want 0", list.Metadata.ResourceVersion)
 	}
 	if got := len(namespacedRecords(h.upstream)); got != 2 {
 		t.Errorf("namespaced requests = %d, want 2", got)
