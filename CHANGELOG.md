@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.27.3](https://github.com/evil8io/drover/compare/v0.27.2...v0.27.3) (2026-10-15)
+
+
+### Bug Fixes
+
+* **api-filter:** keep the native answer when a namespace of a fan-out list fails with a status other than 403 ([#145](https://github.com/evil8io/drover/issues/145)) ([f2a60f6](https://github.com/evil8io/drover/commit/f2a60f67c0f6dc97aa4b295d5fbe75390ba89ec6))
+
 ## [0.27.2](https://github.com/evil8io/drover/compare/v0.27.1...v0.27.2) (2026-10-15)
 
 
