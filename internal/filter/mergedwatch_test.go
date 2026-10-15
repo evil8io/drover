@@ -185,6 +185,7 @@ func TestMergedWatchWithoutAnAllowedNamespaceStreamsNoEvent(t *testing.T) {
 		t.Errorf("namespaced requests = %d, want 0", got)
 	}
 	wantNoEvent(t, reader)
+	wantLog(t, h, "outcome=empty", "resource=pods", "watch=true", "count=0")
 }
 
 // TestMergedWatchWithoutAnAllowedNamespaceKeepsNativeForAClusterScopedKind
@@ -325,10 +326,13 @@ func TestMergedWatchWithANotFoundNamespaceKeepsNative(t *testing.T) {
 	}
 }
 
-// TestMergedWatchWithEveryNamespaceForbiddenKeepsNative checks the answer for
-// an allowed set where no namespace answers 200. The caller then keeps the
-// native 403, also when discovery reports a namespaced kind.
-func TestMergedWatchWithEveryNamespaceForbiddenKeepsNative(t *testing.T) {
+// TestMergedWatchWithEveryNamespaceForbiddenStreamsNoEvent checks the answer
+// for an allowed set where the upstream answers 403 to the watch of every
+// namespace. The caller then gets an open stream without an event. This is
+// the same result as on the list path, where the filter answers an empty
+// collection. The filter reads the scope of the kind from discovery, as on
+// the list path.
+func TestMergedWatchWithEveryNamespaceForbiddenStreamsNoEvent(t *testing.T) {
 	t.Parallel()
 	release := make(chan struct{})
 	defer close(release)
@@ -337,7 +341,29 @@ func TestMergedWatchWithEveryNamespaceForbiddenKeepsNative(t *testing.T) {
 		steveHandler("a", "b"), namespaceWatches(release, nil), coreDiscovery(),
 	), withFanout)
 
-	resp, body := h.do(t, h.request(t, http.MethodGet, podsPath+"?watch=true", nil, callerHeader()))
+	_, reader := startMergedWatch(t, h, podsPath+"?watch=true")
+	if got := len(namespacedRecords(h.upstream)); got != 2 {
+		t.Errorf("namespaced requests = %d, want 2", got)
+	}
+	wantNoEvent(t, reader)
+	wantLog(t, h, "outcome=empty", "resource=pods", "watch=true", "count=2")
+}
+
+// TestMergedWatchWithEveryNamespaceForbiddenKeepsNativeForAClusterScopedKind
+// checks that a caller keeps the native answer for a cluster-scoped kind when
+// the upstream answers 403 to the watch of every namespace. The API server
+// authorizes a request before it routes it, so a caller without the right
+// gets 403, not 404, on the namespaced path of such a kind.
+func TestMergedWatchWithEveryNamespaceForbiddenKeepsNativeForAClusterScopedKind(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	h := newHarnessOpt(t, collectionUpstreamWithDiscovery(
+		steveHandler("a", "b"), namespaceWatches(release, nil), coreDiscovery(),
+	), withFanout)
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, nodesPath+"?watch=true", nil, callerHeader()))
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("status = %d, want 403", resp.StatusCode)
 	}
@@ -347,6 +373,114 @@ func TestMergedWatchWithEveryNamespaceForbiddenKeepsNative(t *testing.T) {
 	if got := len(namespacedRecords(h.upstream)); got != 2 {
 		t.Errorf("namespaced requests = %d, want 2", got)
 	}
+	if got := h.svc.watches.reservedCount(); got != 0 {
+		t.Errorf("reserved slots = %d, want 0", got)
+	}
+}
+
+// TestMergedWatchWithEveryNamespaceForbiddenKeepsNativeWhenDiscoveryFails
+// checks that a caller keeps the native answer when the upstream answers 403
+// to the watch of every namespace and discovery does not give the kind.
+func TestMergedWatchWithEveryNamespaceForbiddenKeepsNativeWhenDiscoveryFails(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	h := newHarnessOpt(t, collectionUpstream(
+		steveHandler("a", "b"), namespaceWatches(release, nil),
+	), withFanout)
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, podsPath+"?watch=true", nil, callerHeader()))
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", resp.StatusCode)
+	}
+	if string(body) != nativeForbidden {
+		t.Errorf("body = %q, want the native answer", body)
+	}
+}
+
+// TestMergedWatchWithoutAnUpstreamWatchEndsAtItsTimeout checks that the
+// filter ends a stream without an upstream watch with a clean end at the
+// timeoutSeconds of the caller. The API server ends a watch in the same way.
+// The test also checks that the filter frees the slot of the stream.
+func TestMergedWatchWithoutAnUpstreamWatchEndsAtItsTimeout(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	h := newHarnessOpt(t, collectionUpstreamWithDiscovery(
+		steveHandler("a", "b"), namespaceWatches(release, nil), coreDiscovery(),
+	), withFanout)
+
+	_, reader := startMergedWatch(t, h, podsPath+"?watch=true&timeoutSeconds=1")
+	wantCleanEnd(t, reader, "the stream did not end at its timeout")
+	if !waitFor(func() bool { return h.svc.watches.reservedCount() == 0 }) {
+		t.Errorf("reserved slots = %d after the end, want 0", h.svc.watches.reservedCount())
+	}
+	wantLog(t, h, `msg="ended a merged watch that started without an upstream watch, at its timeout"`, "timeout=1s")
+}
+
+// TestMergedWatchWithMixedFailuresKeepsNative checks a caller for whom the
+// filter does not open any upstream watch, and the upstream does not answer
+// 403 for every namespace. The caller then keeps the native answer. A client
+// then watches again after a backoff, and it gets a stream when the upstream
+// recovers. The filter stops the tries of a namespace after 3 tries, and an
+// outage can be longer.
+func TestMergedWatchWithMixedFailuresKeepsNative(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	watches := namespaceWatches(release, nil)
+	h := newHarnessOpt(t, collectionUpstream(steveHandler("a", "b"), func(w http.ResponseWriter, r *http.Request) {
+		if namespace, _, _ := splitNamespaced(r.URL.Path); namespace == "b" {
+			errorStatus(w, r)
+			return
+		}
+		watches(w, r)
+	}), withFanout)
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, podsPath+"?watch=true", nil, callerHeader()))
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", resp.StatusCode)
+	}
+	if string(body) != nativeForbidden {
+		t.Errorf("body = %q, want the native answer", body)
+	}
+	if got := h.svc.watches.reservedCount(); got != 0 {
+		t.Errorf("reserved slots = %d, want 0", got)
+	}
+}
+
+// TestMergedWatchWithEveryNamespaceForbiddenAddsTheNamespacesOnANewTry checks
+// a caller for whom the upstream first denies the watch of every namespace.
+// The caller then gets the events of a namespace in the same stream when the
+// upstream allows its watch on a new try.
+func TestMergedWatchWithEveryNamespaceForbiddenAddsTheNamespacesOnANewTry(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	var opens sync.Map
+	watches := namespaceWatches(release, map[string][]string{"a": {podEvent("a")}, "b": {podEvent("b")}})
+	h := newHarnessOpt(t, collectionUpstreamWithDiscovery(steveHandler("a", "b"), func(w http.ResponseWriter, r *http.Request) {
+		namespace, _, _ := splitNamespaced(r.URL.Path)
+		if _, seen := opens.LoadOrStore(namespace, true); !seen {
+			writeForbidden(w, namespacedForbidden)
+			return
+		}
+		watches(w, r)
+	}, coreDiscovery()), withFanout, shortTTL)
+
+	_, reader := startMergedWatch(t, h, podsPath+"?watch=true")
+	if got := mergedEvents(t, reader, 2); got[0] != podEvent("a") || got[1] != podEvent("b") {
+		t.Fatalf("events = %q, want the ADDED events of a and b after a new try", got)
+	}
+	if got := len(namespacedRecords(h.upstream)); got != 4 {
+		t.Errorf("namespaced requests = %d, want 4, two per namespace", got)
+	}
+	wantLog(t, h, `msg="added a namespace to a merged watch"`, "namespace=a")
+	wantLog(t, h, `msg="added a namespace to a merged watch"`, "namespace=b")
 }
 
 // TestMergedWatchKeepsEveryEventOfOneNamespace checks that the events of one
@@ -991,10 +1125,11 @@ func TestMaxWatchesPerCallerCapsAMergedWatch(t *testing.T) {
 	}
 }
 
-// TestMergedWatchReleasesTheSlotOnAFailure checks that a merged watch whose
-// upstream watches all fail after the reserve frees its slot, and that the
-// caller keeps the native answer. The caller has one slot, so a leaked slot
-// answers the next watch with 503.
+// TestMergedWatchReleasesTheSlotOnAFailure checks a merged watch for which
+// the filter does not open any upstream watch after the reserve, because of
+// an error other than 403. It checks that the filter frees the slot of that
+// watch, and that the caller keeps the native answer. The caller has one
+// slot, so with a leaked slot the filter answers the next watch with 503.
 func TestMergedWatchReleasesTheSlotOnAFailure(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -1123,9 +1258,55 @@ func TestMergedWatchListWithoutAnAllowedNamespaceEndsAtOnce(t *testing.T) {
 	_, reader := startMergedWatch(t, h, podsPath+watchListQuery)
 	kind, apiVersion, version, annotations := decodeBookmark(t, nextEvent(t, reader))
 	if kind != "Pod" || apiVersion != "v1" || version != "" || annotations[initialEventsEndAnnotation] != "true" {
-		t.Errorf("end bookmark = %s %s %q %v, want Pod v1 with no version and the end annotation", kind, apiVersion, version, annotations)
+		t.Errorf("end bookmark = %s %s %q %v, want Pod v1 with an empty resourceVersion and the end annotation", kind, apiVersion, version, annotations)
 	}
 	wantNoEvent(t, reader)
+}
+
+// TestMergedWatchListWithEveryNamespaceForbiddenEndsAtOnce checks that a
+// caller gets the end bookmark from discovery when the upstream denies the
+// watch of every namespace. A caller without an allowed namespace gets the end
+// bookmark in the same way.
+func TestMergedWatchListWithEveryNamespaceForbiddenEndsAtOnce(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	h := newHarnessOpt(t, collectionUpstreamWithDiscovery(
+		steveHandler("a", "b"), namespaceWatches(release, nil), coreDiscovery(),
+	), withFanout)
+
+	_, reader := startMergedWatch(t, h, podsPath+watchListQuery)
+	kind, apiVersion, version, annotations := decodeBookmark(t, nextEvent(t, reader))
+	if kind != "Pod" || apiVersion != "v1" || version != "" || annotations[initialEventsEndAnnotation] != "true" {
+		t.Errorf("end bookmark = %s %s %q %v, want Pod v1 with an empty resourceVersion and the end annotation", kind, apiVersion, version, annotations)
+	}
+	wantNoEvent(t, reader)
+}
+
+// TestMergedWatchListWithEveryNamespaceForbiddenKeepsNativeWhenDiscoveryFails
+// checks a watch-list for which the upstream denies the watch of every
+// namespace. When discovery does not give a kind for the end bookmark, the
+// caller gets the native answer.
+func TestMergedWatchListWithEveryNamespaceForbiddenKeepsNativeWhenDiscoveryFails(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+
+	h := newHarnessOpt(t, collectionUpstream(
+		steveHandler("a", "b"), namespaceWatches(release, nil),
+	), withFanout)
+
+	resp, body := h.do(t, h.request(t, http.MethodGet, podsPath+watchListQuery, nil, callerHeader()))
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", resp.StatusCode)
+	}
+	if string(body) != nativeForbidden {
+		t.Errorf("body = %q, want the native answer", body)
+	}
+	if got := h.svc.watches.reservedCount(); got != 0 {
+		t.Errorf("reserved slots = %d, want 0", got)
+	}
 }
 
 // TestMergedWatchDropsAnEndBookmarkWithoutAWatchList checks that the end

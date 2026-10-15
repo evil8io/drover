@@ -249,9 +249,15 @@ type apiResourceList struct {
 	} `json:"resources"`
 }
 
-// emptyCollectionJSON returns an empty List of the kind, with no element.
+// emptyCollectionJSON returns a List of the kind without an element, with the
+// resourceVersion 0. A client starts its watch from the resourceVersion of a
+// list, and the kube-rs watcher returns an error for a list without that
+// value. The API server starts a watch from 0 at any revision of the store,
+// and it sends an ADDED event for each object that exists. The value is thus
+// valid for every kind and every store. For the same reason, the client gets
+// the objects of a namespace that RBAC allowed after the list.
 func emptyCollectionJSON(kind, apiVersion string) []byte {
 	return []byte(`{"kind":` + strconv.Quote(kind) +
 		`,"apiVersion":` + strconv.Quote(apiVersion) +
-		`,"metadata":{},"items":[]}`)
+		`,"metadata":{"resourceVersion":"0"},"items":[]}`)
 }

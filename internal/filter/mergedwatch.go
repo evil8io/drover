@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -115,6 +116,7 @@ func (s *Service) mergedWatch(req *http.Request, target collectionTarget, set al
 	// the list path gives it a collection without an element. A cluster-scoped
 	// kind keeps the native answer, because such an object has no namespace.
 	var kind, apiVersion string
+	discovered := false
 	if len(names) == 0 {
 		var namespaced, ok bool
 		kind, apiVersion, namespaced, ok = s.discoverResource(req, target)
@@ -123,16 +125,36 @@ func (s *Service) mergedWatch(req *http.Request, target collectionTarget, set al
 			s.logList(ctx, start, result)
 			return denied
 		}
+		discovered = true
 	}
 
-	streams, clusterScoped := s.openWatches(req, target, names, caller)
-	// A namespaced path of a kind that has no namespace scope, for example
-	// nodes, answers 404 in every namespace.
-	if clusterScoped || (len(names) > 0 && len(streams) == 0) {
+	streams, clusterScoped, allForbidden := s.openWatches(req, target, names, caller)
+	// For a namespaced path of a kind that does not have a namespace scope,
+	// for example nodes, the upstream answers 404 in every namespace. A
+	// caller gets a stream without an event when the upstream watch of every
+	// namespace gets 403. On the list path, the filter gives such a caller a
+	// collection without an element. trackAllowedSet tries each namespace
+	// without a stream again, and it opens the watch of a namespace whose
+	// role binding Rancher creates after the first try. When the filter does
+	// not open any upstream watch for another reason, the caller keeps the
+	// native answer, so that the client watches again.
+	if clusterScoped || (len(names) > 0 && len(streams) == 0 && !allForbidden) {
 		closeWatches(streams)
 		result.outcome, result.status = outcomeNative, denied.StatusCode
 		s.logList(ctx, start, result)
 		return denied
+	}
+	if len(streams) == 0 && !discovered {
+		// The API server authorizes a request before it routes it. To a
+		// caller without the right, the namespaced path of a cluster-scoped
+		// kind thus answers 403, not 404. Discovery gives the scope, as on
+		// the list path, and the kind for the end bookmark of a watch-list.
+		var namespaced, ok bool
+		if kind, apiVersion, namespaced, ok = s.discoverResource(req, target); !ok || !namespaced {
+			result.outcome, result.status = outcomeNative, denied.StatusCode
+			s.logList(ctx, start, result)
+			return denied
+		}
 	}
 	_ = denied.Body.Close()
 
@@ -151,10 +173,16 @@ func (s *Service) mergedWatch(req *http.Request, target collectionTarget, set al
 		// itself, from the kind that discovery gave.
 		go merge.endInitialEventsWithout(kind, apiVersion)
 	}
+	if len(streams) == 0 {
+		go merge.endAfter(ctx, watchTimeout(req.URL.Query()))
+	}
 	go merge.finishOnEnd(ctx)
 	go s.trackAllowedSet(ctx, req.Clone(ctx), target, names, streams, merge)
 
 	result.outcome, result.status = outcomeFannedOut, resp.StatusCode
+	if len(streams) == 0 {
+		result.outcome = outcomeEmpty
+	}
 	s.logList(ctx, start, result)
 	s.metrics.fanoutNamespaces(ctx, target.cluster, len(names))
 	return resp
@@ -164,12 +192,14 @@ func (s *Service) mergedWatch(req *http.Request, target collectionTarget, set al
 // open holds an in-flight slot of caller until its upstream answers. A
 // namespace that answers anything but 200 drops out of the merge, because the
 // caller may hold the watch permission in some of its namespaces only. It
-// reports whether a namespace answered 404, which says that the kind has no
-// namespace scope.
-func (s *Service) openWatches(req *http.Request, target collectionTarget, names []string, caller string) (streams []upstreamWatch, clusterScoped bool) {
+// reports whether the upstream answered 404 for a namespace. In that case,
+// the kind does not have a namespace scope. It also reports whether the
+// upstream answered 403 for every namespace.
+func (s *Service) openWatches(req *http.Request, target collectionTarget, names []string, caller string) (streams []upstreamWatch, clusterScoped, allForbidden bool) {
 	ctx := req.Context()
 	var mu sync.Mutex
 	var group sync.WaitGroup
+	forbidden := 0
 
 	for _, name := range names {
 		group.Add(1)
@@ -188,6 +218,9 @@ func (s *Service) openWatches(req *http.Request, target collectionTarget, names 
 			defer mu.Unlock()
 			if body == nil {
 				clusterScoped = clusterScoped || status == http.StatusNotFound
+				if status == http.StatusForbidden {
+					forbidden++
+				}
 				return
 			}
 			streams = append(streams, upstreamWatch{namespace: name, body: body})
@@ -195,7 +228,7 @@ func (s *Service) openWatches(req *http.Request, target collectionTarget, names 
 	}
 
 	group.Wait()
-	return streams, clusterScoped
+	return streams, clusterScoped, len(names) > 0 && forbidden == len(names)
 }
 
 // openWatch sends one upstream watch request, and returns the body of a 200
@@ -611,6 +644,37 @@ func controlFrame(opcode byte, payload []byte) []byte {
 // watchOpenTries is the count of tries to open the upstream watch of one
 // namespace of a merged watch.
 const watchOpenTries = 3
+
+// defaultWatchTimeout is the time after which the filter ends a merged stream
+// that started without an upstream watch, when the caller does not set
+// timeoutSeconds. It is the default minimum request timeout of the API
+// server, which ends a watch without timeoutSeconds after at least that time.
+const defaultWatchTimeout = 1800 * time.Second
+
+// watchTimeout returns the time after which the filter ends a merged stream
+// that started without an upstream watch. That time is the timeoutSeconds of
+// the caller, or defaultWatchTimeout.
+func watchTimeout(query url.Values) time.Duration {
+	if seconds, err := strconv.Atoi(query.Get("timeoutSeconds")); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return defaultWatchTimeout
+}
+
+// endAfter ends the merged stream with a clean end after timeout, when the
+// stream is still open. The API server ends a watch at its timeoutSeconds, and
+// a stream without an upstream watch does not have such an end of its own. A
+// client that watches again after the end gets new tries of each namespace.
+func (m *watchMerge) endAfter(ctx context.Context, timeout time.Duration) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-m.stop:
+	case <-timer.C:
+		m.end("ended a merged watch that started without an upstream watch, at its timeout", "timeout", timeout.String())
+	}
+}
 
 // trackAllowedSet re-reads the allowed namespaces of the caller once per cache
 // TTL, through the cache of a plain list, so it adds no request beyond the one
