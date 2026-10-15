@@ -218,12 +218,15 @@ func (f *fanoutSlots) release() {
 // merged answer. The answers stream out in the order of names, so the filter
 // holds at most fanoutConcurrency answers at a time. A namespace that answers
 // anything but 200 drops out of the merge, because the caller may hold the
-// list permission in some of its namespaces only. The native 403 stands when
-// no namespace answers 200.
+// list permission in some of its namespaces only. When the upstream does not
+// answer 200 for any namespace, the caller gets an empty collection only
+// when the upstream answers 403 for every namespace. Otherwise, the caller
+// gets the native 403.
 func (s *Service) fanout(req *http.Request, target collectionTarget, names []string, caller string, denied *http.Response, start time.Time, result listResult) *http.Response {
 	ctx := req.Context()
 	slots := newFanoutSlots(s.fanoutConcurrency, s.inflight, caller)
 	stopped := &atomic.Bool{}
+	forbidden := &atomic.Int32{}
 	answers := make([]chan *http.Response, len(names))
 	for i := range answers {
 		answers[i] = make(chan *http.Response, 1)
@@ -248,7 +251,7 @@ func (s *Service) fanout(req *http.Request, target collectionTarget, names []str
 				}
 				return
 			}
-			go s.fetchNamespaced(req, target, name, slots, answers[i], stopped)
+			go s.fetchNamespaced(req, target, name, slots, answers[i], stopped, forbidden)
 		}
 	}()
 
@@ -286,7 +289,16 @@ func (s *Service) fanout(req *http.Request, target collectionTarget, names []str
 		}
 	}
 
-	if stopped.Load() {
+	// The filter returns the native answer after a 404, because the upstream
+	// answers 404 for a kind that does not have a namespace scope. The filter
+	// also returns the native answer when the upstream answers a status other
+	// than 403 for a namespace, or does not answer. An example is a 502
+	// during an outage.
+	if stopped.Load() || int(forbidden.Load()) != len(names) {
+		if !stopped.Load() {
+			s.logger.WarnContext(ctx, "the fan-out got no collection, and a namespace failed",
+				"cluster", target.cluster, "resource", target.resource, "failed", len(names)-int(forbidden.Load()))
+		}
 		result.outcome, result.status, result.count = outcomeNative, denied.StatusCode, len(names)
 		s.logList(ctx, start, result)
 		return denied
@@ -383,8 +395,8 @@ func (s *Service) discoverResource(req *http.Request, target collectionTarget) (
 // returns its slot in that case. The reader of a usable answer returns the
 // slot, so an unread answer keeps holding one. A 404 sets stopped, because a
 // namespaced path of a kind that has no namespace scope, for example nodes,
-// answers 404 in every namespace.
-func (s *Service) fetchNamespaced(req *http.Request, target collectionTarget, name string, slots *fanoutSlots, answer chan<- *http.Response, stopped *atomic.Bool) {
+// answers 404 in every namespace. It adds one to forbidden for a 403.
+func (s *Service) fetchNamespaced(req *http.Request, target collectionTarget, name string, slots *fanoutSlots, answer chan<- *http.Response, stopped *atomic.Bool, forbidden *atomic.Int32) {
 	ctx := req.Context()
 	resp, err := s.base.RoundTrip(namespacedRequest(req, target, name))
 	if err != nil {
@@ -398,8 +410,11 @@ func (s *Service) fetchNamespaced(req *http.Request, target collectionTarget, na
 	if resp.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBody))
 		_ = resp.Body.Close()
-		if resp.StatusCode == http.StatusNotFound {
+		switch resp.StatusCode {
+		case http.StatusNotFound:
 			stopped.Store(true)
+		case http.StatusForbidden:
+			forbidden.Add(1)
 		}
 		s.metrics.fanoutSkipped(ctx, target.cluster)
 		s.logger.DebugContext(ctx, "the namespaced request returned no collection",
