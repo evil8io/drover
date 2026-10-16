@@ -113,7 +113,7 @@ func TestParseTrustRejectsARoleARNWithoutAName(t *testing.T) {
 	}
 }
 
-const validTrustRules = `{"annotation":"drover-trust","statusAnnotation":"drover-trust-status","maxStatements":20,` +
+const validTrustRules = `{"annotation":"drover.evil8.io/trust-policy","statusAnnotation":"managed.drover.evil8.io/trust-policy-status","maxStatements":20,` +
 	`"audience":"https://openbao.example.com","loginTokenTTL":"5m",` +
 	`"jwtIssuers":{"github":{"requiredClaims":["repository_id"],"allowedClaims":{"ref":["refs/heads/main"]}}},` +
 	`"aws":{"enabled":true,"allowedAccounts":["123456789012"]},"chartOnly":{"key":"ignored"}}`
@@ -125,7 +125,7 @@ func TestParseTrustRules(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse the valid rules: %v", err)
 	}
-	if rules.annotation != "drover-trust" || rules.statusAnnotation != "drover-trust-status" || rules.maxStatements != 20 ||
+	if rules.annotation != "drover.evil8.io/trust-policy" || rules.statusAnnotation != "managed.drover.evil8.io/trust-policy-status" || rules.maxStatements != 20 ||
 		rules.loginTokenTTL != "5m" || !rules.awsEnabled || len(rules.issuers) != 1 {
 		t.Errorf("rules = %+v", rules)
 	}
@@ -137,7 +137,9 @@ func TestParseTrustRules(t *testing.T) {
 	}{
 		{"empty annotation", func(m map[string]any) { m["annotation"] = "" }, "a metadata key is empty"},
 		{"annotation of Kubernetes", func(m map[string]any) { m["annotation"] = "kubernetes.io/trust" }, "kubernetes.io"},
-		{"same keys", func(m map[string]any) { m["statusAnnotation"] = "drover-trust" }, "are the same key"},
+		{"trust key under the managed prefix", func(m map[string]any) { m["annotation"] = "managed.drover.evil8.io/trust" }, "writes its own keys under that domain"},
+		{"status key outside the managed prefix", func(m map[string]any) { m["statusAnnotation"] = "drover.evil8.io/trust-status" }, "is not under managed.drover.evil8.io/"},
+		{"status key of Kubernetes", func(m map[string]any) { m["statusAnnotation"] = "kubernetes.io/trust-status" }, "statusAnnotation: the metadata key"},
 		{"no limit", func(m map[string]any) { delete(m, "maxStatements") }, "maxStatements 0 is not 1 to 100"},
 		{"limit above 100", func(m map[string]any) { m["maxStatements"] = 101 }, "maxStatements 101"},
 		{"no audience", func(m map[string]any) { m["audience"] = "" }, "audience is empty"},
@@ -198,7 +200,7 @@ func TestNewChecksTheTrustRules(t *testing.T) {
 		{"without OpenBao", Config{ServiceAccounts: true, TrustFile: trustRulesPath}, "the trust rules need the OpenBao config"},
 		{"missing file", Config{ServiceAccounts: true, OpenBao: openbao, TrustFile: missing}, "read the trust rules file"},
 		{"trust key copied", Config{ServiceAccounts: true, OpenBao: openbao, TrustFile: trustRulesPath, Annotations: []string{trustKey}}, "copies to a namespace"},
-		{"status key copied", Config{ServiceAccounts: true, OpenBao: openbao, TrustFile: trustRulesPath, NameAnnotation: trustStatusKey}, "copies to a namespace"},
+		{"status key copied", Config{ServiceAccounts: true, OpenBao: openbao, TrustFile: trustRulesPath, NameAnnotation: trustStatusKey}, "writes its own keys under that domain"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

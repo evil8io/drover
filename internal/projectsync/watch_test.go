@@ -41,8 +41,8 @@ const (
 	departedEvent = `{"type":"MODIFIED","object":{"kind":"Namespace","metadata":` +
 		`{"name":"alpha-departed","resourceVersion":"35",` +
 		`"labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1"},` +
-		`"annotations":{"owner":"alpha@example.com","drover-managed-labels":"cost-center",` +
-		`"drover-managed-annotations":"owner"}}}}`
+		`"annotations":{"owner":"alpha@example.com","managed.drover.evil8.io/synced-labels":"cost-center",` +
+		`"managed.drover.evil8.io/synced-annotations":"owner"}}}}`
 
 	// deletedEvent is a DELETED event of alpha-departed without a
 	// deletionTimestamp: the namespace left the label selection of the watch.
@@ -52,8 +52,8 @@ const (
 	deletedEvent = `{"type":"DELETED","object":{"kind":"Namespace","metadata":` +
 		`{"name":"alpha-departed","resourceVersion":"36",` +
 		`"labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1"},` +
-		`"annotations":{"owner":"alpha@example.com","drover-managed-labels":"cost-center",` +
-		`"drover-managed-annotations":"owner","field.cattle.io/projectId":"c-1:p-alpha"}}}}`
+		`"annotations":{"owner":"alpha@example.com","managed.drover.evil8.io/synced-labels":"cost-center",` +
+		`"managed.drover.evil8.io/synced-annotations":"owner","field.cattle.io/projectId":"c-1:p-alpha"}}}}`
 
 	// deletedWithTimestampEvent is a DELETED event of a namespace that the API
 	// server deleted.
@@ -66,8 +66,8 @@ const (
 	// project label or annotation, with its records still on it.
 	freshDeparted = `{"metadata":{"name":"alpha-departed","resourceVersion":"38",` +
 		`"labels":{"cost-center":"cc-1"},` +
-		`"annotations":{"owner":"alpha@example.com","drover-managed-labels":"cost-center",` +
-		`"drover-managed-annotations":"owner"}}}`
+		`"annotations":{"owner":"alpha@example.com","managed.drover.evil8.io/synced-labels":"cost-center",` +
+		`"managed.drover.evil8.io/synced-annotations":"owner"}}}`
 )
 
 // streamOnce fills the project snapshot with one reconcile run, then it reads

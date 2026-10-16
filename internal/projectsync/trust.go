@@ -154,13 +154,14 @@ func parseTrustRules(data []byte) (*trustRules, error) {
 	if err := json.Unmarshal(data, &file); err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
-	for _, key := range []string{file.Annotation, file.StatusAnnotation} {
-		if err := checkKey(key); err != nil {
-			return nil, fmt.Errorf("the trust annotation: %w", err)
-		}
+	if err := checkKey(file.Annotation); err != nil {
+		return nil, fmt.Errorf("annotation: %w", err)
 	}
-	if file.Annotation == file.StatusAnnotation {
-		return nil, errors.New("annotation and statusAnnotation are the same key")
+	if _, err := checkKeySyntax(file.StatusAnnotation); err != nil {
+		return nil, fmt.Errorf("statusAnnotation: %w", err)
+	}
+	if !strings.HasPrefix(file.StatusAnnotation, managedPrefix) {
+		return nil, fmt.Errorf("statusAnnotation %q is not under %s, and the admission policy of the chart protects only that prefix", file.StatusAnnotation, managedPrefix)
 	}
 	if file.MaxStatements < 1 || file.MaxStatements > maxStatementsCap {
 		return nil, fmt.Errorf("maxStatements %d is not 1 to %d", file.MaxStatements, maxStatementsCap)

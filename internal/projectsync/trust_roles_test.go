@@ -456,7 +456,7 @@ func TestReconcileRemovesTheTrustStatusWithTheTrustAnnotation(t *testing.T) {
 	if len(patches) != 1 {
 		t.Fatalf("status patches = %d, want 1", len(patches))
 	}
-	if want := `{"metadata":{"annotations":{"drover-trust-status":null}}}`; patches[0].body != want {
+	if want := `{"metadata":{"annotations":{"managed.drover.evil8.io/trust-policy-status":null}}}`; patches[0].body != want {
 		t.Errorf("patch body = %s, want %s", patches[0].body, want)
 	}
 	if got := patches[0].header.Get("Content-Type"); got != mergePatchType {

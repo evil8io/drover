@@ -29,11 +29,11 @@ const (
 	alphaListPath     = "/k8s/clusters/c-1/api/v1/namespaces"
 
 	alphaTwoBody = `{"metadata":{"labels":{"cost-center":"cc-1"},` +
-		`"annotations":{"drover-managed-annotations":"owner","drover-managed-labels":"cost-center",` +
+		`"annotations":{"managed.drover.evil8.io/synced-annotations":"owner","managed.drover.evil8.io/synced-labels":"cost-center",` +
 		`"owner":"alpha@example.com"}}}`
-	alphaMovedBody = `{"metadata":{"labels":{"tier":null},"annotations":{"drover-managed-labels":"cost-center"}}}`
+	alphaMovedBody = `{"metadata":{"labels":{"tier":null},"annotations":{"managed.drover.evil8.io/synced-labels":"cost-center"}}}`
 	betaOneBody    = `{"metadata":{"labels":{"cost-center":"cc-2"},` +
-		`"annotations":{"drover-managed-labels":"cost-center"}}}`
+		`"annotations":{"managed.drover.evil8.io/synced-labels":"cost-center"}}}`
 
 	// alphaDepartedItem is alpha-departed while it still has the keys of
 	// p-alpha, but its project annotation is already gone: Rancher keeps the
@@ -41,10 +41,10 @@ const (
 	// records that name them.
 	alphaDepartedItem = `{"metadata":{"name":"alpha-departed","resourceVersion":"16",` +
 		`"labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1"},` +
-		`"annotations":{"owner":"alpha@example.com","drover-managed-labels":"cost-center",` +
-		`"drover-managed-annotations":"owner"}}}`
+		`"annotations":{"owner":"alpha@example.com","managed.drover.evil8.io/synced-labels":"cost-center",` +
+		`"managed.drover.evil8.io/synced-annotations":"owner"}}}`
 	alphaDepartedBody = `{"metadata":{"labels":{"cost-center":null},` +
-		`"annotations":{"drover-managed-annotations":null,"drover-managed-labels":null,"owner":null}}}`
+		`"annotations":{"managed.drover.evil8.io/synced-annotations":null,"managed.drover.evil8.io/synced-labels":null,"owner":null}}}`
 )
 
 // reconcileOnce runs one reconcile against a fake Rancher with a token file.
@@ -140,9 +140,9 @@ func TestReconcileSetsTheProjectDisplayName(t *testing.T) {
 		t.Fatalf("patch requests of %s = %d, want 1", alphaTwoPath, len(patches))
 	}
 	want := `{"metadata":{"labels":{"example.com/project-name":"Alpha"},` +
-		`"annotations":{"drover-managed-annotations":"example.com/project-display-name",` +
-		`"drover-managed-labels":"example.com/project-name",` +
-		`"example.com/project-display-name":"Alpha"}}}`
+		`"annotations":{"example.com/project-display-name":"Alpha",` +
+		`"managed.drover.evil8.io/synced-annotations":"example.com/project-display-name",` +
+		`"managed.drover.evil8.io/synced-labels":"example.com/project-name"}}}`
 	if got := patches[0].body; got != want {
 		t.Errorf("patch of %s = %s, want %s", alphaTwoPath, got, want)
 	}
@@ -430,7 +430,7 @@ func TestNamespaceListKeepsOnlyTheKeysThatTheSyncReads(t *testing.T) {
 			`"labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"old","tier":"gold","app":"web",%q:"Alpha"},`+
 			`"annotations":{"owner":"alpha@example.com",%q:"Alpha","note":"outside the allow list","bulk":%q,`+
 			`"field.cattle.io/projectId":"c-1:p-alpha",`+
-			`"drover-managed-labels":"cost-center,%s","drover-managed-annotations":"%s,owner"}}}`,
+			`"managed.drover.evil8.io/synced-labels":"cost-center,%s","managed.drover.evil8.io/synced-annotations":"%s,owner"}}}`,
 			i, 100+i, nameLabel, nameAnnotation, bulk, nameLabel, nameAnnotation)
 	}
 	page.WriteString(`],"metadata":{"resourceVersion":"200"}}`)
@@ -502,9 +502,9 @@ func TestReconcileRewritesARecordAboveTheBound(t *testing.T) {
 	record := "cost-center," + strings.Repeat("x", maxRecordValue)
 	page := `{"kind":"NamespaceList","items":[{"metadata":{"name":"alpha-filled","resourceVersion":"40",` +
 		`"labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1"},` +
-		`"annotations":{"owner":"alpha@example.com","drover-managed-annotations":"owner",` +
+		`"annotations":{"owner":"alpha@example.com","managed.drover.evil8.io/synced-annotations":"owner",` +
 		`"field.cattle.io/projectId":"c-1:p-alpha",` +
-		`"drover-managed-labels":"` + record + `"}}}]}`
+		`"managed.drover.evil8.io/synced-labels":"` + record + `"}}}]}`
 	rancher := newFakeRancher(t, listing("c-1", map[string]string{"": page}))
 	syncer, _ := newSyncer(t, rancher, tokenFile(t, serviceToken))
 	ctx := context.Background()
@@ -529,7 +529,7 @@ func TestReconcileRewritesARecordAboveTheBound(t *testing.T) {
 	if len(patches) != 1 {
 		t.Fatalf("patch requests of alpha-filled = %d, want 1", len(patches))
 	}
-	const want = `{"metadata":{"annotations":{"drover-managed-labels":"cost-center"}}}`
+	const want = `{"metadata":{"annotations":{"managed.drover.evil8.io/synced-labels":"cost-center"}}}`
 	if got := patches[0].body; got != want {
 		t.Errorf("patch of alpha-filled = %s, want %s", got, want)
 	}

@@ -112,7 +112,7 @@ Start the service with `drover project-sync [flags]`.
 | `--otlp-metrics` | `true` | When `true`, the service sends metrics to the OTLP endpoint. |
 | `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | Value of the `service.name` resource attribute. With an empty value, `--service-name=`, the service sets no `service.name`, so that a collector can derive it. The OpenTelemetry SDK still takes a `service.name` from `OTEL_SERVICE_NAME` or `OTEL_RESOURCE_ATTRIBUTES`. |
 
-The flags need at least one label key, annotation key, name label key, or name annotation key, or `--service-accounts`. Every `--openbao-` flag needs `--service-accounts`. `--trust-file` needs `--openbao-address` and `--service-accounts`. A key must be a valid Kubernetes label or annotation key. A key is not valid when its prefix is `cattle.io`, `kubernetes.io`, or `k8s.io`, or a subdomain of one of them. The reason is that Rancher and Kubernetes own those domains.
+The flags need at least one label key, annotation key, name label key, or name annotation key, or `--service-accounts`. Every `--openbao-` flag needs `--service-accounts`. `--trust-file` needs `--openbao-address` and `--service-accounts`. A key must be a valid Kubernetes label or annotation key. A key is not valid when its prefix is `cattle.io`, `kubernetes.io`, or `k8s.io`, or a subdomain of one of them. The reason is that Rancher and Kubernetes own those domains. A key under `managed.drover.evil8.io` is not valid either, because the service writes its own keys under that domain.
 
 The keys of `--labels` and `--name-label`, joined with commas, must not be longer than 4096 bytes. The same limit applies to the keys of `--annotations` and `--name-annotation`. The reason is the limit of an ownership annotation, see [Design](#design).
 
@@ -126,11 +126,11 @@ The service answers `GET /healthz` with status 200 and the body `ok`.
 
 ## Ownership of a key
 
-The service records the keys that it set on a namespace in two annotations of that namespace, `drover-managed-labels` and `drover-managed-annotations`. These two annotations are the ownership annotations. The value of each annotation is a comma-separated list of keys.
+The service records the keys that it set on a namespace in two annotations of that namespace, `managed.drover.evil8.io/synced-labels` and `managed.drover.evil8.io/synced-annotations`. These two annotations are the ownership annotations. The value of each annotation is a comma-separated list of keys.
 
 The service removes a key in one of these lists when the project of the namespace no longer has that key. The service thus removes the keys of the old project from a namespace that moves to another project. From a namespace in no project, it removes every key of the lists, and the two ownership annotations. The service reads the project of a namespace from the annotation `field.cattle.io/projectId`, the project annotation. It does not use the label of the same name, the project label, because Rancher keeps that label when a namespace leaves its project.
 
-A key outside these lists belongs to the tenant, and the service never removes it. The lists are on the namespace, so a tenant can edit them. The service therefore removes only a key of `--labels`, `--annotations`, `--name-label`, or `--name-annotation`. It ignores every other key of the lists. The service does not accept `drover-managed-labels` and `drover-managed-annotations` in `--labels` and `--annotations`, because it writes these keys itself.
+A key outside these lists belongs to the tenant, and the service never removes it. The lists are on the namespace, so a tenant can edit them. The service therefore removes only a key of `--labels`, `--annotations`, `--name-label`, or `--name-annotation`. It ignores every other key of the lists. The service does not accept a key under `managed.drover.evil8.io` in `--labels`, `--annotations`, `--name-label`, and `--name-annotation`, because it writes its own keys under that domain.
 
 ## Design
 
@@ -170,7 +170,7 @@ A project owner can edit the labels, the annotations, and the display name of th
 
 With `--service-accounts`, the service keeps these objects in every cluster that the reconcile run syncs:
 
-1. One account project, with the display name `drover`, the label `drover-service-accounts: "true"`, and the service user in the annotation `field.cattle.io/creatorId`. Rancher then binds the service user as the owner of the project, and no tenant gets a role in it. The service creates the project when the cluster does not have an account project.
+1. One account project, with the display name `drover`, the label `managed.drover.evil8.io/account-project: "true"`, and the service user in the annotation `field.cattle.io/creatorId`. Rancher then binds the service user as the owner of the project, and no tenant gets a role in it. The service creates the project when the cluster does not have an account project.
 2. Per tenant project, the account namespace `drover-<project>` in the account project. `<project>` is the name of the project, for example `p-n52j9`.
 3. In the account namespace, the ServiceAccounts `project-owner`, `project-member`, and `read-only`. The user name of such a ServiceAccount is `system:serviceaccount:drover-<project>:<role>`.
 4. In every namespace of the tenant project, the RoleBindings `drover-project-owner`, `drover-project-member`, and `drover-read-only`, to the ClusterRoles `admin`, `edit`, and `view`.
@@ -178,7 +178,7 @@ With `--service-accounts`, the service keeps these objects in every cluster that
 6. For `project-owner` and `project-member`, the ClusterRoleBinding `drover-<project>-<role>-create-ns`, to the Rancher ClusterRole `create-ns`.
 7. Per project role and per `--bind-cluster-role`, the ClusterRoleBinding `drover-<project>-<role>-clusterrole-<name>` to that ClusterRole. Per project role and per `--bind-role`, the RoleBinding `drover-<project>-<role>-role-<name>` in the namespace of the flag, to that Role. An operator gives every project ServiceAccount the same extra rights with these flags, for example the read of the platform objects that every tenant may see. The service does not read the roles, because a binding to a role that does not exist is valid. When a flag value is removed, the next reconcile run deletes its bindings. When the namespace of a `--bind-role` does not exist in a cluster, each reconcile run writes one warning for that cluster and counts one error. A bound ClusterRole must not grant `get` on `namespaces` without `resourceNames`. The API filter reads the `resourceNames` of that verb from the ClusterRoleBindings of a ServiceAccount for its namespace list, and a rule without names makes the filter deny every namespace list of every project ServiceAccount. See [the API filter document](api-filter.md).
 
-Every ServiceAccount and every binding has the labels `drover-project: <project>` and `drover-role: <role>`, and every binding has one subject. The account namespace has the label `drover-project: <project>`, without `drover-role`. The account namespace is the owner of the bindings, so the garbage collector deletes them together with the namespace.
+Every ServiceAccount and every binding has the labels `managed.drover.evil8.io/tenant-project: <project>` and `managed.drover.evil8.io/role: <role>`, and every binding has one subject. The account namespace has the label `managed.drover.evil8.io/tenant-project: <project>`, without `managed.drover.evil8.io/role`. The account namespace is the owner of the bindings, so the garbage collector deletes them together with the namespace.
 
 A tenant project is a project that is not the System project, the Default project, or an account project. The service finds the System project and the Default project by the labels `authz.management.cattle.io/system-project` and `authz.management.cattle.io/default-project`.
 
@@ -198,12 +198,12 @@ The service applies these rules:
 
 With `--openbao-address`, the service keeps these objects in every cluster that the reconcile run syncs, also in the Rancher cluster:
 
-1. The namespace `drover-openbao` in the account project, with the label `drover-role: openbao`.
+1. The namespace `drover-openbao` in the account project, with the label `managed.drover.evil8.io/role: openbao`.
 2. In that namespace, the ServiceAccount `openbao`, with the same label.
 3. In every account namespace `drover-<project>`, the Role `drover-openbao`. Its rules are `get` on `serviceaccounts` and `create` on `serviceaccounts/token`, both with the `resourceNames` `project-owner`, `project-member`, and `read-only`.
 4. In every account namespace, the RoleBinding `drover-openbao` to that Role, with only one subject, `drover-openbao/openbao`. The namespace `drover-openbao` is the owner of the RoleBinding, so the garbage collector deletes the RoleBinding together with that namespace.
 
-The Role and the RoleBinding have the labels `drover-project: <project>` and `drover-role: openbao`. The service applies these rules:
+The Role and the RoleBinding have the labels `managed.drover.evil8.io/tenant-project: <project>` and `managed.drover.evil8.io/role: openbao`. The service applies these rules:
 
 - The service uses the namespace `drover-openbao` only in an account project, as it does with an account namespace. A reconcile run trusts such a namespace after it checks that the namespace is in an account project. A tenant can create a namespace with that name first, in its own project. The service then writes a warning, writes no config for that cluster, and deletes every RoleBinding `drover-openbao` in the cluster.
 - The service moves a namespace `drover-openbao` that is in no project into the account project. It does this only when the namespace is the owner of a RoleBinding `drover-openbao` in an account namespace.
@@ -259,11 +259,11 @@ The names are the same as the names of the earlier operator objects, so a client
 
 ## Login roles
 
-With `--trust-file`, a project owner can let an outside workload, for example a CI job, log in to OpenBao with a project role. The owner writes trust statements into the annotation `drover-trust` of the Project object. A statement is one entry of the JSON document in that annotation.
+With `--trust-file`, a project owner can let an outside workload, for example a CI job, log in to OpenBao with a project role. The owner writes trust statements into the annotation `drover.evil8.io/trust-policy` of the Project object. A statement is one entry of the JSON document in that annotation.
 
-The service writes one OpenBao login role per valid statement. A login role is a role of the JWT auth method or of the AWS auth method of OpenBao. OpenBao gives the token of a login role the ACL policy of one project role, see [Mounts, roles, and policies](#mounts-roles-and-policies). The service reports the result in the annotation `drover-trust-status`.
+The service writes one OpenBao login role per valid statement. A login role is a role of the JWT auth method or of the AWS auth method of OpenBao. OpenBao gives the token of a login role the ACL policy of one project role, see [Mounts, roles, and policies](#mounts-roles-and-policies). The service reports the result in the annotation `managed.drover.evil8.io/trust-policy-status`.
 
-The rules file contains both annotation keys, so a deployer can choose other keys. The service never copies the two annotations to a namespace. It does not accept them in `--annotations` and `--name-annotation`.
+The rules file contains both annotation keys, so a deployer can choose other keys. The status key must be under `managed.drover.evil8.io`, because an admission policy of the chart protects that domain against a write of a tenant. The trust key must not be under that domain, because a project owner writes it. The service never copies the two annotations to a namespace. It does not accept them in `--annotations` and `--name-annotation`.
 
 ### The trust annotation
 
@@ -310,8 +310,8 @@ The service reads the rules from the file of `--trust-file`, at the start and at
 
 ```json
 {
-  "annotation": "drover-trust",
-  "statusAnnotation": "drover-trust-status",
+  "annotation": "drover.evil8.io/trust-policy",
+  "statusAnnotation": "managed.drover.evil8.io/trust-policy-status",
   "maxStatements": 20,
   "audience": "https://openbao.example.com",
   "loginTokenTTL": "5m",
@@ -325,7 +325,7 @@ The service reads the rules from the file of `--trust-file`, at the start and at
 
 | Key | Rule |
 | --- | --- |
-| `annotation`, `statusAnnotation` | Two different valid annotation keys. |
+| `annotation`, `statusAnnotation` | Two valid annotation keys. `statusAnnotation` starts with `managed.drover.evil8.io/`, and `annotation` is not under that domain. |
 | `maxStatements` | 1 to 100. |
 | `audience` | Not empty. The service binds every JWT login role to this audience. |
 | `loginTokenTTL` | A Go duration from `1m` to `24h`. It is the lifetime of a token of a login role. |
@@ -352,7 +352,7 @@ The service sends every field from which OpenBao can give a token more rights or
 
 ### The status annotation
 
-The service writes `drover-trust-status` with a JSON merge patch of only that key. The request is `PATCH /k8s/clusters/local/apis/management.cattle.io/v3/namespaces/<cluster id>/projects/<project>`. The keys of the status have this order:
+The service writes the status annotation with a JSON merge patch of only that key. The request is `PATCH /k8s/clusters/local/apis/management.cattle.io/v3/namespaces/<cluster id>/projects/<project>`. The keys of the status have this order:
 
 ```json
 {
