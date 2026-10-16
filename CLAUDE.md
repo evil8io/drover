@@ -7,7 +7,7 @@ Write a rule in the imperative. Give the reason for the rule. Delete a line when
 ## Public repository
 
 - This repository is public. Do not write a company name, a customer name, an environment name, or an issue tracker ID anywhere. This rule applies to code, comments, commit messages, branch names, and pull request text. Link an issue from the tracker to the pull request by hand. The domain `drover.evil8.io` in the key prefixes is the one exception, because the GitHub organisation is already in the module path.
-- Put every key that drover writes on a Kubernetes object under the prefix `managed.drover.evil8.io/`, for example `managed.drover.evil8.io/synced-labels`. An admission policy of the chart protects that prefix on every kind, so a key under another prefix has no protection. Put a key that a user writes for drover under the prefix `drover.evil8.io/`, for example the trust annotation. Do not put a key that a user writes under the managed prefix, because the policy then denies the write.
+- Put every key of drover itself under the prefix `managed.drover.evil8.io/`, for example `managed.drover.evil8.io/synced-labels`. The keys that project-sync copies from a Rancher project to its namespaces are keys of the project, not of drover, and they keep their names. Through a policy of the chart, the API server denies a write of a tenant to a key under that prefix, on every kind. The API server does not protect a key under another prefix. Put a key that a user writes for drover under the prefix `drover.evil8.io/`, for example the trust annotation. Do not put a key that a user writes under the managed prefix, because the API server then denies the write.
 
 ## Wiring
 
