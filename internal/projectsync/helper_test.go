@@ -35,11 +35,11 @@ const (
 	// the project annotation next to the label on every namespace of a
 	// project; alpha-three has neither, and alpha-orphan's annotation names a
 	// project that the snapshot does not have.
-	alphaOneItem    = `{"metadata":{"name":"alpha-one","resourceVersion":"11","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1","tier":"gold"},"annotations":{"owner":"alpha@example.com","drover-managed-labels":"cost-center","drover-managed-annotations":"owner","field.cattle.io/projectId":"c-1:p-alpha"}}}`
+	alphaOneItem    = `{"metadata":{"name":"alpha-one","resourceVersion":"11","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1","tier":"gold"},"annotations":{"owner":"alpha@example.com","managed.drover.evil8.io/synced-labels":"cost-center","managed.drover.evil8.io/synced-annotations":"owner","field.cattle.io/projectId":"c-1:p-alpha"}}}`
 	alphaTwoItem    = `{"metadata":{"name":"alpha-two","resourceVersion":"12","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"old","tier":"gold"},"annotations":{"field.cattle.io/projectId":"c-1:p-alpha"}}}`
 	alphaThreeItem  = `{"metadata":{"name":"alpha-three","resourceVersion":"13","labels":{"other":"value"},"annotations":{}}}`
 	alphaOrphanItem = `{"metadata":{"name":"alpha-orphan","resourceVersion":"14","labels":{"field.cattle.io/projectId":"p-gone"},"annotations":{"field.cattle.io/projectId":"c-1:p-gone"}}}`
-	alphaMovedItem  = `{"metadata":{"name":"alpha-moved","resourceVersion":"15","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1","tier":"gold"},"annotations":{"owner":"alpha@example.com","drover-managed-labels":"cost-center,tier","drover-managed-annotations":"owner","field.cattle.io/projectId":"c-1:p-alpha"}}}`
+	alphaMovedItem  = `{"metadata":{"name":"alpha-moved","resourceVersion":"15","labels":{"field.cattle.io/projectId":"p-alpha","cost-center":"cc-1","tier":"gold"},"annotations":{"owner":"alpha@example.com","managed.drover.evil8.io/synced-labels":"cost-center,tier","managed.drover.evil8.io/synced-annotations":"owner","field.cattle.io/projectId":"c-1:p-alpha"}}}`
 
 	alphaNamespaces = `{"kind":"NamespaceList","items":[` +
 		alphaOneItem + `,` + alphaTwoItem + `,` + alphaThreeItem + `,` + alphaOrphanItem + `,` + alphaMovedItem + `]}`

@@ -1,6 +1,6 @@
 {
-  "annotation": "drover-trust",
-  "statusAnnotation": "drover-trust-status",
+  "annotation": "drover.evil8.io/trust-policy",
+  "statusAnnotation": "managed.drover.evil8.io/trust-policy-status",
   "maxStatements": 3,
   "audience": "https://openbao.example.com",
   "loginTokenTTL": "5m",

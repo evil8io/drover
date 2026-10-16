@@ -20,14 +20,14 @@ const (
 	// of a cluster. A project owner can set it on its own project, so the
 	// service trusts it only together with the creator annotation, see
 	// isAccountProject.
-	accountProjectLabel = "drover-service-accounts"
+	accountProjectLabel = managedPrefix + "account-project"
 	// accountProjectName is the display name of a new account project.
 	accountProjectName = "drover"
 
 	// accountProjectKey and accountRoleKey label every object of the
 	// accounts: the tenant project name, and the role.
-	accountProjectKey = "drover-project"
-	accountRoleKey    = "drover-role"
+	accountProjectKey = managedPrefix + "tenant-project"
+	accountRoleKey    = managedPrefix + "role"
 
 	// accountPrefix starts the name of an account namespace, a role binding,
 	// and a cluster role binding of the service.

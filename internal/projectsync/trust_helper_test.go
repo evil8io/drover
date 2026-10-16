@@ -15,8 +15,8 @@ import (
 const (
 	// trustRulesPath is the rules file of the fixture set.
 	trustRulesPath = "testdata/trust/rules.json"
-	trustKey       = "drover-trust"
-	trustStatusKey = "drover-trust-status"
+	trustKey       = "drover.evil8.io/trust-policy"
+	trustStatusKey = "managed.drover.evil8.io/trust-policy-status"
 	githubMount    = "auth/jwt/github"
 )
 

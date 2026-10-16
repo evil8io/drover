@@ -25,13 +25,22 @@ const (
 )
 
 const (
+	// managedDomain is the domain of every key that the service writes on a
+	// Kubernetes object. An admission policy of the chart protects the keys
+	// under managedPrefix on every kind. A key under another prefix has no
+	// protection, so the service writes no such key.
+	managedDomain = "managed.drover.evil8.io"
+	managedPrefix = managedDomain + "/"
+)
+
+const (
 	// managedLabelsKey and managedAnnotationsKey are the annotations that hold
 	// the label keys and the annotation keys that the service wrote on a
 	// namespace. The service removes a key of that list once the project of the
 	// namespace no longer sets it. A key outside the list belongs to the tenant,
 	// and the service never removes it.
-	managedLabelsKey      = "drover-managed-labels"
-	managedAnnotationsKey = "drover-managed-annotations"
+	managedLabelsKey      = managedPrefix + "synced-labels"
+	managedAnnotationsKey = managedPrefix + "synced-annotations"
 )
 
 // namespaceKeys returns the label keys and the annotation keys of a namespace
@@ -67,32 +76,51 @@ func ParseKeys(list string) ([]string, error) {
 	return keys, nil
 }
 
+// checkKey returns an error when key is not a valid key for a copy list or
+// a name key. Such a key is a valid Kubernetes key outside the reserved
+// domains and outside managedDomain.
 func checkKey(key string) error {
-	if key == "" {
-		return errors.New("a metadata key is empty")
+	prefix, err := checkKeySyntax(key)
+	if err != nil {
+		return err
 	}
-	if slices.Contains([]string{managedLabelsKey, managedAnnotationsKey}, key) {
-		return fmt.Errorf("the metadata key %q is reserved, because the service writes it itself", key)
+	if underDomain(prefix, managedDomain) {
+		return fmt.Errorf("the metadata key %q is under %s, and the service writes its own keys under that domain", key, managedDomain)
+	}
+	return nil
+}
+
+// checkKeySyntax returns the prefix of key, and an error when key is not a
+// valid Kubernetes label or annotation key, or when key is under a reserved
+// domain. The prefix of a key without a slash is empty.
+func checkKeySyntax(key string) (string, error) {
+	if key == "" {
+		return "", errors.New("a metadata key is empty")
 	}
 	prefix, name, hasPrefix := strings.Cut(key, "/")
 	if !hasPrefix {
 		prefix, name = "", key
 	}
 	if name == "" {
-		return fmt.Errorf("the metadata key %q has no name after the prefix", key)
+		return "", fmt.Errorf("the metadata key %q has no name after the prefix", key)
 	}
 	if len(name) > maxKeyNameLength || !qualifiedName.MatchString(name) {
-		return fmt.Errorf("the metadata key %q has no valid name: at most %d characters, alphanumeric at both ends, with - _ . inside", key, maxKeyNameLength)
+		return "", fmt.Errorf("the metadata key %q has no valid name: at most %d characters, alphanumeric at both ends, with - _ . inside", key, maxKeyNameLength)
 	}
 	if hasPrefix && (len(prefix) > maxKeyPrefixLength || !dnsSubdomain.MatchString(prefix)) {
-		return fmt.Errorf("the metadata key %q has no valid prefix: a DNS subdomain in lower case, at most %d characters", key, maxKeyPrefixLength)
+		return "", fmt.Errorf("the metadata key %q has no valid prefix: a DNS subdomain in lower case, at most %d characters", key, maxKeyPrefixLength)
 	}
 	for _, domain := range reservedDomains {
-		if prefix == domain || strings.HasSuffix(prefix, "."+domain) {
-			return fmt.Errorf("the metadata key %q is under %s, and Rancher or Kubernetes owns that domain", key, domain)
+		if underDomain(prefix, domain) {
+			return "", fmt.Errorf("the metadata key %q is under %s, and Rancher or Kubernetes owns that domain", key, domain)
 		}
 	}
-	return nil
+	return prefix, nil
+}
+
+// underDomain reports whether prefix is domain or a subdomain of domain.
+func underDomain(prefix, domain string) bool {
+	return prefix == domain || strings.HasSuffix(prefix, "."+domain)
 }
 
 // checkRecord returns an error when the ownership record of keys and nameKey
