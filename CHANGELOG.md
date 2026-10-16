@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.28.0](https://github.com/evil8io/drover/compare/v0.27.3...v0.28.0) (2026-10-16)
+
+
+### ⚠ BREAKING CHANGES
+
+* **project-sync:** every key that project-sync writes is under managed.drover.evil8.io/, and the default trust annotation is drover.evil8.io/trust-policy.
+
+### Features
+
+* **project-sync:** move the keys of the service to the prefix managed.drover.evil8.io ([#147](https://github.com/evil8io/drover/issues/147)) ([8c0cd44](https://github.com/evil8io/drover/commit/8c0cd447ab1deb48035fe1fe0696d0ef0d6536d1))
+
 ## [0.27.3](https://github.com/evil8io/drover/compare/v0.27.2...v0.27.3) (2026-10-15)
 
 
