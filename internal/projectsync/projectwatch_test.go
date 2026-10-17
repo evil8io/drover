@@ -40,6 +40,7 @@ func alphaFrame(t *testing.T, eventType string, edit func(*projectObject)) strin
 		"note":  "outside the allow list",
 		"lifecycle.cattle.io/create.mgmt-project-rbac-remove": "true",
 		"authz.management.cattle.io/creator-role-bindings":    "{}",
+		namespaceCountKey: "3",
 	}
 	object.Spec.ClusterName = "c-1"
 	object.Spec.DisplayName = "Alpha"
@@ -444,8 +445,10 @@ func TestProjectWatchSkipsANameAbove63Characters(t *testing.T) {
 // gives about one second.
 func TestProjectListTakesATokenOfTheClusterLimiter(t *testing.T) {
 	t.Parallel()
+	// The list has two namespaces of p-alpha, so the run writes the count 2.
 	frame := alphaFrame(t, watchModified, func(object *projectObject) {
 		object.Metadata.Labels["cost-center"] = "cc-9"
+		object.Metadata.Annotations[namespaceCountKey] = "2"
 	})
 	page := `{"kind":"NamespaceList","items":[` + alphaOneItem + `,` + alphaTwoItem + `]}`
 	p := newProjectTest(t, []func(*fakeRancher){
@@ -586,24 +589,45 @@ func TestProjectQueueCoalescesAStormOfOneProject(t *testing.T) {
 	}
 }
 
-func TestPatchQueueKeepsTheOriginOfTheNewerItem(t *testing.T) {
+// TestPatchQueueLetsOnlyAWatchItemReplaceAWaitingItem checks the two orders
+// of a watch item and a lister item of one namespace. The list of the lister
+// can be older than a waiting watch item, so a lister item never replaces a
+// waiting item. A watch item replaces any waiting item.
+func TestPatchQueueLetsOnlyAWatchItemReplaceAWaitingItem(t *testing.T) {
 	t.Parallel()
-	patches := newClusterWatch(1).patches
-	var target namespace
-	target.Metadata.Name = "alpha-two"
-	patches.put(patchItem{target: target, origin: originWatch})
-	patches.put(patchItem{target: target, origin: originProject})
+	tests := []struct {
+		name          string
+		first, second string
+	}{
+		{name: "a lister item after a watch item", first: originWatch, second: originProject},
+		{name: "a watch item after a lister item", first: originProject, second: originWatch},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			patches := newClusterWatch(1).patches
+			var target namespace
+			target.Metadata.Name = "alpha-two"
+			for _, origin := range []string{tt.first, tt.second} {
+				if origin == originProject {
+					patches.add(patchItem{target: target, origin: origin})
+				} else {
+					patches.put(patchItem{target: target, origin: origin})
+				}
+			}
 
-	item, ok := patches.next(context.Background())
-	if !ok {
-		t.Fatal("next returned no namespace")
-	}
-	patches.done()
-	if item.origin != originProject {
-		t.Errorf("origin = %q, want %q", item.origin, originProject)
-	}
-	if !patches.idle() {
-		t.Error("the queue has work after one namespace")
+			item, ok := patches.next(context.Background())
+			if !ok {
+				t.Fatal("next returned no namespace")
+			}
+			patches.done()
+			if item.origin != originWatch {
+				t.Errorf("origin = %q, want %q", item.origin, originWatch)
+			}
+			if !patches.idle() {
+				t.Error("the queue has work after one namespace")
+			}
+		})
 	}
 }
 

@@ -4,6 +4,8 @@ This service copies labels and annotations of a Rancher project to every namespa
 
 The service polls Rancher at every `--interval`, in a reconcile run. It also keeps one namespace watch per cluster open, so that a new namespace gets its keys within a few seconds. It keeps one project watch open too. When a label, an annotation, or the display name of a project changes, the namespaces of the project get the change within seconds. One replica is enough, because every reconcile run is a full reconcile.
 
+The service also writes the namespace count of each project into an annotation of the Project object. See [The namespace count](#the-namespace-count).
+
 Status 403 for the namespace list of a cluster means that the service user does not have the right to list namespaces on that cluster. The service then writes a warning with the cluster id and continues with the next cluster.
 
 With `--service-accounts`, the service also keeps three ServiceAccounts per project of a tenant, one per project role. A CI job of a project authenticates with a token of such a ServiceAccount, through the Rancher proxy. See [Service accounts](#service-accounts).
@@ -15,9 +17,11 @@ With `--trust-file` as well, the service writes an OpenBao login role for each v
 ## Requirements
 
 1. The service needs a Rancher service user with `get`, `list`, `watch`, and `patch` on `namespaces`, in every cluster whose namespaces the service syncs. With a `cluster-owner` binding, the user also has these rights.
-2. The same service user needs `list` and `watch` on `projects` of `management.cattle.io`, cluster-wide, in the Rancher cluster. The Rancher cluster is the cluster that Rancher itself runs in. Its cluster id is `local`. The user gets these rights from a `ClusterRoleTemplateBinding` on that cluster, with a role template that has those two verbs. The user does not get them from the bindings on the other clusters.
+2. The same service user needs `list`, `watch`, and `patch` on `projects` of `management.cattle.io`, cluster-wide, in the Rancher cluster. The Rancher cluster is the cluster that Rancher itself runs in. Its cluster id is `local`. The user gets these rights from a `ClusterRoleTemplateBinding` on that cluster, with a role template that has those three verbs. The user does not get them from the bindings on the other clusters.
 
-   Without these rights, Rancher answers a request of the project watch with status 403. The service then writes one warning per attempt, with the backoff between attempts. The periodic reconcile run continues without the project watch.
+   Without `list` and `watch`, Rancher answers a request of the project watch with status 403. The service then writes one warning per attempt, with the backoff between attempts. The periodic reconcile run continues without the project watch.
+
+   The service writes the [namespace count](#the-namespace-count) of a project with the `patch` right. With `--trust-file`, it also writes the [status annotation](#the-status-annotation) with this right.
 3. The service needs an API token of that service user, in a Secret that the service mounts.
 4. With `--service-accounts`, the same service user also needs these rights in every cluster, and in the Rancher cluster through a `ClusterRoleTemplateBinding`:
    - every verb on `namespaces`, and `create` and `manage-namespaces` on `projects` of `management.cattle.io`. With these rights, the user has every rule of the Rancher ClusterRoles `<project>-namespaces-edit` and `<project>-namespaces-readonly`, so it can bind them without `bind`.
@@ -58,8 +62,7 @@ With `--trust-file` as well, the service writes an OpenBao login role for each v
    ```
 
    OpenBao connects to each cluster through the Rancher proxy, with a ServiceAccount token of that cluster. Rancher accepts such a token only for a cluster with `enabled: true` in its `ClusterProxyConfig`. See [the API filter document](api-filter.md).
-7. With `--trust-file`, the same service user also needs `patch` on `projects` of `management.cattle.io`, cluster-wide, in the Rancher cluster. Add this rule to the GlobalRole of the service user. The service writes the status annotation of a project with this right.
-8. With `--trust-file`, the ACL policy of item 6 also needs the paths that follow. OpenBao also needs a JWT auth mount at `auth/jwt/<issuer>` for each issuer of the rules file. For the AWS method, OpenBao needs an AWS auth mount at `auth/aws`. The service does not create these auth mounts.
+7. With `--trust-file`, the ACL policy of item 6 also needs the paths that follow. OpenBao also needs a JWT auth mount at `auth/jwt/<issuer>` for each issuer of the rules file. For the AWS method, OpenBao needs an AWS auth mount at `auth/aws`. The service does not create these auth mounts.
 
    ```hcl
    path "auth/jwt/+/role/*" {
@@ -132,6 +135,37 @@ The service removes a key in one of these lists when the project of the namespac
 
 A key outside these lists belongs to the tenant, and the service never removes it. The lists are on the namespace, so a tenant can edit them. The service therefore removes only a key of `--labels`, `--annotations`, `--name-label`, or `--name-annotation`. It ignores every other key of the lists. The service does not accept a key under `managed.drover.evil8.io` in `--labels`, `--annotations`, `--name-label`, and `--name-annotation`, because it writes its own keys under that domain.
 
+## The namespace count
+
+The service writes the namespace count of each project into the annotation `managed.drover.evil8.io/namespace-count` of the Project object. The namespace count is the number of namespaces of the project. The admission policy of the chart denies a write of a tenant to each key under `managed.drover.evil8.io`. The service writes the namespace count in every mode, also without `--service-accounts`. It writes the namespace count of every project, also of the System project, the Default project, and the account project.
+
+A namespace counts for a project when its project annotation `field.cattle.io/projectId` has the value `<cluster id>:<project>` of that project, with the id of the cluster of the namespace. A namespace in `Terminating` counts until the API server deletes it, or until it leaves its project. The service writes the namespace count at these times:
+
+- In each reconcile run, after the namespace list of a cluster. The run writes the namespace count of each project of that cluster whose annotation has another value.
+- Within seconds after a namespace event. The worker of the cluster writes the namespace count of each project that the namespace joined or left, when the annotation has another value.
+
+The service compares the namespace count with the annotation value in its copy of the project. A project without the annotation therefore gets the namespace count in the next reconcile run. A project without namespaces gets the value `"0"`. The service treats an annotation value of more than 20 bytes as absent, and it replaces that value. After an upgrade to a release with the namespace count, the first reconcile run patches every project once.
+
+The service keeps the namespaces of each project in memory, in the namespace sets. The reconcile run builds the namespace sets of a cluster again from its namespace list. The service keeps each change of the worker during that list request, and applies these changes again on top of the list. A change of the annotation starts no namespace list and no namespace patch. When the count of a project event differs from the count in the namespace sets, the project watch writes the namespace count again, with a token of the rate limiter of the cluster. This corrects an event that the project watch gets after a later write of the worker, and a manual edit of the annotation.
+
+The service writes the annotation with a JSON merge patch of only that key. The request is `PATCH /k8s/clusters/local/apis/management.cattle.io/v3/namespaces/<cluster id>/projects/<project>`. A 404 or a 409 answer is not an error. A failed patch in a reconcile run counts as an error of the run. The next reconcile run repeats a failed patch of the worker or of the project watch.
+
+The annotation value can differ from the number of namespaces in these cases:
+
+- The annotation value changes some seconds after a namespace create or delete. The namespace watch gets only the namespaces with the project label, and Rancher sets that label about three seconds after the create. The worker also waits for a token of the rate limiter of the cluster.
+- After a start of the service, the worker writes no namespace count for a cluster before the first namespace list of that cluster. The same applies to a cluster that returns to the project list.
+- While the service is down, the annotation value does not change.
+
+The admission policy of the chart reads the annotation on a Project DELETE. It denies the delete when the value is not `"0"`. A deployment tool that reads back every annotation of a Project shows this key as drift. Configure the tool to ignore the key.
+
+The service writes these log lines for the namespace count:
+
+| Line | Level | Fields |
+| --- | --- | --- |
+| `the namespace count is written` | info | `cluster`, `project`, `count` |
+| `the namespace count patch failed` | warn | `cluster`, `project`, `error` |
+| `the namespace count patch is skipped` | debug | `cluster`, `project`, `error` |
+
 ## Design
 
 The service polls `GET /v3/projects` at every interval. With one list per interval, the service gets every project that the service user can see, because Rancher filters that list by RBAC. The service takes the set of clusters from the `clusterId` of those projects, so it needs no cluster list of its own. One reconcile run syncs at most 8 clusters at the same time.
@@ -140,7 +174,7 @@ The reconcile run lists every namespace of a cluster, also a namespace without t
 
 For each namespace, the service keeps in memory only the keys that it reads for the sync. These are the project label, the project annotation, the two ownership annotations, and the keys of `--labels`, `--annotations`, `--name-label`, and `--name-annotation`. The service keeps the metadata under other keys in memory only while it decodes that namespace. A tenant can fill an ownership annotation up to the size limit of the API server for annotations, 256 KiB. The service therefore treats an ownership annotation above 4096 bytes as absent, because a list that the service writes is a short list of keys. The service replaces that annotation in the next patch, when the new list of keys is not empty.
 
-The service also lists the projects in pages of 500. For each project, it keeps only the keys of `--labels` and `--annotations`. With `--trust-file`, it also keeps the two annotations of the [login roles](#login-roles).
+The service also lists the projects in pages of 500. For each project, it keeps only the keys of `--labels` and `--annotations`, and the [namespace count](#the-namespace-count) annotation. With `--trust-file`, it also keeps the two annotations of the [login roles](#login-roles).
 
 The service reads at most 4 MiB of one item of any list, and it sets no limit on a page. This limit is above the default object limit of etcd, 1.5 MiB. Many large namespaces of one tenant on one page thus do not stop the list of the cluster. When a namespace is larger, the reconcile run fails for that cluster only, with an error that contains the limit in bytes. When a project is larger, the whole reconcile run fails. When an item of another list is larger, only the work that needs that list fails.
 
@@ -150,17 +184,17 @@ When a stream ends without an error after at least 10 s, the service starts a ne
 
 The watch puts the namespace of an event into the patch queue of its cluster, with the namespace name as the key. One worker per cluster patches the namespaces of that queue, one at a time. After a second event of a namespace, the queue contains only the second event for that namespace. For several events on one namespace before its patch, the worker thus sends one patch.
 
-The worker and the lister of a cluster share one rate limiter, with `--patch-rate` tokens per second. Each request of the worker or the lister to Rancher takes one token. A namespace that needs no request takes no token. So when the watch starts without a resource version, the `ADDED` event of a namespace in the wanted state does not wait for the limiter. One project event sends 1 request for the namespace list. With `--service-accounts`, it sends 3 more requests when every account object exists, and 8 more with `--openbao-address`. The burst is equal to the rate, with a minimum of 1.
+The worker and the lister of a cluster share one rate limiter, with `--patch-rate` tokens per second. Each request of the worker or the lister to Rancher takes one token. A namespace that needs no request takes no token. So when the watch starts without a resource version, the `ADDED` event of a namespace in the wanted state does not wait for the limiter. A namespace event that changes the namespace count of a project sends 1 patch of that project, and a move between two projects sends 2. One project event sends 1 request for the namespace list. With `--service-accounts`, it sends 3 more requests when every account object exists, and 8 more with `--openbao-address`. The burst is equal to the rate, with a minimum of 1.
 
 A patch of a namespace that no longer exists, or of a namespace in `Terminating`, is not an error. The service skips it, and the next reconcile run repeats the work.
 
-The service also keeps one project watch open, on `GET /k8s/clusters/local/apis/management.cattle.io/v3/projects?watch=true`, with the same timeout and backoff as the namespace watch. The watch decodes a Project object into the same fields that the service reads from the project list. These are the project id, the cluster id, the display name, the allow-listed labels and annotations, and the two annotations of the login roles. When the watch starts again without a resource version, it gets the full project list again, as an `ADDED` event per project. For each such event, the service only compares the project with its copy in memory, so the service sends no request because of the restart.
+The service also keeps one project watch open, on `GET /k8s/clusters/local/apis/management.cattle.io/v3/projects?watch=true`, with the same timeout and backoff as the namespace watch. The watch decodes a Project object into the same fields that the service reads from the project list. These are the project id, the cluster id, the display name, the allow-listed labels and annotations, the namespace count annotation, and the two annotations of the login roles. When the watch starts again without a resource version, it gets the full project list again, as an `ADDED` event per project. For each such event, the service only compares the project with its copy in memory, so the service sends no request because of the restart.
 
 The service skips a project of a cluster that the last reconcile run did not see. The next reconcile run handles that project. The service thus syncs a new cluster only in the next reconcile run, as it did before the project watch was added. The service skips a Project object whose `metadata.namespace` differs from its `spec.clusterName`, and it writes a warning. The service also skips a project whose name is not a valid label value, because no namespace can have that name in its project label.
 
 When a project changes, the service updates the copy of the project that it keeps from the last reconcile run. It then puts the project name on the project queue of the cluster. After a second event of the same project, the queue contains only the second event for that project. For several events on one project before the lister takes it, the lister thus sends one list.
 
-One lister per cluster takes a project from the project queue. It lists the namespaces of the cluster with the label selector `field.cattle.io/projectId=<name>`, in pages of 500, as the reconcile run does. It puts each such namespace on the patch queue of the cluster, with the origin `project`. The worker of the cluster then patches these namespaces as it patches the namespaces that the namespace watch finds.
+One lister per cluster takes a project from the project queue. It lists the namespaces of the cluster with the label selector `field.cattle.io/projectId=<name>`, in pages of 500, as the reconcile run does. It puts each such namespace on the patch queue of the cluster, with the origin `project`. When the queue has a waiting item of a namespace, the lister keeps that item, because its list can be older than that item. The worker of the cluster then patches these namespaces as it patches the namespaces that the namespace watch finds.
 
 When the display name changes, the service first clears the name cache of the worker, so that the worker computes the new label value. When a list fails, the service writes a warning, and the next reconcile run repeats the work. For status 403, the service writes the same warning as for a failed namespace list of the reconcile run.
 
@@ -325,7 +359,7 @@ The service reads the rules from the file of `--trust-file`, at the start and at
 
 | Key | Rule |
 | --- | --- |
-| `annotation`, `statusAnnotation` | Two valid annotation keys. `statusAnnotation` starts with `managed.drover.evil8.io/`, and `annotation` is not under that domain. |
+| `annotation`, `statusAnnotation` | Two valid annotation keys. `statusAnnotation` starts with `managed.drover.evil8.io/`, and `annotation` is not under that domain. `statusAnnotation` is not `managed.drover.evil8.io/namespace-count`, the key of the [namespace count](#the-namespace-count). |
 | `maxStatements` | 1 to 100. |
 | `audience` | Not empty. The service binds every JWT login role to this audience. |
 | `loginTokenTTL` | A Go duration from `1m` to `24h`. It is the lifetime of a token of a login role. |

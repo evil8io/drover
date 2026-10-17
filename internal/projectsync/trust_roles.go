@@ -453,9 +453,7 @@ func (s *Syncer) writeTrustStatus(ctx context.Context, run *trustRun, cluster, n
 		value = &text
 	}
 
-	path := clusterPath(rancherCluster) + managementProjects + cluster + "/projects/" + name
-	body := map[string]any{"metadata": map[string]any{"annotations": map[string]*string{run.rules.statusAnnotation: value}}}
-	err := s.send(ctx, run.token, http.MethodPatch, path, body, nil)
+	err := s.patchProjectAnnotation(ctx, run.token, cluster, name, run.rules.statusAnnotation, value)
 	if hasStatus(err, http.StatusNotFound, http.StatusConflict) {
 		s.logger.DebugContext(ctx, "the trust status patch is skipped",
 			"cluster", cluster, "project", name, "error", err.Error())

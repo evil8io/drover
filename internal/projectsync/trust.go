@@ -163,6 +163,9 @@ func parseTrustRules(data []byte) (*trustRules, error) {
 	if !strings.HasPrefix(file.StatusAnnotation, managedPrefix) {
 		return nil, fmt.Errorf("statusAnnotation %q is not under %s, and the admission policy of the chart protects only that prefix", file.StatusAnnotation, managedPrefix)
 	}
+	if file.StatusAnnotation == namespaceCountKey {
+		return nil, fmt.Errorf("statusAnnotation %q is the namespace count annotation of the service", file.StatusAnnotation)
+	}
 	if file.MaxStatements < 1 || file.MaxStatements > maxStatementsCap {
 		return nil, fmt.Errorf("maxStatements %d is not 1 to %d", file.MaxStatements, maxStatementsCap)
 	}

@@ -21,12 +21,14 @@ const (
 	serviceToken = "service"
 	userAgent    = "drover/test"
 
+	// The namespace count of each project is the count of its namespaces in
+	// the fixed list of its cluster.
 	alphaProject = `{"id":"c-1:p-alpha","clusterId":"c-1","name":"Alpha",` +
 		`"labels":{"cost-center":"cc-1","team":"team-a"},` +
-		`"annotations":{"owner":"alpha@example.com","note":"outside the allow list"}}`
+		`"annotations":{"owner":"alpha@example.com","note":"outside the allow list","managed.drover.evil8.io/namespace-count":"3"}}`
 
 	betaProject = `{"id":"c-2:p-beta","clusterId":"c-2","name":"Beta",` +
-		`"labels":{"cost-center":"cc-2"},"annotations":{}}`
+		`"labels":{"cost-center":"cc-2"},"annotations":{"managed.drover.evil8.io/namespace-count":"1"}}`
 
 	// The five namespaces of cluster c-1. alpha-two and alpha-moved need a
 	// patch. alpha-one is in the wanted state already, and its tier label
@@ -70,6 +72,9 @@ type fakeRancher struct {
 
 	// paginate serves the project list in two pages.
 	paginate bool
+	// projects are the items of the project list, in one page. Nil selects
+	// alphaProject and betaProject.
+	projects []string
 	// forbidden is the cluster whose namespace list returns status 403.
 	forbidden string
 	// hangs are the clusters whose namespace list blocks until the request
@@ -83,6 +88,8 @@ type fakeRancher struct {
 	patchStatus map[string]int
 	// patchBody is the answer body of a patch that fails, by namespace name.
 	patchBody map[string]string
+	// patchHook sees the path of every patch before the answer.
+	patchHook func(path string)
 	// freshNamespaces are the bodies that answer a GET of one namespace, by
 	// name. This is the read that refreshItem makes after a DELETED event
 	// without a deletionTimestamp. A name without an entry gets status 404.
@@ -130,6 +137,11 @@ func newFakeRancher(t *testing.T, options ...func(*fakeRancher)) *fakeRancher {
 
 func paginated() func(*fakeRancher) {
 	return func(f *fakeRancher) { f.paginate = true }
+}
+
+// servingProjects serves items as the project list, in one page.
+func servingProjects(items ...string) func(*fakeRancher) {
+	return func(f *fakeRancher) { f.projects = items }
 }
 
 func forbid(cluster string) func(*fakeRancher) {
@@ -205,6 +217,11 @@ func failPatch(namespace string, status int, body string) func(*fakeRancher) {
 	}
 }
 
+// onPatch calls hook with the path of every patch before the answer.
+func onPatch(hook func(path string)) func(*fakeRancher) {
+	return func(f *fakeRancher) { f.patchHook = hook }
+}
+
 // refreshed serves body as the answer of a GET of the single namespace name.
 func refreshed(name, body string) func(*fakeRancher) {
 	return func(f *fakeRancher) {
@@ -256,6 +273,10 @@ func (f *fakeRancher) serve(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *fakeRancher) serveProjects(w http.ResponseWriter, r *http.Request) {
+	if f.projects != nil {
+		_, _ = io.WriteString(w, `{"type":"collection","data":[`+strings.Join(f.projects, ",")+`],"pagination":{}}`)
+		return
+	}
 	if !f.paginate {
 		_, _ = io.WriteString(w, `{"type":"collection","data":[`+alphaProject+`,`+betaProject+`],"pagination":{}}`)
 		return
@@ -293,6 +314,9 @@ func (f *fakeRancher) serveProjectWatch(w http.ResponseWriter, r *http.Request) 
 }
 
 func (f *fakeRancher) servePatch(w http.ResponseWriter, r *http.Request) {
+	if f.patchHook != nil {
+		f.patchHook(r.URL.Path)
+	}
 	name := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
 	if status, ok := f.patchStatus[name]; ok {
 		w.WriteHeader(status)
