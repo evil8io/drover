@@ -416,16 +416,19 @@ func TestWatchSendsNoPatchWhenTheRefreshFindsTheNamespaceGone(t *testing.T) {
 
 // TestWatchTakesNoTokenForANamespaceThatNeedsNoRequest checks the start of a
 // watch without a resource version: an ADDED event for every namespace, and
-// no namespace needs a patch. At 2 tokens per second, a token per namespace
-// makes the 10 namespaces take 4 s.
+// no namespace needs a patch. The namespace list of the run has the 10
+// namespaces too, so no event changes a namespace count. At 2 tokens per
+// second, a token per namespace makes the 10 namespaces take 4 s.
 func TestWatchTakesNoTokenForANamespaceThatNeedsNoRequest(t *testing.T) {
 	t.Parallel()
-	var frames []string
+	var frames, items []string
 	for i := range 10 {
-		frames = append(frames, `{"type":"ADDED","object":`+
-			strings.Replace(alphaOneItem, `"name":"alpha-one"`, `"name":"alpha-settled-`+strconv.Itoa(i)+`"`, 1)+`}`)
+		item := strings.Replace(alphaOneItem, `"name":"alpha-one"`, `"name":"alpha-settled-`+strconv.Itoa(i)+`"`, 1)
+		items = append(items, item)
+		frames = append(frames, `{"type":"ADDED","object":`+item+`}`)
 	}
-	rancher := newFakeRancher(t, watching("c-1", frames...))
+	page := `{"kind":"NamespaceList","items":[` + strings.Join(items, ",") + `]}`
+	rancher := newFakeRancher(t, watching("c-1", frames...), listing("c-1", map[string]string{"": page}))
 	syncer, _ := newSyncer(t, rancher, tokenFile(t, serviceToken), func(cfg *Config) {
 		cfg.PatchRate = 2
 	})

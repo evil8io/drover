@@ -133,10 +133,14 @@ func (s *Syncer) applyProject(ctx context.Context, watches *watchSet, eventType 
 		old.trust == item.project.trust &&
 		maps.Equal(old.Labels, item.project.Labels) &&
 		maps.Equal(old.Annotations, item.project.Annotations) {
-		// The service writes the status itself, so a new status is not a
-		// change. The service starts no work for that event.
-		if old.trustStatus != item.project.trustStatus {
+		// The service writes the status and the namespace count itself, so
+		// a new value of one of them is not a change. The service starts no
+		// work for that event.
+		if old.trustStatus != item.project.trustStatus || old.namespaceCount != item.project.namespaceCount {
 			s.setProject(cluster, item.name, item.project)
+		}
+		if old.namespaceCount != item.project.namespaceCount {
+			s.correctCount(ctx, watches, cluster, item.name)
 		}
 		s.logger.DebugContext(ctx, "project unchanged", "cluster", cluster, "project", id)
 		return
@@ -145,6 +149,9 @@ func (s *Syncer) applyProject(ctx context.Context, watches *watchSet, eventType 
 		s.logger.DebugContext(ctx, "project skipped, the cluster left the snapshot",
 			"cluster", cluster, "project", id)
 		return
+	}
+	if !known || old.namespaceCount != item.project.namespaceCount {
+		s.correctCount(ctx, watches, cluster, item.name)
 	}
 	nameChanged := old.Name != item.project.Name
 	s.metrics.projectChanged(ctx, cluster)
@@ -223,6 +230,6 @@ func (s *Syncer) listProject(ctx context.Context, cluster, name string, patches 
 		return
 	}
 	for _, item := range items {
-		patches.put(patchItem{target: item, origin: originProject})
+		patches.add(patchItem{target: item, origin: originProject})
 	}
 }

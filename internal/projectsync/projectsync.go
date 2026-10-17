@@ -143,6 +143,10 @@ type Syncer struct {
 	clusters map[string]map[string]project
 	accounts map[string]accountState
 
+	// counts are the namespace sets of the namespace count annotation, which
+	// the reconcile run and the worker write.
+	counts namespaceSets
+
 	// selfMu guards self, the id of the service user.
 	selfMu sync.Mutex
 	self   string
@@ -396,6 +400,7 @@ func (s *Syncer) reconcile(ctx context.Context) {
 	run.clusters = len(clusters)
 
 	names := slices.Sorted(maps.Keys(clusters))
+	s.counts.retain(names)
 	// A watcher outlives the run, so it gets the base context, not the span.
 	s.watches.update(base, names)
 	s.watches.startProjects(base)
@@ -483,6 +488,22 @@ func (s *Syncer) setProject(cluster, name string, item project) bool {
 	return true
 }
 
+// setNamespaceCount stores value as the namespace count of the project name
+// in the snapshot of cluster, as setProject does. It changes no other field,
+// and it stores nothing when the snapshot has no such project.
+func (s *Syncer) setNamespaceCount(cluster, name, value string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, ok := s.clusters[cluster][name]
+	if !ok {
+		return
+	}
+	item.namespaceCount = value
+	next := maps.Clone(s.clusters[cluster])
+	next[name] = item
+	s.clusters = withCluster(s.clusters, cluster, next)
+}
+
 // deleteProject removes a project name from the snapshot of cluster, as
 // setProject does. It returns false when the snapshot has no such cluster.
 func (s *Syncer) deleteProject(cluster, name string) bool {
@@ -541,12 +562,14 @@ func (s *Syncer) byCluster(ctx context.Context, projects []project) map[string]m
 	return clusters
 }
 
-// syncCluster syncs the namespaces and the accounts of one cluster. It returns
-// the OpenBao target of the cluster when the run keeps the OpenBao objects,
-// and nil otherwise.
+// syncCluster syncs the namespaces, the namespace counts, and the accounts of
+// one cluster. It returns the OpenBao target of the cluster when the run
+// keeps the OpenBao objects, and nil otherwise.
 func (s *Syncer) syncCluster(ctx context.Context, token, cluster string, projects map[string]project, run *counters) *openbaoTarget {
+	s.counts.beginList(cluster)
 	items, err := s.namespaces(ctx, token, cluster, "")
 	if err != nil {
+		s.counts.endList(cluster)
 		run.errors++
 		s.logListFailure(ctx, err, cluster)
 		if s.serviceAccounts {
@@ -554,6 +577,7 @@ func (s *Syncer) syncCluster(ctx context.Context, token, cluster string, project
 		}
 		return nil
 	}
+	s.counts.replace(cluster, items)
 	run.namespaces += len(items)
 
 	nameLabels := make(map[string]string)
@@ -578,6 +602,7 @@ func (s *Syncer) syncCluster(ctx context.Context, token, cluster string, project
 			run.patched++
 		}
 	}
+	s.writeCounts(ctx, token, cluster, projects, run)
 
 	if s.serviceAccounts {
 		return s.syncAccounts(ctx, token, cluster, projects, items, run)

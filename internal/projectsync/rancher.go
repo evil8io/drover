@@ -55,6 +55,10 @@ type project struct {
 	// namespace sync never copies them.
 	trust       trustValue
 	trustStatus string
+
+	// namespaceCount is the namespace count annotation. pruneProject sets it.
+	// The namespace sync never copies it.
+	namespaceCount string
 }
 
 // pagination is the part of the pagination of a Rancher collection that the
@@ -102,11 +106,12 @@ func (s *Syncer) pruneNamespace(item namespace) namespace {
 }
 
 // pruneProject returns item with only the labels and the annotations that the
-// sync copies. It also puts the trust annotation and the status annotation
-// into their own fields.
+// sync copies. It also puts the trust annotation, the status annotation, and
+// the namespace count annotation into their own fields.
 func (s *Syncer) pruneProject(item project) project {
 	item.reserved = item.Labels[systemProjectLabel] == "true" || item.Labels[defaultProjectLabel] == "true"
 	item.marked = item.Labels[accountProjectLabel] == "true"
+	item.namespaceCount = pruneNamespaceCount(item.Annotations[namespaceCountKey])
 	if rules := s.trustRules(); rules != nil {
 		item.trust = newTrustValue(item.Annotations[rules.annotation])
 		item.trustStatus = pruneTrustStatus(item.Annotations[rules.statusAnnotation])

@@ -616,8 +616,9 @@ func TestReconcileReadsAPageAboveTheSizeOfTheItems(t *testing.T) {
 	})
 	syncer.reconcile(context.Background())
 
-	if got := patchedPaths(rancher); !slices.Equal(got, []string{alphaTwoPath, betaOnePath}) {
-		t.Errorf("patched paths = %v, want [%s %s]", got, alphaTwoPath, betaOnePath)
+	// The page has one namespace of p-alpha, so the run also writes its count.
+	if got := patchedPaths(rancher); !slices.Equal(got, []string{alphaTwoPath, betaOnePath, alphaProjectPath}) {
+		t.Errorf("patched paths = %v, want [%s %s %s]", got, alphaTwoPath, betaOnePath, alphaProjectPath)
 	}
 	if !strings.Contains(logs.String(), "errors=0") {
 		t.Errorf("no summary line without errors:\n%s", logs.String())

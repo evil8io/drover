@@ -364,7 +364,8 @@ func (s *Syncer) patchWorker(ctx context.Context, cluster string, watch *cluster
 			clear(names)
 		default:
 		}
-		if item.refresh {
+		refreshed := item.refresh
+		if refreshed {
 			item, ok = s.refreshItem(ctx, cluster, item)
 		}
 		if ok && !item.deleted {
@@ -372,6 +373,9 @@ func (s *Syncer) patchWorker(ctx context.Context, cluster string, watch *cluster
 		}
 		if ok && s.serviceAccounts {
 			s.applyAccounts(ctx, cluster, watch, item, seen)
+		}
+		if ok {
+			s.applyCount(ctx, cluster, item, refreshed)
 		}
 		watch.patches.done()
 		if ctx.Err() != nil {
@@ -476,6 +480,27 @@ func (q *queue[T]) put(item T) {
 	if _, ok := q.pending[key]; !ok {
 		q.order = append(q.order, key)
 	}
+	q.pending[key] = item
+	q.mu.Unlock()
+
+	select {
+	case q.signal <- struct{}{}:
+	default:
+	}
+}
+
+// add stores item under its key, but only when no item of that key waits.
+// The lister uses it, because its list can be older than a waiting item of
+// the namespace watch.
+func (q *queue[T]) add(item T) {
+	key := q.key(item)
+
+	q.mu.Lock()
+	if _, ok := q.pending[key]; ok {
+		q.mu.Unlock()
+		return
+	}
+	q.order = append(q.order, key)
 	q.pending[key] = item
 	q.mu.Unlock()
 

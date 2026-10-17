@@ -320,11 +320,13 @@ func (f *accountsFake) requestsOfPath(path string) []recorded {
 	return out
 }
 
-// writes returns every request of a method other than GET, in order.
+// writes returns every request of a method other than GET, in order. It
+// leaves out the patches of the namespace count annotation, which
+// countWrites reads.
 func (f *accountsFake) writes() []recorded {
 	var out []recorded
 	for _, req := range f.all() {
-		if req.method != http.MethodGet {
+		if req.method != http.MethodGet && !isCountPatch(req) {
 			out = append(out, req)
 		}
 	}

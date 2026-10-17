@@ -140,6 +140,7 @@ func TestParseTrustRules(t *testing.T) {
 		{"trust key under the managed prefix", func(m map[string]any) { m["annotation"] = "managed.drover.evil8.io/trust" }, "writes its own keys under that domain"},
 		{"status key outside the managed prefix", func(m map[string]any) { m["statusAnnotation"] = "drover.evil8.io/trust-status" }, "is not under managed.drover.evil8.io/"},
 		{"status key of Kubernetes", func(m map[string]any) { m["statusAnnotation"] = "kubernetes.io/trust-status" }, "statusAnnotation: the metadata key"},
+		{"status key of the namespace count", func(m map[string]any) { m["statusAnnotation"] = namespaceCountKey }, "is the namespace count annotation"},
 		{"no limit", func(m map[string]any) { delete(m, "maxStatements") }, "maxStatements 0 is not 1 to 100"},
 		{"limit above 100", func(m map[string]any) { m["maxStatements"] = 101 }, "maxStatements 101"},
 		{"no audience", func(m map[string]any) { m["audience"] = "" }, "audience is empty"},
