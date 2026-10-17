@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.29.0](https://github.com/evil8io/drover/compare/v0.28.0...v0.29.0) (2026-10-17)
+
+
+### Features
+
+* **project-sync:** write the namespace count of each project to an annotation ([#152](https://github.com/evil8io/drover/issues/152)) ([c231f5d](https://github.com/evil8io/drover/commit/c231f5d3c0260e370cef07f9ddbe8224e0277ab1))
+
 ## [0.28.0](https://github.com/evil8io/drover/compare/v0.27.3...v0.28.0) (2026-10-16)
 
 
