@@ -1127,3 +1127,79 @@ func (f *accountsFake) serveNamespacedRoles(w http.ResponseWriter, r *http.Reque
 		http.NotFound(w, r)
 	}
 }
+
+// --- two clusters ---
+
+// otherCluster is the second cluster of twoClusters.
+const otherCluster = "c-2"
+
+// twoClusters serves the Rancher endpoints of two accounts fakes: first is
+// the cluster acctCluster, and second is the cluster otherCluster. Each fake
+// serves only acctCluster. So for second, the router changes each path and
+// project id of otherCluster to acctCluster, and it changes the project list
+// of second back to otherCluster.
+type twoClusters struct {
+	server        *httptest.Server
+	first, second *accountsFake
+}
+
+func newTwoClusters(t *testing.T) *twoClusters {
+	t.Helper()
+	c := &twoClusters{first: newAccountsFake(t), second: newAccountsFake(t)}
+	c.server = httptest.NewServer(http.HandlerFunc(c.serve))
+	t.Cleanup(c.server.Close)
+	return c
+}
+
+// rancherURL returns a config option that points the syncer at the router.
+func (c *twoClusters) rancherURL(t *testing.T) func(*Config) {
+	t.Helper()
+	target, err := url.Parse(c.server.URL)
+	if err != nil {
+		t.Fatalf("parse the server URL: %v", err)
+	}
+	return func(cfg *Config) { cfg.RancherURL = target }
+}
+
+func (c *twoClusters) serve(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet && r.URL.Path == projectsPath {
+		c.serveProjectList(w, r)
+		return
+	}
+	management := clusterPath(rancherCluster) + managementProjects
+	for _, prefix := range [][2]string{
+		{clusterPath(otherCluster) + "/", clusterPath(acctCluster) + "/"},
+		{management + otherCluster + "/", management + acctCluster + "/"},
+		{projectsPath + "/" + otherCluster + ":", projectsPath + "/" + acctCluster + ":"},
+	} {
+		if rest, ok := strings.CutPrefix(r.URL.Path, prefix[0]); ok {
+			r.URL.Path, r.URL.RawPath = prefix[1]+rest, ""
+			c.second.serve(w, r)
+			return
+		}
+	}
+	c.first.serve(w, r)
+}
+
+// serveProjectList answers the projects of both fakes, with the cluster id
+// otherCluster for the projects of second.
+func (c *twoClusters) serveProjectList(w http.ResponseWriter, r *http.Request) {
+	var items []project
+	for _, fake := range []*accountsFake{c.first, c.second} {
+		answer := httptest.NewRecorder()
+		fake.serve(answer, r)
+		var page normanCollection[project]
+		if err := json.Unmarshal(answer.Body.Bytes(), &page); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if fake == c.second {
+			for i := range page.Data {
+				page.Data[i].ID = otherCluster + ":" + page.Data[i].Name
+				page.Data[i].ClusterID = otherCluster
+			}
+		}
+		items = append(items, page.Data...)
+	}
+	writeJSON(w, http.StatusOK, normanCollection[project]{Type: "collection", Data: items})
+}

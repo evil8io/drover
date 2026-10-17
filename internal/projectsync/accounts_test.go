@@ -37,11 +37,61 @@ func markedProject(fake *accountsFake, name string) {
 // role bindings of one project, by name.
 func crbWant(project string) map[string]roleRef {
 	return map[string]roleRef{
-		namespacesBindingName(project, accountRoles[0]): {APIGroup: rbacGroup, Kind: "ClusterRole", Name: project + "-namespaces-edit"},
-		createBindingName(project, accountRoles[0]):     {APIGroup: rbacGroup, Kind: "ClusterRole", Name: createNamespaceRole},
-		namespacesBindingName(project, accountRoles[1]): {APIGroup: rbacGroup, Kind: "ClusterRole", Name: project + "-namespaces-edit"},
-		createBindingName(project, accountRoles[1]):     {APIGroup: rbacGroup, Kind: "ClusterRole", Name: createNamespaceRole},
-		namespacesBindingName(project, accountRoles[2]): {APIGroup: rbacGroup, Kind: "ClusterRole", Name: project + "-namespaces-readonly"},
+		namespacesBindingName(acctCluster, project, accountRoles[0]): {APIGroup: rbacGroup, Kind: "ClusterRole", Name: project + "-namespaces-edit"},
+		createBindingName(acctCluster, project, accountRoles[0]):     {APIGroup: rbacGroup, Kind: "ClusterRole", Name: createNamespaceRole},
+		namespacesBindingName(acctCluster, project, accountRoles[1]): {APIGroup: rbacGroup, Kind: "ClusterRole", Name: project + "-namespaces-edit"},
+		createBindingName(acctCluster, project, accountRoles[1]):     {APIGroup: rbacGroup, Kind: "ClusterRole", Name: createNamespaceRole},
+		namespacesBindingName(acctCluster, project, accountRoles[2]): {APIGroup: rbacGroup, Kind: "ClusterRole", Name: project + "-namespaces-readonly"},
+	}
+}
+
+func TestAccountNamesContainTheClusterID(t *testing.T) {
+	t.Parallel()
+	owner := accountRoles[0]
+	for _, tt := range []struct{ got, want string }{
+		{accountNamespace("c-m-4x2kq7bd", "p-n52j9"), "drover-c-m-4x2kq7bd-p-n52j9"},
+		{namespacesBindingName("c-1", "p-alpha", owner), "drover-c-1-p-alpha-project-owner-namespaces"},
+		{createBindingName("c-1", "p-alpha", owner), "drover-c-1-p-alpha-project-owner-create-ns"},
+		{boundBindingName("c-1", "p-alpha", owner, publicRead[0]), "drover-c-1-p-alpha-project-owner-clusterrole-drover:public-read"},
+		{boundBindingName("c-1", "p-alpha", owner, publicRead[1]), "drover-c-1-p-alpha-project-owner-role-drover:public-read"},
+	} {
+		if tt.got != tt.want {
+			t.Errorf("name = %s, want %s", tt.got, tt.want)
+		}
+	}
+	if project, ok := accountProjectOf("c-1", "drover-c-1-p-alpha"); !ok || project != "p-alpha" {
+		t.Errorf("project of drover-c-1-p-alpha = %q, %v; want p-alpha", project, ok)
+	}
+	for _, name := range []string{"drover-openbao", "drover-p-alpha", "drover-c-2-p-alpha", "drover-c-1-"} {
+		if project, ok := accountProjectOf("c-1", name); ok {
+			t.Errorf("project of %s in c-1 = %q, want no account namespace", name, project)
+		}
+	}
+}
+
+func TestReconcileGivesNoAccountsToAProjectWithATooLongAccountNamespaceName(t *testing.T) {
+	t.Parallel()
+	// drover-c-1- has 11 characters, so the first name fits 63 characters,
+	// and the second name does not.
+	fits := "p-" + strings.Repeat("a", 50)
+	long := "p-" + strings.Repeat("b", 51)
+	fake := newAccountsFake(t)
+	fake.addProject(fits, nil)
+	fake.addProject(long, nil)
+	syncer, logs := newAccountsSyncer(t, fake)
+
+	syncer.reconcile(context.Background())
+
+	var created []string
+	for _, req := range filterMethod(fake.requestsOfPath(namespacesPath(acctCluster)), http.MethodPost) {
+		created = append(created, decodeBody[object](t, req.body).Metadata.Name)
+	}
+	if want := []string{accountNamespace(acctCluster, fits)}; !slices.Equal(created, want) || len(want[0]) != maxNamespaceLength {
+		t.Errorf("namespace creates = %v, want only %v with %d characters", created, want, maxNamespaceLength)
+	}
+	want := `level=DEBUG msg="the project gets no accounts, because the name of its account namespace is too long" cluster=c-1 project=` + long
+	if !strings.Contains(logs.String(), want) {
+		t.Errorf("no line %s:\n%s", want, logs.String())
 	}
 }
 
@@ -101,15 +151,15 @@ func TestReconcileCreatesTheAccountsOfANewProject(t *testing.T) {
 		t.Fatalf("namespace create requests = %d, want 1", len(nsPosts))
 	}
 	accountNS := decodeBody[object](t, nsPosts[0].body)
-	if got, want := accountNS.Metadata.Name, accountNamespace("p-alpha"); got != want {
+	if got, want := accountNS.Metadata.Name, accountNamespace(acctCluster, "p-alpha"); got != want {
 		t.Errorf("name of the account namespace = %q, want %q", got, want)
 	}
 	if got, want := accountNS.Metadata.Annotations[projectAnnotation], acctCluster+":p-acct"; got != want {
 		t.Errorf("project annotation of the account namespace = %q, want %q", got, want)
 	}
-	accountNSUID := fake.namespaceUID(accountNamespace("p-alpha"))
+	accountNSUID := fake.namespaceUID(accountNamespace(acctCluster, "p-alpha"))
 
-	saPosts := filterMethod(fake.requestsOfPath(serviceAccountsPath(acctCluster, "drover-p-alpha")), http.MethodPost)
+	saPosts := filterMethod(fake.requestsOfPath(serviceAccountsPath(acctCluster, "drover-c-1-p-alpha")), http.MethodPost)
 	if len(saPosts) != 3 {
 		t.Fatalf("service account create requests = %d, want 3", len(saPosts))
 	}
@@ -137,10 +187,10 @@ func TestReconcileCreatesTheAccountsOfANewProject(t *testing.T) {
 		if b.RoleRef != want {
 			t.Errorf("role ref of %s = %+v, want %+v", b.Metadata.Name, b.RoleRef, want)
 		}
-		if len(b.Subjects) != 1 || b.Subjects[0].Kind != "ServiceAccount" || b.Subjects[0].Namespace != "drover-p-alpha" {
-			t.Errorf("subjects of %s = %v, want one ServiceAccount subject in drover-p-alpha", b.Metadata.Name, b.Subjects)
+		if len(b.Subjects) != 1 || b.Subjects[0].Kind != "ServiceAccount" || b.Subjects[0].Namespace != "drover-c-1-p-alpha" {
+			t.Errorf("subjects of %s = %v, want one ServiceAccount subject in drover-c-1-p-alpha", b.Metadata.Name, b.Subjects)
 		}
-		if len(b.Metadata.OwnerReferences) != 1 || b.Metadata.OwnerReferences[0].Name != "drover-p-alpha" ||
+		if len(b.Metadata.OwnerReferences) != 1 || b.Metadata.OwnerReferences[0].Name != "drover-c-1-p-alpha" ||
 			b.Metadata.OwnerReferences[0].UID != accountNSUID {
 			t.Errorf("owner references of %s = %v, want the account namespace", b.Metadata.Name, b.Metadata.OwnerReferences)
 		}
@@ -184,7 +234,7 @@ func TestReconcileGivesNoAccountsToTheSystemOrTheDefaultProject(t *testing.T) {
 	syncer.reconcile(context.Background())
 
 	for _, name := range []string{"p-system", "p-default"} {
-		nsName := accountNamespace(name)
+		nsName := accountNamespace(acctCluster, name)
 		if got := fake.requestsOfPath(namespacePath(acctCluster, nsName)); len(got) != 0 {
 			t.Errorf("requests of %s = %d, want 0", nsName, len(got))
 		}
@@ -218,10 +268,10 @@ func TestReconcileTreatsAProjectWithAnotherCreatorAsATenant(t *testing.T) {
 	if len(nsPosts) != 1 {
 		t.Fatalf("namespace create requests = %d, want 1", len(nsPosts))
 	}
-	if got, want := decodeBody[object](t, nsPosts[0].body).Metadata.Name, accountNamespace("p-marked"); got != want {
+	if got, want := decodeBody[object](t, nsPosts[0].body).Metadata.Name, accountNamespace(acctCluster, "p-marked"); got != want {
 		t.Errorf("name of the account namespace = %q, want %q", got, want)
 	}
-	if got := filterMethod(fake.requestsOfPath(serviceAccountsPath(acctCluster, "drover-p-marked")), http.MethodPost); len(got) != 3 {
+	if got := filterMethod(fake.requestsOfPath(serviceAccountsPath(acctCluster, "drover-c-1-p-marked")), http.MethodPost); len(got) != 3 {
 		t.Errorf("service account create requests = %d, want 3", len(got))
 	}
 }
@@ -284,16 +334,16 @@ func TestReconcileCorrectsAWrongBindingAndCreatesAMissingOne(t *testing.T) {
 
 	// A wrong subject on the role binding of ns-a: an update.
 	fake.mutateRoleBinding("ns-a", roleBindingName(accountRoles[0]), func(b *binding) {
-		b.Subjects = []subject{{Kind: "ServiceAccount", Name: "someone-else", Namespace: accountNamespace("p-alpha")}}
+		b.Subjects = []subject{{Kind: "ServiceAccount", Name: "someone-else", Namespace: accountNamespace(acctCluster, "p-alpha")}}
 	})
 	// A wrong role reference on a cluster role binding: a delete and a
 	// create, because the role reference is immutable.
-	wrongName := namespacesBindingName("p-alpha", accountRoles[0])
+	wrongName := namespacesBindingName(acctCluster, "p-alpha", accountRoles[0])
 	fake.mutateClusterRoleBinding(wrongName, func(b *binding) {
 		b.RoleRef.Name = "wrong-role"
 	})
 	// A missing cluster role binding: a create.
-	missingName := createBindingName("p-alpha", accountRoles[0])
+	missingName := createBindingName(acctCluster, "p-alpha", accountRoles[0])
 	fake.removeClusterRoleBinding(missingName)
 
 	fake.resetRequests()
@@ -336,7 +386,7 @@ func TestReconcileSkipsAnAccountNamespaceNameTakenByAnotherProject(t *testing.T)
 	markedProject(fake, "p-acct")
 	fake.addProject("p-alpha", nil)
 
-	colliding := accountNamespace("p-alpha")
+	colliding := accountNamespace(acctCluster, "p-alpha")
 	var ns namespace
 	ns.Metadata.Name = colliding
 	ns.Metadata.UID = "uid-" + colliding
@@ -346,10 +396,10 @@ func TestReconcileSkipsAnAccountNamespaceNameTakenByAnotherProject(t *testing.T)
 
 	// A stray cluster role binding and a stray role binding of p-alpha, left
 	// over from before the name collision.
-	fake.addClusterRoleBinding(accountBinding("ClusterRoleBinding", namespacesBindingName("p-alpha", accountRoles[0]),
-		"", "p-alpha-namespaces-edit", "p-alpha", "uid-old", accountRoles[0]))
+	fake.addClusterRoleBinding(accountBinding("ClusterRoleBinding", namespacesBindingName(acctCluster, "p-alpha", accountRoles[0]),
+		"", "p-alpha-namespaces-edit", acctCluster, "p-alpha", "uid-old", accountRoles[0]))
 	fake.addRoleBinding("junk-ns", accountBinding("RoleBinding", roleBindingName(accountRoles[0]),
-		"junk-ns", accountRoles[0].clusterRole, "p-alpha", "uid-old", accountRoles[0]))
+		"junk-ns", accountRoles[0].clusterRole, acctCluster, "p-alpha", "uid-old", accountRoles[0]))
 
 	syncer, logs := newAccountsSyncer(t, fake)
 	syncer.reconcile(context.Background())
@@ -367,7 +417,7 @@ func TestReconcileSkipsAnAccountNamespaceNameTakenByAnotherProject(t *testing.T)
 		t.Errorf("no warning line:\n%s", logs.String())
 	}
 
-	crbPath := clusterRoleBindingsPath(acctCluster) + "/" + namespacesBindingName("p-alpha", accountRoles[0])
+	crbPath := clusterRoleBindingsPath(acctCluster) + "/" + namespacesBindingName(acctCluster, "p-alpha", accountRoles[0])
 	if got := filterMethod(fake.requestsOfPath(crbPath), http.MethodDelete); len(got) != 1 {
 		t.Errorf("DELETE requests of the stray cluster role binding = %d, want 1", len(got))
 	}
@@ -386,7 +436,7 @@ func TestReconcileMovesAnOrphanedAccountNamespaceOnlyWithProof(t *testing.T) {
 		markedProject(fake, "p-acct")
 		fake.addProject("p-alpha", nil)
 
-		orphan := accountNamespace("p-alpha")
+		orphan := accountNamespace(acctCluster, "p-alpha")
 		var ns namespace
 		ns.Metadata.Name = orphan
 		ns.Metadata.UID = "uid-" + orphan
@@ -397,8 +447,8 @@ func TestReconcileMovesAnOrphanedAccountNamespaceOnlyWithProof(t *testing.T) {
 		if withProof {
 			ownerUID = ns.Metadata.UID
 		}
-		fake.addClusterRoleBinding(accountBinding("ClusterRoleBinding", namespacesBindingName("p-alpha", accountRoles[0]),
-			"", "p-alpha-namespaces-edit", "p-alpha", ownerUID, accountRoles[0]))
+		fake.addClusterRoleBinding(accountBinding("ClusterRoleBinding", namespacesBindingName(acctCluster, "p-alpha", accountRoles[0]),
+			"", "p-alpha-namespaces-edit", acctCluster, "p-alpha", ownerUID, accountRoles[0]))
 
 		syncer, logs := newAccountsSyncer(t, fake)
 		syncer.reconcile(context.Background())
@@ -408,7 +458,7 @@ func TestReconcileMovesAnOrphanedAccountNamespaceOnlyWithProof(t *testing.T) {
 	t.Run("with the proof of a matching owner reference", func(t *testing.T) {
 		t.Parallel()
 		fake, logs := setup(t, true)
-		orphan := accountNamespace("p-alpha")
+		orphan := accountNamespace(acctCluster, "p-alpha")
 
 		patches := filterMethod(fake.requestsOfPath(namespacePath(acctCluster, orphan)), http.MethodPatch)
 		if len(patches) != 1 {
@@ -441,7 +491,7 @@ func TestReconcileMovesAnOrphanedAccountNamespaceOnlyWithProof(t *testing.T) {
 	t.Run("without a matching owner reference", func(t *testing.T) {
 		t.Parallel()
 		fake, logs := setup(t, false)
-		orphan := accountNamespace("p-alpha")
+		orphan := accountNamespace(acctCluster, "p-alpha")
 
 		if got := filterMethod(fake.requestsOfPath(namespacePath(acctCluster, orphan)), http.MethodPatch); len(got) != 0 {
 			t.Errorf("PATCH requests of %s = %d, want 0", orphan, len(got))
@@ -464,7 +514,7 @@ func TestReconcileDeletesAStrayBindingOnlyWhenTheNamespaceHasNoProject(t *testin
 	// No label, no annotation: the namespace has no project.
 	fake.addNamespace(lostNS)
 	fake.addRoleBinding("ns-x", accountBinding("RoleBinding", roleBindingName(accountRoles[2]),
-		"ns-x", accountRoles[2].clusterRole, "p-gone", "uid-gone", accountRoles[2]))
+		"ns-x", accountRoles[2].clusterRole, acctCluster, "p-gone", "uid-gone", accountRoles[2]))
 
 	var unknownNS namespace
 	unknownNS.Metadata.Name = "ns-y"
@@ -472,7 +522,7 @@ func TestReconcileDeletesAStrayBindingOnlyWhenTheNamespaceHasNoProject(t *testin
 	unknownNS.Metadata.Annotations = map[string]string{projectAnnotation: acctCluster + ":p-vanished"}
 	fake.addNamespace(unknownNS)
 	fake.addRoleBinding("ns-y", accountBinding("RoleBinding", roleBindingName(accountRoles[0]),
-		"ns-y", accountRoles[0].clusterRole, "p-vanished", "uid-vanished", accountRoles[0]))
+		"ns-y", accountRoles[0].clusterRole, acctCluster, "p-vanished", "uid-vanished", accountRoles[0]))
 
 	syncer, _ := newAccountsSyncer(t, fake)
 	syncer.reconcile(context.Background())
@@ -503,17 +553,17 @@ func TestReconcileDeletesAnAccountNamespaceOnlyAfterA404OfItsProject(t *testing.
 	syncer, _ := newAccountsSyncer(t, fake)
 	syncer.reconcile(context.Background()) // establishes the account project p-acct
 
-	goneNS := accountNamespace("p-gone-a")
+	goneNS := accountNamespace(acctCluster, "p-gone-a")
 	var ns1 namespace
 	ns1.Metadata.Name = goneNS
 	ns1.Metadata.UID = "uid-" + goneNS
 	ns1.Metadata.Labels = map[string]string{accountProjectKey: "p-gone-a", projectLabel: "p-acct"}
 	ns1.Metadata.Annotations = map[string]string{projectAnnotation: acctCluster + ":p-acct"}
 	fake.addNamespace(ns1)
-	fake.addClusterRoleBinding(accountBinding("ClusterRoleBinding", namespacesBindingName("p-gone-a", accountRoles[0]),
-		"", "p-gone-a-namespaces-edit", "p-gone-a", ns1.Metadata.UID, accountRoles[0]))
+	fake.addClusterRoleBinding(accountBinding("ClusterRoleBinding", namespacesBindingName(acctCluster, "p-gone-a", accountRoles[0]),
+		"", "p-gone-a-namespaces-edit", acctCluster, "p-gone-a", ns1.Metadata.UID, accountRoles[0]))
 
-	keptNS := accountNamespace("p-gone-b")
+	keptNS := accountNamespace(acctCluster, "p-gone-b")
 	var ns2 namespace
 	ns2.Metadata.Name = keptNS
 	ns2.Metadata.UID = "uid-" + keptNS
@@ -525,7 +575,7 @@ func TestReconcileDeletesAnAccountNamespaceOnlyAfterA404OfItsProject(t *testing.
 	fake.resetRequests()
 	syncer.reconcile(context.Background())
 
-	crbPath := clusterRoleBindingsPath(acctCluster) + "/" + namespacesBindingName("p-gone-a", accountRoles[0])
+	crbPath := clusterRoleBindingsPath(acctCluster) + "/" + namespacesBindingName(acctCluster, "p-gone-a", accountRoles[0])
 	nsPath := namespacePath(acctCluster, goneNS)
 	all := fake.all()
 	crbIdx, nsIdx := -1, -1
@@ -567,7 +617,7 @@ func TestReconcileSweepsAnAccountNamespaceOfAProjectGoneFromThePreviousTrustToo(
 		t.Fatal("p-alpha is not trusted after the first run")
 	}
 
-	goneNS := accountNamespace("p-alpha")
+	goneNS := accountNamespace(acctCluster, "p-alpha")
 	// Rancher settles the label some time after the create, so the second
 	// run's bulk namespace list can find the account namespace.
 	fake.mutateNamespace(goneNS, func(ns *namespace) {
@@ -597,17 +647,17 @@ func TestReconcileKeepsTheRoleBindingsOfAProjectWhoseAccountNamespaceCheckFailed
 	fake.addNamespace(tenantNamespace("ns-a", "p-alpha"))
 	for _, role := range accountRoles {
 		fake.addRoleBinding("ns-a", accountBinding("RoleBinding", roleBindingName(role), "ns-a",
-			role.clusterRole, "p-alpha", "uid-old", role))
+			role.clusterRole, acctCluster, "p-alpha", "uid-old", role))
 	}
 
-	orphan := accountNamespace("p-alpha")
+	orphan := accountNamespace(acctCluster, "p-alpha")
 	var ns namespace
 	ns.Metadata.Name = orphan
 	ns.Metadata.UID = "uid-" + orphan
 	// No project: eligible for the adopt check.
 	fake.addNamespace(ns)
-	fake.addClusterRoleBinding(accountBinding("ClusterRoleBinding", namespacesBindingName("p-alpha", accountRoles[0]),
-		"", "p-alpha-namespaces-edit", "p-alpha", ns.Metadata.UID, accountRoles[0]))
+	fake.addClusterRoleBinding(accountBinding("ClusterRoleBinding", namespacesBindingName(acctCluster, "p-alpha", accountRoles[0]),
+		"", "p-alpha-namespaces-edit", acctCluster, "p-alpha", ns.Metadata.UID, accountRoles[0]))
 	fake.failPatch(orphan, http.StatusInternalServerError)
 
 	syncer, logs := newAccountsSyncer(t, fake)
@@ -656,7 +706,7 @@ func TestApplyAccountsHandlesTheNamespaceCases(t *testing.T) {
 		fake := newAccountsFake(t)
 		for _, role := range accountRoles {
 			fake.addRoleBinding("ns-a", accountBinding("RoleBinding", roleBindingName(role), "ns-a",
-				role.clusterRole, "p-alpha", "uid-1", role))
+				role.clusterRole, acctCluster, "p-alpha", "uid-1", role))
 		}
 		syncer, _ := newAccountsSyncer(t, fake)
 		syncer.setAccounts(acctCluster, accountState{
@@ -675,7 +725,7 @@ func TestApplyAccountsHandlesTheNamespaceCases(t *testing.T) {
 				t.Fatalf("PUT requests of %s = %d, want 1", path, len(puts))
 			}
 			updated := decodeBody[binding](t, puts[0].body)
-			if len(updated.Subjects) != 1 || updated.Subjects[0].Namespace != accountNamespace("p-beta") {
+			if len(updated.Subjects) != 1 || updated.Subjects[0].Namespace != accountNamespace(acctCluster, "p-beta") {
 				t.Errorf("subjects of %s after the move = %v, want the account namespace of p-beta", path, updated.Subjects)
 			}
 		}
@@ -689,7 +739,7 @@ func TestApplyAccountsHandlesTheNamespaceCases(t *testing.T) {
 		fake := newAccountsFake(t)
 		for _, role := range accountRoles {
 			fake.addRoleBinding("ns-b", accountBinding("RoleBinding", roleBindingName(role), "ns-b",
-				role.clusterRole, "p-alpha", "uid-1", role))
+				role.clusterRole, acctCluster, "p-alpha", "uid-1", role))
 		}
 		syncer, _ := newAccountsSyncer(t, fake)
 		syncer.setAccounts(acctCluster, accountState{
@@ -769,14 +819,14 @@ func TestApplyAccountsHandlesTheNamespaceCases(t *testing.T) {
 		seen := make(map[string]string)
 
 		var target namespace
-		target.Metadata.Name = accountNamespace("p-outside")
+		target.Metadata.Name = accountNamespace(acctCluster, "p-outside")
 		target.Metadata.Annotations = map[string]string{projectAnnotation: acctCluster + ":p-real"}
 		syncer.applyAccounts(context.Background(), acctCluster, watch, patchItem{target: target}, seen)
 
 		if watch.projects.idle() {
 			t.Error("the project queue is empty, want p-outside queued")
 		}
-		collection := roleBindingsPath(acctCluster, accountNamespace("p-outside"))
+		collection := roleBindingsPath(acctCluster, accountNamespace(acctCluster, "p-outside"))
 		posts := filterMethod(fake.requestsOfPath(collection), http.MethodPost)
 		if len(posts) != 3 {
 			t.Fatalf("role binding create requests = %d, want 3 (the namespace's own project is p-real)", len(posts))
@@ -785,8 +835,8 @@ func TestApplyAccountsHandlesTheNamespaceCases(t *testing.T) {
 		for _, req := range posts {
 			b := decodeBody[binding](t, req.body)
 			names = append(names, b.Metadata.Name)
-			if b.Subjects[0].Namespace != accountNamespace("p-real") {
-				t.Errorf("subject namespace of %s = %s, want %s", b.Metadata.Name, b.Subjects[0].Namespace, accountNamespace("p-real"))
+			if b.Subjects[0].Namespace != accountNamespace(acctCluster, "p-real") {
+				t.Errorf("subject namespace of %s = %s, want %s", b.Metadata.Name, b.Subjects[0].Namespace, accountNamespace(acctCluster, "p-real"))
 			}
 		}
 		slices.Sort(names)
@@ -815,10 +865,10 @@ func TestListProjectCreatesTheAccountsOfANewProjectThroughTheLister(t *testing.T
 	if len(nsPosts) != 1 {
 		t.Fatalf("namespace create requests = %d, want 1", len(nsPosts))
 	}
-	if got, want := decodeBody[object](t, nsPosts[0].body).Metadata.Name, accountNamespace("p-new"); got != want {
+	if got, want := decodeBody[object](t, nsPosts[0].body).Metadata.Name, accountNamespace(acctCluster, "p-new"); got != want {
 		t.Errorf("name of the account namespace = %q, want %q", got, want)
 	}
-	if got := filterMethod(fake.requestsOfPath(serviceAccountsPath(acctCluster, "drover-p-new")), http.MethodPost); len(got) != 3 {
+	if got := filterMethod(fake.requestsOfPath(serviceAccountsPath(acctCluster, "drover-c-1-p-new")), http.MethodPost); len(got) != 3 {
 		t.Errorf("service account create requests = %d, want 3", len(got))
 	}
 	if got := filterMethod(fake.requestsOfPath(clusterRoleBindingsPath(acctCluster)), http.MethodPost); len(got) != 5 {
@@ -887,7 +937,7 @@ func TestWorkerDeletesTheRoleBindingsOfTheOldProjectOfAMovedNamespace(t *testing
 	fake := newAccountsFake(t)
 	for _, role := range accountRoles {
 		fake.addRoleBinding("ns-a", accountBinding("RoleBinding", roleBindingName(role), "ns-a",
-			role.clusterRole, "p-alpha", "uid-1", role))
+			role.clusterRole, acctCluster, "p-alpha", "uid-1", role))
 	}
 	syncer, _ := newAccountsSyncer(t, fake)
 	syncer.setAccounts(acctCluster, accountState{
@@ -922,17 +972,17 @@ func TestReconcileDeletesTheRoleBindingsOfAnotherProjectInAPendingProject(t *tes
 	fake.addNamespace(tenantNamespace("ns-kept", "p-beta"))
 	for _, role := range accountRoles {
 		fake.addRoleBinding("ns-moved", accountBinding("RoleBinding", roleBindingName(role), "ns-moved",
-			role.clusterRole, "p-alpha", "uid-alpha", role))
+			role.clusterRole, acctCluster, "p-alpha", "uid-alpha", role))
 		fake.addRoleBinding("ns-kept", accountBinding("RoleBinding", roleBindingName(role), "ns-kept",
-			role.clusterRole, "p-beta", "uid-beta", role))
+			role.clusterRole, acctCluster, "p-beta", "uid-beta", role))
 	}
-	orphan := accountNamespace("p-beta")
+	orphan := accountNamespace(acctCluster, "p-beta")
 	var ns namespace
 	ns.Metadata.Name = orphan
 	ns.Metadata.UID = "uid-beta"
 	fake.addNamespace(ns)
-	fake.addClusterRoleBinding(accountBinding("ClusterRoleBinding", namespacesBindingName("p-beta", accountRoles[0]),
-		"", "p-beta-namespaces-edit", "p-beta", ns.Metadata.UID, accountRoles[0]))
+	fake.addClusterRoleBinding(accountBinding("ClusterRoleBinding", namespacesBindingName(acctCluster, "p-beta", accountRoles[0]),
+		"", "p-beta-namespaces-edit", acctCluster, "p-beta", ns.Metadata.UID, accountRoles[0]))
 	fake.failPatch(orphan, http.StatusInternalServerError)
 
 	syncer, _ := newAccountsSyncer(t, fake)
@@ -958,20 +1008,20 @@ func TestReconcileSweepsAnAccountNamespaceInNoProjectOnlyWithProof(t *testing.T)
 		fake := newAccountsFake(t)
 		markedProject(fake, "p-acct")
 		var ns namespace
-		ns.Metadata.Name = accountNamespace("p-gone")
+		ns.Metadata.Name = accountNamespace(acctCluster, "p-gone")
 		ns.Metadata.UID = "uid-" + ns.Metadata.Name
 		fake.addNamespace(ns)
 		ownerUID := "uid-other"
 		if withProof {
 			ownerUID = ns.Metadata.UID
 		}
-		fake.addClusterRoleBinding(accountBinding("ClusterRoleBinding", namespacesBindingName("p-gone", accountRoles[0]),
-			"", "p-gone-namespaces-edit", "p-gone", ownerUID, accountRoles[0]))
+		fake.addClusterRoleBinding(accountBinding("ClusterRoleBinding", namespacesBindingName(acctCluster, "p-gone", accountRoles[0]),
+			"", "p-gone-namespaces-edit", acctCluster, "p-gone", ownerUID, accountRoles[0]))
 		syncer, _ := newAccountsSyncer(t, fake)
 		syncer.reconcile(context.Background())
 		return fake
 	}
-	nsPath := namespacePath(acctCluster, accountNamespace("p-gone"))
+	nsPath := namespacePath(acctCluster, accountNamespace(acctCluster, "p-gone"))
 
 	t.Run("with a cluster role binding that names it as owner", func(t *testing.T) {
 		t.Parallel()
@@ -996,8 +1046,8 @@ func TestReconcileKeepsTheAccountNamespaceWhenABindingDeleteFails(t *testing.T) 
 	markedProject(fake, "p-acct")
 	goneNS := accountNamespaceIn("p-gone")
 	fake.addNamespace(goneNS)
-	crb := accountBinding("ClusterRoleBinding", namespacesBindingName("p-gone", accountRoles[0]),
-		"", "p-gone-namespaces-edit", "p-gone", goneNS.Metadata.UID, accountRoles[0])
+	crb := accountBinding("ClusterRoleBinding", namespacesBindingName(acctCluster, "p-gone", accountRoles[0]),
+		"", "p-gone-namespaces-edit", acctCluster, "p-gone", goneNS.Metadata.UID, accountRoles[0])
 	fake.addClusterRoleBinding(crb)
 	fake.fail(http.MethodDelete, clusterRoleBindingsPath(acctCluster)+"/"+crb.Metadata.Name, http.StatusInternalServerError)
 
@@ -1042,7 +1092,7 @@ func TestListProjectWritesNoOpenBaoObjectsForAChangedOpenBaoNamespace(t *testing
 
 			setup.syncer.listProject(context.Background(), acctCluster, "p-new", newClusterWatch(10).patches)
 
-			nsName := accountNamespace("p-new")
+			nsName := accountNamespace(acctCluster, "p-new")
 			if got := fake.requestsOfPath(rolesPath(acctCluster, nsName)); len(got) != 0 {
 				t.Errorf("role requests in %s = %d, want 0", nsName, len(got))
 			}
@@ -1106,7 +1156,7 @@ func TestReconcileKeepsATrustThatTheListerAddsDuringTheRun(t *testing.T) {
 	lost.Metadata.Name = "ns-x"
 	fake.addNamespace(lost)
 	stray := accountBinding("RoleBinding", roleBindingName(accountRoles[0]), "ns-x",
-		accountRoles[0].clusterRole, "p-gone", "uid-gone", accountRoles[0])
+		accountRoles[0].clusterRole, acctCluster, "p-gone", "uid-gone", accountRoles[0])
 	fake.addRoleBinding("ns-x", stray)
 	strayPath := roleBindingsPath(acctCluster, "ns-x") + "/" + stray.Metadata.Name
 	fake.onRequest(func(method, path string) {

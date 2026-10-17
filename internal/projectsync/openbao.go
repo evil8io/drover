@@ -219,10 +219,10 @@ func isOpenBaoBinding(item binding) bool {
 	return item.Metadata.Name == openbaoNamespace && item.Metadata.Labels[accountRoleKey] == openbaoLabel
 }
 
-// openbaoRole returns the Role in the account namespace of project that lets
-// the OpenBao ServiceAccount read the ServiceAccounts of the project roles and
-// request their tokens.
-func openbaoRole(project string) role {
+// openbaoRole returns the Role in the account namespace of project in cluster
+// that lets the OpenBao ServiceAccount read the ServiceAccounts of the project
+// roles and request their tokens.
+func openbaoRole(cluster, project string) role {
 	names := make([]string, 0, len(accountRoles))
 	for _, item := range accountRoles {
 		names = append(names, item.name)
@@ -232,7 +232,7 @@ func openbaoRole(project string) role {
 		Kind:       "Role",
 		Metadata: objectMeta{
 			Name:      openbaoNamespace,
-			Namespace: accountNamespace(project),
+			Namespace: accountNamespace(cluster, project),
 			Labels:    openbaoLabels(project),
 		},
 		Rules: []policyRule{
@@ -243,16 +243,16 @@ func openbaoRole(project string) role {
 }
 
 // openbaoRoleBinding returns the RoleBinding in the account namespace of
-// project to the Role of openbaoRole, for the OpenBao ServiceAccount. The
-// OpenBao namespace with uid owns it, so the garbage collector deletes it with
-// that namespace.
-func openbaoRoleBinding(project, uid string) binding {
+// project in cluster to the Role of openbaoRole, for the OpenBao
+// ServiceAccount. The OpenBao namespace with uid owns it, so the garbage
+// collector deletes it with that namespace.
+func openbaoRoleBinding(cluster, project, uid string) binding {
 	return binding{
 		APIVersion: rbacAPIVersion,
 		Kind:       "RoleBinding",
 		Metadata: objectMeta{
 			Name:            openbaoNamespace,
-			Namespace:       accountNamespace(project),
+			Namespace:       accountNamespace(cluster, project),
 			Labels:          openbaoLabels(project),
 			OwnerReferences: []ownerReference{{APIVersion: "v1", Kind: "Namespace", Name: openbaoNamespace, UID: uid}},
 		},
@@ -273,7 +273,7 @@ func (s *Syncer) syncOpenBao(ctx context.Context, token, cluster string, owners 
 	// OpenBao RoleBinding there proves the owner of the OpenBao namespace.
 	var proof []binding
 	for _, item := range roleBindings {
-		name, ok := strings.CutPrefix(item.Metadata.Namespace, accountPrefix)
+		name, ok := accountProjectOf(cluster, item.Metadata.Namespace)
 		if _, known := trusted[name]; ok && known && isOpenBaoBinding(item) {
 			proof = append(proof, item)
 		}
@@ -303,7 +303,7 @@ func (s *Syncer) syncOpenBao(ctx context.Context, token, cluster string, owners 
 	}
 	rolesIn := groupBy(roles, func(item role) string { return item.Metadata.Namespace })
 	for _, name := range slices.Sorted(maps.Keys(trusted)) {
-		nsName := accountNamespace(name)
+		nsName := accountNamespace(cluster, name)
 		s.ensureOpenBaoAccess(ctx, token, cluster, name, uid, rolesIn[nsName], roleBindingsIn[nsName], run)
 	}
 	return uid, account
@@ -315,10 +315,10 @@ func (s *Syncer) syncOpenBao(ctx context.Context, token, cluster string, owners 
 // namespace. Without them, the service creates each object first, and reads
 // it after a 409.
 func (s *Syncer) ensureOpenBaoAccess(ctx context.Context, token, cluster, name, uid string, roles []role, bindings []binding, run *counters) {
-	wantRole := openbaoRole(name)
+	wantRole := openbaoRole(cluster, name)
 	s.reconcileRole(ctx, token, cluster, wantRole, findRole(roles, wantRole.Metadata.Name), name, run)
-	wantBinding := openbaoRoleBinding(name, uid)
-	s.reconcileBinding(ctx, token, cluster, roleBindingsPath(cluster, accountNamespace(name)), wantBinding,
+	wantBinding := openbaoRoleBinding(cluster, name, uid)
+	s.reconcileBinding(ctx, token, cluster, roleBindingsPath(cluster, accountNamespace(cluster, name)), wantBinding,
 		findBinding(bindings, wantBinding.Metadata.Name), name, run)
 }
 

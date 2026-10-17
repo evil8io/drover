@@ -97,20 +97,37 @@ const (
 	trustNo
 )
 
-func accountNamespace(project string) string {
-	return accountPrefix + project
+// accountNamespace returns the name of the account namespace of project in
+// cluster. Two clusters can have a project with the same name, so the name
+// contains the cluster id.
+func accountNamespace(cluster, project string) string {
+	return accountNamespacePrefix(cluster) + project
+}
+
+// accountNamespacePrefix starts the name of every account namespace of
+// cluster.
+func accountNamespacePrefix(cluster string) string {
+	return accountPrefix + cluster + "-"
+}
+
+// accountProjectOf returns the project of the account namespace name of
+// cluster. It returns false for a name without the prefix of an account
+// namespace of cluster, and for the prefix alone.
+func accountProjectOf(cluster, name string) (string, bool) {
+	project, ok := strings.CutPrefix(name, accountNamespacePrefix(cluster))
+	return project, ok && project != ""
 }
 
 func roleBindingName(role accountRole) string {
 	return accountPrefix + role.name
 }
 
-func namespacesBindingName(project string, role accountRole) string {
-	return accountPrefix + project + "-" + role.name + "-namespaces"
+func namespacesBindingName(cluster, project string, role accountRole) string {
+	return accountNamespace(cluster, project) + "-" + role.name + "-namespaces"
 }
 
-func createBindingName(project string, role accountRole) string {
-	return accountPrefix + project + "-" + role.name + "-create-ns"
+func createBindingName(cluster, project string, role accountRole) string {
+	return accountNamespace(cluster, project) + "-" + role.name + "-create-ns"
 }
 
 // isAccountProject reports whether item is an account project of the service
@@ -122,14 +139,20 @@ func isAccountProject(item project, self string) bool {
 	return item.marked && self != "" && item.CreatorID == self
 }
 
-// isTenant reports whether the project named name gets accounts: not the
-// System project, not the Default project, not an account project, and not a
-// project whose account namespace name is the OpenBao namespace.
-func isTenant(item project, name, self string) bool {
-	if item.reserved || isAccountProject(item, self) || accountNamespace(name) == openbaoNamespace {
+// isTenant reports whether the project named name of cluster gets accounts:
+// not the System project, not the Default project, not an account project,
+// and a project whose account namespace name fits a namespace name.
+func isTenant(item project, cluster, name, self string) bool {
+	if item.reserved || isAccountProject(item, self) {
 		return false
 	}
-	return len(name) <= maxLabelValueLength && qualifiedName.MatchString(name)
+	return len(name) <= maxLabelValueLength && qualifiedName.MatchString(name) && fitsNamespace(cluster, name)
+}
+
+// fitsNamespace reports whether the account namespace name of the project
+// name of cluster has at most maxNamespaceLength characters.
+func fitsNamespace(cluster, name string) bool {
+	return len(accountNamespace(cluster, name)) <= maxNamespaceLength
 }
 
 // accountProjects returns the names of the account projects in projects,
@@ -383,11 +406,15 @@ func (s *Syncer) syncAccounts(ctx context.Context, token, cluster string, projec
 	pending := make(map[string]bool)
 	denied := make(map[string]bool)
 	for _, name := range slices.Sorted(maps.Keys(projects)) {
-		if !isTenant(projects[name], name, self) {
+		if !isTenant(projects[name], cluster, name, self) {
+			if !fitsNamespace(cluster, name) {
+				s.logger.DebugContext(ctx, "the project gets no accounts, because the name of its account namespace is too long",
+					"cluster", cluster, "project", name)
+			}
 			continue
 		}
-		item, listed := byName[accountNamespace(name)]
-		uid, outcome := s.checkAccountNamespace(ctx, token, cluster, tenantSpace(name), owners, item, listed, clusterBindingsOf[name], true, run)
+		item, listed := byName[accountNamespace(cluster, name)]
+		uid, outcome := s.checkAccountNamespace(ctx, token, cluster, tenantSpace(cluster, name), owners, item, listed, clusterBindingsOf[name], true, run)
 		switch outcome {
 		case trustUnknown:
 			pending[name] = true
@@ -398,7 +425,7 @@ func (s *Syncer) syncAccounts(ctx context.Context, token, cluster string, projec
 			continue
 		}
 		trusted[name] = uid
-		s.ensureAccounts(ctx, token, cluster, name, accountsIn[accountNamespace(name)], run)
+		s.ensureAccounts(ctx, token, cluster, name, accountsIn[accountNamespace(cluster, name)], run)
 		s.ensureClusterBindings(ctx, token, cluster, name, uid, clusterBindingsOf[name], run)
 		s.ensureBoundRoles(ctx, token, cluster, name, uid, clusterBindingsOf[name], roleBindingsOf[name], run)
 		for _, member := range members[name] {
@@ -439,7 +466,7 @@ func (s *Syncer) syncAccounts(ctx context.Context, token, cluster string, projec
 		}
 		if uid, ok := trusted[name]; ok {
 			settled[item.Metadata.Name] = settledKey(name, uid, item.Metadata.UID)
-		} else if !isTenant(source, name, self) {
+		} else if !isTenant(source, cluster, name, self) {
 			settled[item.Metadata.Name] = settledKey(name, "", item.Metadata.UID)
 		}
 	}
@@ -504,9 +531,9 @@ type accountSpace struct {
 	what, loss string
 }
 
-func tenantSpace(project string) accountSpace {
+func tenantSpace(cluster, project string) accountSpace {
 	return accountSpace{
-		name:    accountNamespace(project),
+		name:    accountNamespace(cluster, project),
 		project: project,
 		labels:  map[string]string{accountProjectKey: project},
 		what:    "account namespace",
@@ -607,7 +634,7 @@ func (s *Syncer) createAccountNamespace(ctx context.Context, token, cluster stri
 // ensureAccounts creates the ServiceAccounts of project name that existing
 // does not have.
 func (s *Syncer) ensureAccounts(ctx context.Context, token, cluster, name string, existing []object, run *counters) {
-	nsName := accountNamespace(name)
+	nsName := accountNamespace(cluster, name)
 	for _, role := range accountRoles {
 		if slices.ContainsFunc(existing, func(item object) bool { return item.Metadata.Name == role.name }) {
 			continue
@@ -638,11 +665,11 @@ func accountLabels(project string, role accountRole) map[string]string {
 }
 
 // accountBinding returns a binding of kind to the ClusterRole clusterRole, for
-// the ServiceAccount of role in the account namespace of project. The account
-// namespace with uid owns it, so the garbage collector deletes it with that
-// namespace.
-func accountBinding(kind, name, namespace, clusterRole, project, uid string, role accountRole) binding {
-	nsName := accountNamespace(project)
+// the ServiceAccount of role in the account namespace of project in cluster.
+// The account namespace with uid owns it, so the garbage collector deletes it
+// with that namespace.
+func accountBinding(kind, name, namespace, clusterRole, cluster, project, uid string, role accountRole) binding {
+	nsName := accountNamespace(cluster, project)
 	return binding{
 		APIVersion: rbacAPIVersion,
 		Kind:       kind,
@@ -661,9 +688,9 @@ func accountBinding(kind, name, namespace, clusterRole, project, uid string, rol
 func (s *Syncer) ensureClusterBindings(ctx context.Context, token, cluster, name, uid string, existing []binding, run *counters) {
 	collection := clusterRoleBindingsPath(cluster)
 	for _, role := range accountRoles {
-		wants := []binding{accountBinding("ClusterRoleBinding", namespacesBindingName(name, role), "", name+"-"+role.namespaces, name, uid, role)}
+		wants := []binding{accountBinding("ClusterRoleBinding", namespacesBindingName(cluster, name, role), "", name+"-"+role.namespaces, cluster, name, uid, role)}
 		if role.createNamespaces {
-			wants = append(wants, accountBinding("ClusterRoleBinding", createBindingName(name, role), "", createNamespaceRole, name, uid, role))
+			wants = append(wants, accountBinding("ClusterRoleBinding", createBindingName(cluster, name, role), "", createNamespaceRole, cluster, name, uid, role))
 		}
 		for _, want := range wants {
 			s.reconcileBinding(ctx, token, cluster, collection, want, findBinding(existing, want.Metadata.Name), name, run)
@@ -676,7 +703,7 @@ func (s *Syncer) ensureClusterBindings(ctx context.Context, token, cluster, name
 func (s *Syncer) ensureRoleBindings(ctx context.Context, token, cluster, nsName, name, uid string, existing []binding, run *counters) {
 	collection := roleBindingsPath(cluster, nsName)
 	for _, role := range accountRoles {
-		want := accountBinding("RoleBinding", roleBindingName(role), nsName, role.clusterRole, name, uid, role)
+		want := accountBinding("RoleBinding", roleBindingName(role), nsName, role.clusterRole, cluster, name, uid, role)
 		s.reconcileBinding(ctx, token, cluster, collection, want, findBinding(existing, want.Metadata.Name), name, run)
 	}
 }
@@ -809,11 +836,11 @@ func managedRoleBinding(item binding) bool {
 }
 
 // managedClusterBinding reports whether item is a cluster role binding of the
-// service for project name.
-func managedClusterBinding(item binding, name string) bool {
+// service for project name in cluster.
+func managedClusterBinding(item binding, cluster, name string) bool {
 	return slices.ContainsFunc(accountRoles, func(role accountRole) bool {
-		return item.Metadata.Name == namespacesBindingName(name, role) ||
-			(role.createNamespaces && item.Metadata.Name == createBindingName(name, role))
+		return item.Metadata.Name == namespacesBindingName(cluster, name, role) ||
+			(role.createNamespaces && item.Metadata.Name == createBindingName(cluster, name, role))
 	})
 }
 
@@ -825,13 +852,13 @@ func managedClusterBinding(item binding, name string) bool {
 func (s *Syncer) dropAccountBindings(ctx context.Context, token, cluster, name string, clusterBindings, roleBindings []binding, run *counters) int {
 	failed := 0
 	for _, item := range clusterBindings {
-		if (managedClusterBinding(item, name) || isBoundBinding(item, name)) &&
+		if (managedClusterBinding(item, cluster, name) || isBoundBinding(item, cluster, name)) &&
 			!s.dropBinding(ctx, token, cluster, clusterRoleBindingsPath(cluster), item, name, run) {
 			failed++
 		}
 	}
 	for _, item := range roleBindings {
-		if (managedRoleBinding(item) || isOpenBaoBinding(item) || isBoundBinding(item, name)) &&
+		if (managedRoleBinding(item) || isOpenBaoBinding(item) || isBoundBinding(item, cluster, name)) &&
 			!s.dropBinding(ctx, token, cluster, roleBindingsPath(cluster, item.Metadata.Namespace), item, name, run) {
 			failed++
 		}
@@ -897,13 +924,8 @@ func (s *Syncer) sweepAccountNamespaces(ctx context.Context, token, cluster stri
 		if item.Metadata.DeletionTimestamp != "" {
 			continue
 		}
-		// The OpenBao namespace has the prefix of an account namespace, and no
-		// project.
-		if item.Metadata.Name == openbaoNamespace {
-			continue
-		}
-		name, ok := strings.CutPrefix(item.Metadata.Name, accountPrefix)
-		if !ok || name == "" {
+		name, ok := accountProjectOf(cluster, item.Metadata.Name)
+		if !ok {
 			continue
 		}
 		if _, ok := trusted[name]; ok {
@@ -917,7 +939,7 @@ func (s *Syncer) sweepAccountNamespaces(ctx context.Context, token, cluster stri
 			continue
 		}
 		if source, known := projects[name]; known {
-			if isTenant(source, name, self) {
+			if isTenant(source, cluster, name, self) {
 				continue
 			}
 		} else {
@@ -976,7 +998,7 @@ func (s *Syncer) ensureProjectAccounts(ctx context.Context, token, cluster, name
 		return
 	}
 	source, known := s.projectsOf(cluster)[name]
-	if !known || !isTenant(source, name, s.cachedSelf()) {
+	if !known || !isTenant(source, cluster, name, s.cachedSelf()) {
 		return
 	}
 
@@ -985,7 +1007,7 @@ func (s *Syncer) ensureProjectAccounts(ctx context.Context, token, cluster, name
 		s.accountFailure(ctx, nil, "the cluster role binding list request failed", err, "cluster", cluster, "project", name)
 		return
 	}
-	uid, outcome := s.checkAccountNamespace(ctx, token, cluster, tenantSpace(name), state.projects, namespace{}, false, clusterBindings, false, nil)
+	uid, outcome := s.checkAccountNamespace(ctx, token, cluster, tenantSpace(cluster, name), state.projects, namespace{}, false, clusterBindings, false, nil)
 	switch outcome {
 	case trustUnknown:
 		return
@@ -1000,7 +1022,7 @@ func (s *Syncer) ensureProjectAccounts(ctx context.Context, token, cluster, name
 		return
 	}
 
-	accounts, err := listAll(ctx, s, token, serviceAccountsPath(cluster, accountNamespace(name)), accountProjectKey, pruneObject)
+	accounts, err := listAll(ctx, s, token, serviceAccountsPath(cluster, accountNamespace(cluster, name)), accountProjectKey, pruneObject)
 	if err != nil {
 		s.accountFailure(ctx, nil, "the service account list request failed", err, "cluster", cluster, "project", name)
 		return
@@ -1072,7 +1094,7 @@ func (s *Syncer) applyAccounts(ctx context.Context, cluster string, watch *clust
 		seen[nsName] = key
 		return
 	}
-	if target, ok := strings.CutPrefix(nsName, accountPrefix); ok && watch != nil {
+	if target, ok := accountProjectOf(cluster, nsName); ok && watch != nil {
 		if _, known := projects[target]; known {
 			// A namespace with the name of an account namespace, outside
 			// the account projects.
@@ -1088,7 +1110,7 @@ func (s *Syncer) applyAccounts(ctx context.Context, cluster string, watch *clust
 	waiting := false
 	if uid == "" && name != "" {
 		source, known := projects[name]
-		waiting = !known || isTenant(source, name, s.cachedSelf())
+		waiting = !known || isTenant(source, cluster, name, s.cachedSelf())
 	}
 
 	token, err := rancherclient.ReadToken(s.tokenFile)

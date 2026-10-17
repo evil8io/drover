@@ -96,10 +96,10 @@ func (w *openbaoWriter) ownPolicy(text, cluster, project string, role accountRol
 	return text == strings.TrimSpace(head+credsParameters+"}") || text == strings.TrimSpace(head+"}")
 }
 
-func (w *openbaoWriter) wantRole(project string, role accountRole) credentialRole {
+func (w *openbaoWriter) wantRole(cluster, project string, role accountRole) credentialRole {
 	return credentialRole{
 		ServiceAccountName: role.name,
-		Namespaces:         []string{accountNamespace(project)},
+		Namespaces:         []string{accountNamespace(cluster, project)},
 		Audiences:          []string{},
 		DefaultTTL:         int64(w.credentialTTL / time.Second),
 		MaxTTL:             int64(w.credentialMaxTTL / time.Second),
@@ -292,7 +292,7 @@ func (s *Syncer) keepOpenBaoCluster(ctx context.Context, token, cluster string, 
 		for _, role := range accountRoles {
 			name := roleName(project, role)
 			wanted[roleKey(name)] = true
-			if listed && !s.keepRole(ctx, cluster, name, w.wantRole(project, role), slices.Contains(roles, name)) {
+			if listed && !s.keepRole(ctx, cluster, name, w.wantRole(cluster, project, role), slices.Contains(roles, name)) {
 				errs++
 			}
 			policy := w.policyName(cluster, project, role)
@@ -670,7 +670,7 @@ func (s *Syncer) writeOpenBaoProject(ctx context.Context, cluster, name string) 
 			write           func() error
 		}{
 			{"role", roleName(name, role), roleKey(roleName(name, role)), func() error {
-				return w.writeRole(ctx, cluster, roleName(name, role), w.wantRole(name, role))
+				return w.writeRole(ctx, cluster, roleName(name, role), w.wantRole(cluster, name, role))
 			}},
 			{"policy", w.policyName(cluster, name, role), policyKey(w.policyName(cluster, name, role)), func() error {
 				return w.writePolicy(ctx, w.policyName(cluster, name, role), w.policyText(cluster, name, role))
