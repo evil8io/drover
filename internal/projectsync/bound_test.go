@@ -32,7 +32,7 @@ func checkBoundPosts(t *testing.T, posts []recorded, project, uid, kind string, 
 		got[b.Metadata.Name] = b
 	}
 	for _, role := range accountRoles {
-		name := boundBindingName(project, role, bound)
+		name := boundBindingName(acctCluster, project, role, bound)
 		b, ok := got[name]
 		if !ok {
 			t.Errorf("no create request of %s", name)
@@ -41,7 +41,7 @@ func checkBoundPosts(t *testing.T, posts []recorded, project, uid, kind string, 
 		if want := (roleRef{APIGroup: rbacGroup, Kind: kind, Name: bound.Name}); b.RoleRef != want {
 			t.Errorf("role ref of %s = %+v, want %+v", name, b.RoleRef, want)
 		}
-		if want := []subject{{Kind: "ServiceAccount", Name: role.name, Namespace: accountNamespace(project)}}; len(b.Subjects) != 1 || b.Subjects[0] != want[0] {
+		if want := []subject{{Kind: "ServiceAccount", Name: role.name, Namespace: accountNamespace(acctCluster, project)}}; len(b.Subjects) != 1 || b.Subjects[0] != want[0] {
 			t.Errorf("subjects of %s = %v, want %v", name, b.Subjects, want)
 		}
 		if len(b.Metadata.OwnerReferences) != 1 || b.Metadata.OwnerReferences[0].UID != uid {
@@ -65,7 +65,7 @@ func TestReconcileBindsTheBoundRolesAndSweepsARemovedOne(t *testing.T) {
 
 	syncer.reconcile(context.Background())
 
-	uid := fake.namespaceUID(accountNamespace("p-alpha"))
+	uid := fake.namespaceUID(accountNamespace(acctCluster, "p-alpha"))
 	crbPosts := filterMethod(fake.requestsOfPath(clusterRoleBindingsPath(acctCluster)), http.MethodPost)
 	if len(crbPosts) != 8 {
 		t.Fatalf("cluster role binding create requests = %d, want 5 of the project roles and 3 of the bound ClusterRole", len(crbPosts))
@@ -89,7 +89,7 @@ func TestReconcileBindsTheBoundRolesAndSweepsARemovedOne(t *testing.T) {
 	narrower, _ := newAccountsSyncer(t, fake, withBoundRoles(publicRead[:1]))
 	narrower.reconcile(context.Background())
 	for _, role := range accountRoles {
-		path := roleBindingsPath(acctCluster, "kube-public") + "/" + boundBindingName("p-alpha", role, publicRead[1])
+		path := roleBindingsPath(acctCluster, "kube-public") + "/" + boundBindingName(acctCluster, "p-alpha", role, publicRead[1])
 		if got := filterMethod(fake.requestsOfPath(path), http.MethodDelete); len(got) != 1 {
 			t.Errorf("DELETE requests of %s = %d, want 1", path, len(got))
 		}
@@ -111,7 +111,7 @@ func TestReconcileDropsTheBoundBindingsOfAProjectWithoutAccounts(t *testing.T) {
 	markedProject(fake, "p-acct")
 	fake.addProject("p-alpha", nil)
 
-	colliding := accountNamespace("p-alpha")
+	colliding := accountNamespace(acctCluster, "p-alpha")
 	var ns namespace
 	ns.Metadata.Name = colliding
 	ns.Metadata.UID = "uid-" + colliding
@@ -119,9 +119,9 @@ func TestReconcileDropsTheBoundBindingsOfAProjectWithoutAccounts(t *testing.T) {
 	ns.Metadata.Annotations = map[string]string{projectAnnotation: acctCluster + ":p-beta"}
 	fake.addNamespace(ns)
 
-	crb := boundBinding("p-alpha", "uid-old", accountRoles[0], publicRead[0])
+	crb := boundBinding(acctCluster, "p-alpha", "uid-old", accountRoles[0], publicRead[0])
 	fake.addClusterRoleBinding(crb)
-	rb := boundBinding("p-alpha", "uid-old", accountRoles[2], publicRead[1])
+	rb := boundBinding(acctCluster, "p-alpha", "uid-old", accountRoles[2], publicRead[1])
 	fake.addRoleBinding("kube-public", rb)
 
 	syncer, _ := newAccountsSyncer(t, fake, withBoundRoles(publicRead))
@@ -150,7 +150,7 @@ func TestListProjectBindsTheBoundRolesThroughTheLister(t *testing.T) {
 	watch := newClusterWatch(10)
 	syncer.listProject(context.Background(), acctCluster, "p-new", watch.patches)
 
-	uid := fake.namespaceUID(accountNamespace("p-new"))
+	uid := fake.namespaceUID(accountNamespace(acctCluster, "p-new"))
 	crbPosts := filterMethod(fake.requestsOfPath(clusterRoleBindingsPath(acctCluster)), http.MethodPost)
 	if len(crbPosts) != 8 {
 		t.Fatalf("cluster role binding create requests = %d, want 8", len(crbPosts))

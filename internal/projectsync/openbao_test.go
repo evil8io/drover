@@ -19,7 +19,7 @@ import (
 // the name of the account namespace of project.
 func accountNamespaceIn(project string) namespace {
 	var ns namespace
-	ns.Metadata.Name = accountNamespace(project)
+	ns.Metadata.Name = accountNamespace(acctCluster, project)
 	ns.Metadata.UID = "uid-" + ns.Metadata.Name
 	ns.Metadata.Labels = map[string]string{accountProjectKey: project, projectLabel: "p-acct"}
 	ns.Metadata.Annotations = map[string]string{projectAnnotation: acctCluster + ":p-acct"}
@@ -73,7 +73,7 @@ func TestReconcileKeepsTheOpenBaoObjectsOfEveryAccountNamespace(t *testing.T) {
 	}
 
 	for _, project := range []string{"p-alpha", "p-beta"} {
-		nsName := accountNamespace(project)
+		nsName := accountNamespace(acctCluster, project)
 		wantLabels := map[string]string{accountProjectKey: project, accountRoleKey: openbaoLabel}
 
 		rolePosts := filterMethod(fake.requestsOfPath(rolesPath(acctCluster, nsName)), http.MethodPost)
@@ -139,7 +139,7 @@ func TestReconcileCorrectsAChangedOrDeletedOpenBaoRoleAndRoleBinding(t *testing.
 	setup := newOpenBaoSetup(t, fake)
 	setup.syncer.reconcile(context.Background())
 
-	alpha, beta := accountNamespace("p-alpha"), accountNamespace("p-beta")
+	alpha, beta := accountNamespace(acctCluster, "p-alpha"), accountNamespace(acctCluster, "p-beta")
 	fake.mutateRole(alpha, openbaoNamespace, func(item *role) {
 		item.Rules[1].ResourceNames = []string{"project-owner", "project-member", "read-only", "someone-else"}
 	})
@@ -188,7 +188,7 @@ func TestReconcileGivesNoOpenBaoConfigWhenATenantOwnsTheNamespace(t *testing.T) 
 	fake.addProject("p-beta", nil)
 	fake.addNamespace(accountNamespaceIn("p-alpha"))
 	// An OpenBao RoleBinding from before the tenant took the name.
-	fake.addRoleBinding(accountNamespace("p-alpha"), openbaoRoleBinding("p-alpha", "uid-old"))
+	fake.addRoleBinding(accountNamespace(acctCluster, "p-alpha"), openbaoRoleBinding(acctCluster, "p-alpha", "uid-old"))
 	fake.addNamespace(tenantNamespace(openbaoNamespace, "p-beta"))
 	setup := newOpenBaoSetup(t, fake)
 
@@ -199,7 +199,7 @@ func TestReconcileGivesNoOpenBaoConfigWhenATenantOwnsTheNamespace(t *testing.T) 
 	if !strings.Contains(setup.logs.String(), want) {
 		t.Errorf("no warning line:\n%s", setup.logs.String())
 	}
-	stale := roleBindingsPath(acctCluster, accountNamespace("p-alpha")) + "/" + openbaoNamespace
+	stale := roleBindingsPath(acctCluster, accountNamespace(acctCluster, "p-alpha")) + "/" + openbaoNamespace
 	if got := filterMethod(fake.requestsOfPath(stale), http.MethodDelete); len(got) != 1 {
 		t.Errorf("DELETE requests of the OpenBao role binding = %d, want 1", len(got))
 	}
@@ -211,7 +211,7 @@ func TestReconcileGivesNoOpenBaoConfigWhenATenantOwnsTheNamespace(t *testing.T) 
 		t.Errorf("service account create requests in %s = %d, want 0", openbaoNamespace, len(got))
 	}
 	for _, project := range []string{"p-alpha", "p-beta"} {
-		if got := filterMethod(fake.requestsOfPath(rolesPath(acctCluster, accountNamespace(project))), http.MethodPost); len(got) != 0 {
+		if got := filterMethod(fake.requestsOfPath(rolesPath(acctCluster, accountNamespace(acctCluster, project))), http.MethodPost); len(got) != 0 {
 			t.Errorf("role create requests of %s = %d, want 0", project, len(got))
 		}
 	}
@@ -232,9 +232,9 @@ func TestReconcileDeletesTheOpenBaoRoleBindingOfAProjectWithoutAccounts(t *testi
 	markedProject(fake, "p-acct")
 	fake.addProject("p-alpha", nil)
 	fake.addProject("p-beta", nil)
-	taken := tenantNamespace(accountNamespace("p-alpha"), "p-beta")
+	taken := tenantNamespace(accountNamespace(acctCluster, "p-alpha"), "p-beta")
 	fake.addNamespace(taken)
-	fake.addRoleBinding(taken.Metadata.Name, openbaoRoleBinding("p-alpha", "uid-old"))
+	fake.addRoleBinding(taken.Metadata.Name, openbaoRoleBinding(acctCluster, "p-alpha", "uid-old"))
 	setup := newOpenBaoSetup(t, fake)
 
 	setup.syncer.reconcile(context.Background())
@@ -246,7 +246,7 @@ func TestReconcileDeletesTheOpenBaoRoleBindingOfAProjectWithoutAccounts(t *testi
 	if got := filterMethod(fake.requestsOfPath(rolesPath(acctCluster, taken.Metadata.Name)), http.MethodPost); len(got) != 0 {
 		t.Errorf("role create requests in %s = %d, want 0", taken.Metadata.Name, len(got))
 	}
-	if got := filterMethod(fake.requestsOfPath(rolesPath(acctCluster, accountNamespace("p-beta"))), http.MethodPost); len(got) != 1 {
+	if got := filterMethod(fake.requestsOfPath(rolesPath(acctCluster, accountNamespace(acctCluster, "p-beta"))), http.MethodPost); len(got) != 1 {
 		t.Errorf("role create requests of p-beta = %d, want 1", len(got))
 	}
 }
@@ -262,7 +262,7 @@ func TestReconcileMovesAnOpenBaoNamespaceInNoProjectOnlyWithProof(t *testing.T) 
 		proofIn string
 		moved   bool
 	}{
-		{name: "with a role binding in an account namespace", proofIn: accountNamespace("p-alpha"), moved: true},
+		{name: "with a role binding in an account namespace", proofIn: accountNamespace(acctCluster, "p-alpha"), moved: true},
 		{name: "with a role binding in a tenant namespace only", proofIn: "ns-a"},
 		{name: "without a role binding"},
 	}
@@ -279,7 +279,7 @@ func TestReconcileMovesAnOpenBaoNamespaceInNoProjectOnlyWithProof(t *testing.T) 
 			orphan.Metadata.UID = orphanUID
 			fake.addNamespace(orphan)
 			if tc.proofIn != "" {
-				proof := openbaoRoleBinding("p-alpha", orphanUID)
+				proof := openbaoRoleBinding(acctCluster, "p-alpha", orphanUID)
 				proof.Metadata.Namespace = tc.proofIn
 				fake.addRoleBinding(tc.proofIn, proof)
 			}
@@ -324,29 +324,6 @@ func TestReconcileMovesAnOpenBaoNamespaceInNoProjectOnlyWithProof(t *testing.T) 
 				t.Errorf("OpenBao config writes = %d, want 1", len(got))
 			}
 		})
-	}
-}
-
-func TestReconcileGivesNoAccountsToAProjectNamedOpenBao(t *testing.T) {
-	t.Parallel()
-	fake := newAccountsFake(t)
-	fake.addProject("openbao", nil)
-	fake.addProject("p-alpha", nil)
-	setup := newOpenBaoSetup(t, fake)
-
-	setup.syncer.reconcile(context.Background())
-
-	saPosts := filterMethod(fake.requestsOfPath(serviceAccountsPath(acctCluster, openbaoNamespace)), http.MethodPost)
-	if len(saPosts) != 1 || decodeBody[object](t, saPosts[0].body).Metadata.Name != openbaoAccount {
-		t.Errorf("service account creates in %s = %v, want the OpenBao ServiceAccount only", openbaoNamespace, saPosts)
-	}
-	for _, req := range filterMethod(fake.requestsOfPath(clusterRoleBindingsPath(acctCluster)), http.MethodPost) {
-		if project := decodeBody[binding](t, req.body).Metadata.Labels[accountProjectKey]; project != "p-alpha" {
-			t.Errorf("cluster role binding of project %q, want p-alpha only", project)
-		}
-	}
-	if got := fake.requestsOfPath(rolesPath(acctCluster, openbaoNamespace)); len(got) != 0 {
-		t.Errorf("role requests in %s = %d, want 0", openbaoNamespace, len(got))
 	}
 }
 
@@ -790,7 +767,7 @@ func TestListProjectGivesANewProjectTheOpenBaoRoleAndRoleBinding(t *testing.T) {
 
 	listNewProject(t, setup, "uid-bao")
 
-	nsName := accountNamespace("p-new")
+	nsName := accountNamespace(acctCluster, "p-new")
 	rolePosts := filterMethod(fake.requestsOfPath(rolesPath(acctCluster, nsName)), http.MethodPost)
 	if len(rolePosts) != 1 {
 		t.Fatalf("role create requests in %s = %d, want 1", nsName, len(rolePosts))
@@ -834,7 +811,7 @@ func TestListProjectGivesNoOpenBaoObjectsWithoutATrustedNamespace(t *testing.T) 
 
 	listNewProject(t, setup, "")
 
-	nsName := accountNamespace("p-new")
+	nsName := accountNamespace(acctCluster, "p-new")
 	if got := fake.requestsOfPath(rolesPath(acctCluster, nsName)); len(got) != 0 {
 		t.Errorf("role requests in %s = %d, want 0", nsName, len(got))
 	}
@@ -856,7 +833,7 @@ func TestListProjectCorrectsTheOpenBaoRoleBindingOfAnExistingProject(t *testing.
 	setup := newOpenBaoSetup(t, fake)
 	setup.syncer.reconcile(context.Background())
 
-	nsName := accountNamespace("p-alpha")
+	nsName := accountNamespace(acctCluster, "p-alpha")
 	fake.mutateRoleBinding(nsName, openbaoNamespace, func(b *binding) {
 		b.Subjects = append(b.Subjects, subject{Kind: "ServiceAccount", Name: "intruder", Namespace: "ns-a"})
 	})
@@ -906,7 +883,7 @@ func TestReconcileKeepsTheOpenBaoNamespaceUidOnlyWhileItIsTrusted(t *testing.T) 
 func wantRoleData(project, role string) map[string]any {
 	return map[string]any{
 		"service_account_name":                  role,
-		"allowed_kubernetes_namespaces":         []any{accountNamespace(project)},
+		"allowed_kubernetes_namespaces":         []any{accountNamespace(acctCluster, project)},
 		"allowed_kubernetes_namespace_selector": "",
 		"kubernetes_role_name":                  "",
 		"generated_role_rules":                  "",

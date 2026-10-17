@@ -259,7 +259,7 @@ func TestReloadTrustKeepsTheLastValidRules(t *testing.T) {
 func TestTrustStatusIsDeterministic(t *testing.T) {
 	t.Parallel()
 	entries := []statementStatus{
-		{Name: "deploy", Ready: true, Login: &loginRef{Path: githubMount, Role: "p-abc12_deploy"}},
+		{Name: "deploy", Ready: true, Login: &loginRef{Path: githubMount, Role: "c-1_p-abc12_deploy"}},
 		notReady("rotator", reasonAccountNotAllowed),
 	}
 	status := trustStatus{ObservedHash: "sha256:00", ObservedAt: "2026-10-03T12:00:00Z", Statements: &entries}
@@ -268,7 +268,7 @@ func TestTrustStatusIsDeterministic(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	want := `{"observedHash":"sha256:00","observedAt":"2026-10-03T12:00:00Z","statements":[` +
-		`{"name":"deploy","ready":true,"login":{"path":"auth/jwt/github","role":"p-abc12_deploy"}},` +
+		`{"name":"deploy","ready":true,"login":{"path":"auth/jwt/github","role":"c-1_p-abc12_deploy"}},` +
 		`{"name":"rotator","ready":false,"reason":"AccountNotAllowed","message":"the account is not in the allowed accounts"}]}`
 	if string(data) != want {
 		t.Errorf("status =\n%s\nwant\n%s", data, want)
@@ -328,33 +328,25 @@ func TestWithoutPath(t *testing.T) {
 	}
 }
 
-func TestProjectNamesSplitALoginRoleNameAtTheUnderscore(t *testing.T) {
+func TestSplitLoginNameSplitsAtTheFirstAndTheLastUnderscore(t *testing.T) {
 	t.Parallel()
-	names := newProjectNames(map[string]map[string]project{
-		"c-1": {"p": {}, "p-alpha": {}, "p-abc12": {}},
-		"c-2": {"p-xyz34": {}, "p-abc12": {}},
-	}, map[string]map[string]project{
-		"c-2": {"p-xyz34": {}},
-	})
-
-	if got, _ := names.owners("p-xyz34_deploy"); len(got) != 1 || !names.owns("p-xyz34_deploy", "c-2", "p-xyz34") {
-		t.Errorf("owners of p-xyz34_deploy = %v, want only p-xyz34 of c-2, also with the project in two sets", got)
+	for role, want := range map[string][3]string{
+		"c-1_p-alpha_deploy":               {"c-1", "p-alpha", "deploy"},
+		"c-m-abcd1234_p-xyz34_deploy-main": {"c-m-abcd1234", "p-xyz34", "deploy-main"},
+		"local_p_alpha-deploy":             {"local", "p", "alpha-deploy"},
+	} {
+		cluster, project, statement, ok := splitLoginName(role)
+		if !ok || [3]string{cluster, project, statement} != want {
+			t.Errorf("splitLoginName(%q) = %q, %q, %q, %v; want %q", role, cluster, project, statement, ok, want)
+		}
 	}
-	if !names.owns("p-alpha_deploy", "c-1", "p-alpha") || names.owns("p-alpha_deploy", "c-1", "p") {
-		t.Error("the owner of p-alpha_deploy is not p-alpha alone, want p-alpha and not p")
-	}
-	if got, _ := names.owners("p_alpha-deploy"); len(got) != 1 || got[0] != (projectRef{cluster: "c-1", name: "p"}) {
-		t.Errorf("owners of p_alpha-deploy = %v, want only p of c-1", got)
-	}
-	if got, _ := names.owners("p-abc12_ci"); len(got) != 2 || names.owns("p-abc12_ci", "c-1", "p-abc12") {
-		t.Errorf("owners of p-abc12_ci = %v, want p-abc12 of c-1 and of c-2, and no single owner", got)
-	}
-	if got, ok := names.owners("p-gone_ci"); !ok || len(got) != 0 {
-		t.Errorf("owners of p-gone_ci = %v, %v; want a name of the service without an owner", got, ok)
-	}
-	for _, role := range []string{"p-alpha-deploy", "admin-deploy", "p-alpha_de_ploy", "p-alpha__deploy", "_deploy", "p-alpha_", "p-alpha_Deploy", "p-alpha_deploy/../x"} {
-		if got, ok := names.owners(role); ok || got != nil {
-			t.Errorf("owners of %q = %v, %v; want no name of the service", role, got, ok)
+	for _, role := range []string{
+		"p-alpha_deploy", "p-alpha-deploy", "admin-deploy", "_p-alpha_deploy", "c-1__deploy", "c-1_p-alpha_",
+		"c-1_p-alpha_Deploy", "c-1_p-alpha_deploy/../x", "c-1_p/../x_deploy", "c-1_-p_deploy",
+		"c-1_p_x_deploy", "c-1_ops_team_ci", "c-1_P-alpha_deploy", "c-1_p.alpha_deploy",
+	} {
+		if cluster, project, statement, ok := splitLoginName(role); ok {
+			t.Errorf("splitLoginName(%q) = %q, %q, %q; want no name of the service", role, cluster, project, statement)
 		}
 	}
 }
@@ -363,12 +355,12 @@ func TestPreviousLoginsReadsEachRoleOnceUpToTheLimit(t *testing.T) {
 	t.Parallel()
 	entries := make([]string, 0, 3000)
 	for i := range 3000 {
-		entries = append(entries, fmt.Sprintf(`{"name":"s","ready":true,"login":{"path":"auth/aws","role":"p-alpha_s%d"}}`, i/2))
+		entries = append(entries, fmt.Sprintf(`{"name":"s","ready":true,"login":{"path":"auth/aws","role":"c-1_p-alpha_s%d"}}`, i/2))
 	}
 	status := `{"statements":[{"name":"x","ready":false},` + strings.Join(entries, ",") + `]}`
 
 	got := previousLogins(status, 4)
-	want := []loginRef{{Path: awsAuthPath, Role: "p-alpha_s0"}, {Path: awsAuthPath, Role: "p-alpha_s1"}}
+	want := []loginRef{{Path: awsAuthPath, Role: "c-1_p-alpha_s0"}, {Path: awsAuthPath, Role: "c-1_p-alpha_s1"}}
 	if !slices.Equal(got, want) {
 		t.Errorf("previousLogins = %v, want %v", got, want)
 	}

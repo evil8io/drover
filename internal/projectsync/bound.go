@@ -58,37 +58,38 @@ func checkBoundRoles(roles []BoundRole) error {
 }
 
 // boundBindingPrefix starts the name of every binding of a bound role for
-// role in project: drover-<project>-<role>-clusterrole- for a ClusterRole,
-// and drover-<project>-<role>-role- for a Role. The kind in the name lets the
-// sweep find a binding whose role left the config.
-func boundBindingPrefix(project string, role accountRole, namespaced bool) string {
+// role in project of cluster: drover-<cluster>-<project>-<role>-clusterrole-
+// for a ClusterRole, and drover-<cluster>-<project>-<role>-role- for a Role.
+// The kind in the name lets the sweep find a binding whose role left the
+// config.
+func boundBindingPrefix(cluster, project string, role accountRole, namespaced bool) string {
 	kind := "clusterrole"
 	if namespaced {
 		kind = "role"
 	}
-	return accountPrefix + project + "-" + role.name + "-" + kind + "-"
+	return accountNamespace(cluster, project) + "-" + role.name + "-" + kind + "-"
 }
 
-func boundBindingName(project string, role accountRole, bound BoundRole) string {
-	return boundBindingPrefix(project, role, bound.Namespace != "") + bound.Name
+func boundBindingName(cluster, project string, role accountRole, bound BoundRole) string {
+	return boundBindingPrefix(cluster, project, role, bound.Namespace != "") + bound.Name
 }
 
 // boundBinding returns the binding of bound for the ServiceAccount of role in
-// the account namespace of project, which has the uid.
-func boundBinding(project, uid string, role accountRole, bound BoundRole) binding {
+// the account namespace of project in cluster, which has the uid.
+func boundBinding(cluster, project, uid string, role accountRole, bound BoundRole) binding {
 	bindingKind, roleKind := bound.kinds()
-	b := accountBinding(bindingKind, boundBindingName(project, role, bound), bound.Namespace, bound.Name, project, uid, role)
+	b := accountBinding(bindingKind, boundBindingName(cluster, project, role, bound), bound.Namespace, bound.Name, cluster, project, uid, role)
 	b.RoleRef.Kind = roleKind
 	return b
 }
 
 // isBoundBinding reports whether item is a binding of a bound role for
-// project: its name has the prefix of a project role, with the kind of its
-// scope.
-func isBoundBinding(item binding, project string) bool {
+// project in cluster: its name has the prefix of a project role, with the
+// kind of its scope.
+func isBoundBinding(item binding, cluster, project string) bool {
 	namespaced := item.Metadata.Namespace != ""
 	return slices.ContainsFunc(accountRoles, func(role accountRole) bool {
-		return strings.HasPrefix(item.Metadata.Name, boundBindingPrefix(project, role, namespaced))
+		return strings.HasPrefix(item.Metadata.Name, boundBindingPrefix(cluster, project, role, namespaced))
 	})
 }
 
@@ -112,7 +113,7 @@ func (s *Syncer) ensureBoundRoles(ctx context.Context, token, cluster, name, uid
 	wanted := make(map[string]bool, len(accountRoles)*len(s.boundRoles))
 	for _, role := range accountRoles {
 		for _, bound := range s.boundRoles {
-			want := boundBinding(name, uid, role, bound)
+			want := boundBinding(cluster, name, uid, role, bound)
 			collection, existing := clusterRoleBindingsPath(cluster), clusterBindings
 			if bound.Namespace != "" {
 				collection, existing = roleBindingsPath(cluster, bound.Namespace), roleBindings
@@ -123,12 +124,12 @@ func (s *Syncer) ensureBoundRoles(ctx context.Context, token, cluster, name, uid
 		}
 	}
 	for _, item := range clusterBindings {
-		if isBoundBinding(item, name) && !wanted[bindingKey("", item.Metadata.Name)] {
+		if isBoundBinding(item, cluster, name) && !wanted[bindingKey("", item.Metadata.Name)] {
 			s.dropBinding(ctx, token, cluster, clusterRoleBindingsPath(cluster), item, name, run)
 		}
 	}
 	for _, item := range roleBindings {
-		if isBoundBinding(item, name) && !wanted[bindingKey(item.Metadata.Namespace, item.Metadata.Name)] {
+		if isBoundBinding(item, cluster, name) && !wanted[bindingKey(item.Metadata.Namespace, item.Metadata.Name)] {
 			s.dropBinding(ctx, token, cluster, roleBindingsPath(cluster, item.Metadata.Namespace), item, name, run)
 		}
 	}

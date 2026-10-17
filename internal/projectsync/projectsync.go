@@ -454,15 +454,6 @@ func (s *Syncer) setClusters(clusters map[string]map[string]project) {
 	s.clusters = clusters
 }
 
-// snapshot returns the projects of every cluster, by cluster and project name.
-// The service never writes to the maps after a store, so the caller reads
-// them without the lock.
-func (s *Syncer) snapshot() map[string]map[string]project {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.clusters
-}
-
 // projectsOf returns the projects of a cluster, by project name, from the last
 // reconcile run and the project watch.
 func (s *Syncer) projectsOf(cluster string) map[string]project {
