@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.30.0](https://github.com/evil8io/drover/compare/v0.29.0...v0.30.0) (2026-10-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* **project-sync:** the account namespace is `drover-<cluster id>-<project>`, the ClusterRoleBindings and the bound RoleBindings have that prefix, the `allowed_kubernetes_namespaces` of each OpenBao role follows, and a login role is `<cluster id>_<project>_<statement>`. A client sends the new namespace name in `kubernetes_namespace` of a credential request, and the new role name at a login. The first reconcile run after the upgrade writes the new objects, and it deletes each old login role that the last status of a project names. The old account namespaces and their bindings stay. Delete the old bindings first, then the old namespaces, as `docs/project-sync.md` describes.
+
+### Features
+
+* **project-sync:** put the cluster id in the names of the account namespace, the bindings, and the login roles ([#153](https://github.com/evil8io/drover/issues/153)) ([52ead13](https://github.com/evil8io/drover/commit/52ead13209c86e9e7859ee6cdc876df847114274))
+
 ## [0.29.0](https://github.com/evil8io/drover/compare/v0.28.0...v0.29.0) (2026-10-17)
 
 
