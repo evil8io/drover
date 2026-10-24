@@ -42,6 +42,7 @@ because a topic feels casual or because other prose seems friendlier.
 | Noun clusters | Maximum 3 words stacked as a modifier. Break a longer stack apart and name the relationship. |
 | Sentence length | Maximum 20 words for an instruction or a procedure. Maximum 25 words for descriptive text. |
 | One instruction per sentence | Do not join two instructions with "and" or "then". |
+| One claim per sentence | Do not join two independent claims with ", and". Write two sentences. Join two clauses only when the second depends on the first. |
 | Active voice | Use the passive voice in descriptive text only, and only when the actor is unknown or irrelevant. |
 | Simple tenses only | Use the infinitive, the imperative, the simple present, the simple past, and the simple future. Use a past participle as an adjective only. Do not use the present perfect, the past perfect, or a compound auxiliary. |
 | Own actions in first person | When you state your own action, its result, or your next action, use "I" with the simple past, the simple present, or the simple future. Reserve the imperative for instructions to the reader. |
@@ -52,6 +53,7 @@ because a topic feels casual or because other prose seems friendlier.
 | Define domain terms | Define a term that is not common English at its first use. Do not carry undefined shorthand forward. Ask whether a platform engineer would meet the word in this kind of work. When the answer is no, define the term, or write the plain equivalent. The risk is highest for a word from the field you used to do the work, rather than from the subject of the work. |
 | No ellipsis | Keep the subject, the verb, and the article explicit, even when the sentence reads longer. Start a policy description with its verb, for example "Denies a pod ...". |
 | Contractions | A contraction of a pronoun and an auxiliary is permitted, for example "I'll", "it's", and "don't". A contraction is not ellipsis. |
+| Negation | Negate the verb, not the object. Write "does not have a time limit", not "has no time limit". Write "does not use", not "uses no". |
 | Paragraphs | One topic. Maximum 6 sentences. |
 | Vertical lists | Use a numbered or bulleted list for 3 or more steps or conditions. |
 
@@ -84,8 +86,9 @@ of any length, commit messages, PR bodies, issue text, docs, memory notes, and t
 
 1. Use the plain verb. Ask whether the subject can act by itself. A chart, a value, a
    key, a schema, a file, a module, or a release cannot act. Do not make it the subject
-   of an action verb, of "has", or of "sets". Name the real actor, for example Helm,
-   Kubernetes, Rancher, tofu, or the reader. Or use the passive, "is", "contains",
+   of an action verb, of "has", or of "sets". Do not write "names", "says", or "claims"
+   with such a subject, also when the source text does. Name the real actor, for example
+   Helm, Kubernetes, Rancher, tofu, or the reader. Or use the passive, "is", "contains",
    "needs", or "depends on". Write "Helm renders", "Tofu derives ... in `rbac.tf`", or
    "The verbs are fixed in the templates".
 
@@ -152,6 +155,8 @@ Rule 1 covers a class of verbs, not a fixed list. These are the common replaceme
 | Instead of | Write |
 |------------|-------|
 | carries, holds | contains, is in |
+| names, says, claims | contains, has, is in, "per the README, ..." |
+| has no X, uses no X, is in no X | does not have an X, does not use an X, is not in an X |
 | sits at, sits in | is at, is in |
 | lives in | is in |
 | rests on, rides on | depends on |
@@ -164,7 +169,7 @@ Rule 1 covers a class of verbs, not a fixed list. These are the common replaceme
 | the trap holds | the deadlock is stable |
 | wants, knows, survives | rewrite the sentence with a plain verb |
 
-One example for each repository rule and for 2 STE rules, and a second example for rules
+One example for each repository rule and for 3 STE rules, and a second example for rules
 1 and 6:
 
 | Rule | Do not write | Write |
@@ -173,6 +178,7 @@ One example for each repository rule and for 2 STE rules, and a second example f
 | 1 | kgateway sits at CNCF Sandbox, and the repository holds 1,135 releases. | kgateway is at CNCF Sandbox, and the repository has 1,135 releases. |
 | 2 | The provider upgrade is the real story here, and a rebuild is the safe bet. | After the provider upgrade, tofu plans 3 replacements. A rebuild is safer, because the state contains 12 resources only. |
 | No ellipsis | Three units changed, two plans clean. | I changed three units, and tofu reports no changes for two of the three plans. |
+| One claim per sentence | Three PRs do not need a change, and the provider blocks the fourth. | Three PRs do not need a change. A provider bug blocks the fourth. |
 | 3 | The apply is much faster now. | The apply takes 4m10s, against 11m30s before the change, measured on the test stack. |
 | 4 | Great question. You are absolutely right, I will change the timeout. | The chart default for the timeout is 30s at `values.yaml:88`, so the 5s figure is wrong. |
 | 5 | Good catch. Let me re-read my earlier message, because I phrased the rollback step badly. | The rollback step needs `-replace`, not `state rm`. |
