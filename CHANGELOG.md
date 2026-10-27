@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.30.1](https://github.com/evil8io/drover/compare/v0.30.0...v0.30.1) (2026-10-27)
+
+
+### Bug Fixes
+
+* **deps:** update module google.golang.org/grpc to v1.85.0 ([#161](https://github.com/evil8io/drover/issues/161)) ([72edbe3](https://github.com/evil8io/drover/commit/72edbe3356a1fc219f11ceee2eaeb7a97c1ab209))
+
 ## [0.30.0](https://github.com/evil8io/drover/compare/v0.29.0...v0.30.0) (2026-10-17)
 
 
