@@ -33,7 +33,7 @@ A CI job, or another client outside the cluster, is not a Rancher user. It thus 
 | `project-member` | `edit` |
 | `read-only` | `view` |
 
-project-sync creates the ServiceAccounts in the namespace `drover-<cluster id>-<project>`. That namespace is in a hidden Rancher project with the name `drover`. Tenants do not have a role in that project. Each of the three ServiceAccounts can list the namespaces of its project. `project-owner` and `project-member` can also create namespaces in the project. A client can use a token of such a ServiceAccount through the Rancher proxy, for example with kubectl.
+project-sync creates the ServiceAccounts in the cluster of the project, in the namespace `drover-<cluster id>-<project>`. Each cluster has one hidden Rancher project with the name `drover`, and that namespace is in it. Tenants do not have a role in that hidden project. Each of the three ServiceAccounts can list the namespaces of its project. `project-owner` and `project-member` can also create namespaces in the project. A client can use a token of such a ServiceAccount through the Rancher proxy, for example with kubectl.
 
 Notes:
 
