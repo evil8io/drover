@@ -31,12 +31,15 @@ With `--password-secret`, a run first writes the hash of the password in `--cred
 
 ## Requirements
 
-- Rancher on an `https` URL (`--rancher-url`). For a private certificate, the command needs the CA of Rancher (`--rancher-ca-file`).
-- A local Rancher user as the service user. Its name and its password are in the files `username` and `password` in `--credentials-dir`.
-- A Kubernetes ServiceAccount for the pod, with `get` and `patch` on the token Secret (`--token-secret`). With `--password-secret`, the ServiceAccount also needs `get` and `patch` on that Secret. Rancher keeps that Secret in the namespace `cattle-local-user-passwords`. Both Secrets must exist before the first run.
-- A schedule that starts the command more frequently than `--renew-before`, usually a CronJob.
+Each item states if the [drover chart](https://github.com/evil8io/charts/tree/main/charts/drover) satisfies it.
 
-Helm creates the users, the Secrets, the RBAC objects, and the CronJob from the [drover chart](https://github.com/evil8io/charts/tree/main/charts/drover). The chart needs external-secrets to generate the passwords.
+- Rancher on an `https` URL (`--rancher-url`). With the chart, set the value `rancher.url`.
+- For a private certificate, the CA of Rancher (`--rancher-ca-file`). The chart does not mount a CA file. When the command cannot verify the certificate, set the value `rancher.insecureSkipVerify`.
+- A local Rancher user as the service user. With the chart, Helm creates this user.
+- The name and the password of that user in the files `username` and `password` in `--credentials-dir`. With the chart, external-secrets generates the password. The chart does not contain external-secrets.
+- A Kubernetes ServiceAccount for the pod, with `get` and `patch` on the token Secret (`--token-secret`). With `--password-secret`, the ServiceAccount also needs `get` and `patch` on that Secret. Rancher keeps that Secret in the namespace `cattle-local-user-passwords`. With the chart, Helm creates the ServiceAccount and its rights.
+- Both Secrets, before the first run. With the chart, Helm creates them.
+- A schedule that starts the command more frequently than `--renew-before`. With the chart, a CronJob starts the command at the schedule in `tokenRotation.schedule`, each 10 minutes by default.
 
 ## How to run it
 

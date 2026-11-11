@@ -112,33 +112,41 @@ When you add the ServiceAccount tokens of a cluster as an issuer, use the claim 
 
 ## Requirements
 
+Each item states if the [drover chart](https://github.com/evil8io/charts/tree/main/charts/drover) satisfies it.
+
 **Always**
 
-- A separate Rancher service user for project-sync, with an API token in a mounted file (`--token-file`). Do not use the service user of the api-filter. The api-filter is on the request path of each tenant, so its user must have as few rights as possible. project-sync needs many more rights. A Rancher token expires, so [rotate-token](rotate-token.md) must also renew this token.
-- A network path to Rancher (`--rancher-url`). For an `https` URL with a private certificate, project-sync needs the CA of Rancher (`--rancher-ca-file`).
-- These rights for the service user: `get`, `list`, `watch`, and `patch` on `namespaces` in each downstream cluster. The user also needs `list`, `watch`, and `patch` on the Rancher projects in the `local` cluster.
-- An admission policy that denies a tenant write to a label or an annotation under `managed.drover.evil8.io/`. project-sync trusts its own keys under that prefix. The [drover-policies chart](https://github.com/evil8io/charts/tree/main/charts/drover-policies) contains this policy.
+- A separate Rancher service user for project-sync. Do not use the service user of the api-filter. The api-filter is on the request path of each tenant, so its user must have as few rights as possible. project-sync needs many more rights. With the chart, Helm creates this user.
+- An API token of that user in a mounted file (`--token-file`). A Rancher token expires, so a job must renew it. With the chart, a CronJob runs [rotate-token](rotate-token.md) for this token.
+- A network path to Rancher (`--rancher-url`). With the chart, set the value `rancher.url` to the Rancher Service in the cluster.
+- For an `https` URL with a private certificate, the CA of Rancher (`--rancher-ca-file`). The chart does not mount a CA file. When project-sync cannot verify the certificate, set the value `rancher.insecureSkipVerify`.
+- These rights for the service user: `get`, `list`, `watch`, and `patch` on `namespaces` in each downstream cluster. The user also needs `list`, `watch`, and `patch` on the Rancher projects in the `local` cluster. With the chart, Helm creates the Rancher roles and bindings for these rights.
+- An admission policy that denies a tenant write to a label or an annotation under `managed.drover.evil8.io/`. project-sync trusts its own keys under that prefix. The drover chart does not contain this policy. Install the [drover-policies chart](https://github.com/evil8io/charts/tree/main/charts/drover-policies), which contains it.
 
 **For service accounts**
 
-- More rights for the service user in each cluster. The user needs every verb on `namespaces`, and `create` on Rancher projects. The user also needs the rights to manage ServiceAccounts, RoleBindings, and ClusterRoleBindings. The user also needs `bind` on each role that project-sync binds. These roles are `admin`, `edit`, `view`, `create-ns`, and each role of `--bind-cluster-role` and `--bind-role`.
-- Rancher 2.9.0 or later, and a `ClusterProxyConfig` with `enabled: true` for each cluster. Without them, Rancher does not accept the tokens of the ServiceAccounts.
-- The [api-filter](api-filter.md), when the ServiceAccounts must list their namespaces.
+- More rights for the service user in each cluster. The user needs every verb on `namespaces`, and `create` on Rancher projects. The user also needs the rights to manage ServiceAccounts, RoleBindings, and ClusterRoleBindings. The user also needs `bind` on each role that project-sync binds. These roles are `admin`, `edit`, `view`, `create-ns`, and each role of `--bind-cluster-role` and `--bind-role`. With the chart, Helm adds these rights when `projectSync.serviceAccounts.enabled` is true.
+- Rancher 2.9.0 or later. Without it, Rancher does not accept the tokens of the ServiceAccounts. The chart does not install Rancher.
+- A `ClusterProxyConfig` with `enabled: true` for each cluster. With the chart, Kyverno creates it for each downstream cluster.
+- The [api-filter](api-filter.md), when the ServiceAccounts must list their namespaces. The api-filter is part of the chart.
 
 **For short-lived tokens**
 
-- An OpenBao server that project-sync can connect to (`--openbao-address`).
-- An `https` URL of Rancher that OpenBao can connect to (`--openbao-rancher-url`). OpenBao verifies the certificate of that URL. For a private CA, the Rancher setting `cacerts` must contain the CA.
-- A Kubernetes auth mount in OpenBao, with a role for the ServiceAccount of the project-sync pod. The flags are `--openbao-auth-path`, `--openbao-role`, and `--openbao-jwt-file`. The role needs an ACL policy for the secrets engine mounts, their roles, and the policies under the mount prefix.
-- More rights for the Rancher service user. The user needs `create` on the tokens of the ServiceAccounts, and the rights to manage Roles. The user also needs `get` on the Rancher clusters and on the Rancher setting `cacerts`.
+- An OpenBao server that project-sync can connect to (`--openbao-address`). With the chart, Helm installs OpenBao when `projectSync.serviceAccounts.enabled` is true.
+- An `https` URL of Rancher that OpenBao can connect to (`--openbao-rancher-url`). With the chart, the URL is the value `global.broker.rancherUrl`, or the first entry of `httpRoute.hostnames`.
+- A certificate on that URL that OpenBao can verify. For a private CA, the Rancher setting `cacerts` must contain the CA. The chart does not write that setting.
+- A Kubernetes auth mount in OpenBao, with a role for the ServiceAccount of the project-sync pod. The flags are `--openbao-auth-path`, `--openbao-role`, and `--openbao-jwt-file`. The role needs an ACL policy for the secrets engine mounts, their roles, and the policies under the mount prefix. With the chart, OpenBao creates the auth mount at its first start. A Helm hook writes the role and the policy.
+- More rights for the Rancher service user. The user needs `create` on the tokens of the ServiceAccounts, and the rights to manage Roles. The user also needs `get` on the Rancher clusters and on the Rancher setting `cacerts`. With the chart, Helm adds these rights.
 
 **For login roles**
 
-- A JWT auth mount at `auth/jwt/<issuer>` for each issuer in the file of `--trust-file`, with the configuration of that issuer. For AWS identities, an AWS auth mount at `auth/aws`.
-- An ACL policy for project-sync that also includes the roles of those auth mounts.
-- A network path from the clients, for example CI runners, to OpenBao and to Rancher.
+- The file of `--trust-file`. With the chart, Helm writes this file from the values under `global.broker`.
+- A JWT auth mount at `auth/jwt/<issuer>` for each issuer in that file, with the configuration of that issuer. With the chart, a Helm hook creates one mount for each entry of `global.broker.jwtIssuers`.
+- For AWS identities, an AWS auth mount at `auth/aws`. With the chart, a Helm hook creates it when `global.broker.aws.enabled` is true.
+- An ACL policy for project-sync that also includes the roles of those auth mounts. With the chart, the same Helm hook writes it.
+- A network path from the clients, for example CI runners, to OpenBao and to Rancher. With the chart, set `openbao.server.gateway.httpRoute` for the route to OpenBao. The chart does not contain the Gateway.
 
-Helm creates all these objects from the [drover chart](https://github.com/evil8io/charts/tree/main/charts/drover), also OpenBao. The permission lists and the OpenBao policies are in [.claude/docs/project-sync.md](../.claude/docs/project-sync.md).
+The permission lists and the OpenBao policies are in [.claude/docs/project-sync.md](../.claude/docs/project-sync.md).
 
 ## How to run it
 

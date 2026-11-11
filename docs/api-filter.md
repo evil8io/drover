@@ -42,21 +42,24 @@ A ServiceAccount is not a Rancher user, so it is not a member of a project. The 
 
 ## Requirements
 
+Each item states if the [drover chart](https://github.com/evil8io/charts/tree/main/charts/drover) satisfies it.
+
 **Rancher**
 
-- A Rancher service user with `get`, `list`, and `watch` on `namespaces` in each downstream cluster. A `cluster-owner` binding also gives these rights.
-- An API token of that user in a mounted file (`--token-file`). A Rancher token expires, so a job must renew it. [rotate-token](rotate-token.md) does this.
-- A network path from the api-filter to the Rancher Service in the cluster (`--upstream`). Do not use the public Rancher hostname. On that hostname, the Gateway sends the filtered paths back to the api-filter. For an `https` upstream with a private certificate, the api-filter needs the CA of Rancher (`--upstream-ca-file`).
+- A Rancher service user with `get`, `list`, and `watch` on `namespaces` in each downstream cluster. A `cluster-owner` binding also gives these rights. With the chart, Helm creates this user and its Rancher roles.
+- An API token of that user in a mounted file (`--token-file`). A Rancher token expires, so a job must renew it. With the chart, a CronJob runs [rotate-token](rotate-token.md) for this token.
+- A network path from the api-filter to the Rancher Service in the cluster (`--upstream`). With the chart, set the value `rancher.url` to that Service. Do not use the public Rancher hostname. On that hostname, the Gateway sends the filtered paths back to the api-filter.
+- For an `https` upstream with a private certificate, the CA of Rancher (`--upstream-ca-file`). The chart does not mount a CA file. When the api-filter cannot verify the certificate, set the value `rancher.insecureSkipVerify`.
 
 **A Gateway API controller in front of Rancher**
 
-A Gateway API implementation must serve the Rancher hostname. An Ingress controller is not sufficient, because the routes below match on the HTTP method. The controller must support these features:
+A Gateway API implementation must serve the Rancher hostname. The chart does not contain a Gateway API controller or a Gateway. Set the value `httpRoute.parentRefs` to your Gateway. An Ingress controller is not sufficient, because the routes below match on the HTTP method. The controller must support these features:
 
 - `HTTPRoute` rules with a method match, and with `Exact` and `PathPrefix` path matches. The controller must apply the standard precedence: an exact match first, then the longest prefix.
-- Responses that stay open for minutes without a buffer, and websocket upgrades. Watches, `exec`, and log streams stay open for minutes. Give the routes a long request timeout, or no timeout.
-- A backend in another namespace (`ReferenceGrant`), when the api-filter and Rancher are in different namespaces.
+- Responses that stay open for minutes without a buffer, and websocket upgrades. Watches, `exec`, and log streams stay open for minutes. The routes thus need a long request timeout, or no timeout. The routes of the chart have the `HTTPRoute` request timeout `0s`. When your controller ignores that field, configure the timeout in the controller.
+- A backend in another namespace (`ReferenceGrant`), when the api-filter and Rancher are in different namespaces. Helm does not create the `ReferenceGrant`.
 
-Each downstream cluster needs one set of routes:
+Each downstream cluster needs one set of routes. With the chart, Kyverno creates these routes for each cluster, so the chart needs Kyverno with its cleanup controller. Without the chart, create the routes yourself.
 
 | Match | Method | Path | Target |
 | --- | --- | --- | --- |
@@ -70,10 +73,9 @@ The last route keeps the namespaced reads, `exec`, `attach`, `portforward`, and 
 
 **For ServiceAccount callers**
 
-- Rancher 2.9.0 or later, and a `ClusterProxyConfig` with `enabled: true` for the cluster.
-- A ClusterRoleBinding of the ServiceAccount to a role that grants `get` on `namespaces`, with the allowed namespaces in `resourceNames`. [project-sync](project-sync.md) creates these bindings for the project ServiceAccounts.
-
-Helm creates these objects from the [drover chart](https://github.com/evil8io/charts/tree/main/charts/drover): the service user, the token and its rotation, the routes for each cluster, and the `ClusterProxyConfig`. The chart needs Kyverno for the routes and the `ClusterProxyConfig`.
+- Rancher 2.9.0 or later. The chart does not install Rancher.
+- A `ClusterProxyConfig` with `enabled: true` for the cluster. With the chart, Kyverno creates it for each downstream cluster.
+- A ClusterRoleBinding of the ServiceAccount to a role that grants `get` on `namespaces`, with the allowed namespaces in `resourceNames`. [project-sync](project-sync.md) creates these bindings for the project ServiceAccounts. For another ServiceAccount, create the binding yourself.
 
 ## How to run it
 
