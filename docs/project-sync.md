@@ -103,7 +103,7 @@ The platform team sets the limits for all projects in the file of `--trust-file`
 }
 ```
 
-- `jwtIssuers` contains the JWT issuers that a statement can use. Each issuer needs a JWT auth mount at `auth/jwt/<issuer>` in OpenBao. The AWS method needs an auth mount at `auth/aws`. project-sync does not create auth mounts.
+- `jwtIssuers` contains the JWT issuers that a statement can use. Each issuer needs a JWT auth mount at `auth/jwt/<issuer>` in OpenBao. The AWS method needs an auth mount at `auth/aws`. project-sync does not create auth mounts. With the drover chart, a Helm hook creates them: one JWT mount for each entry of `global.broker.jwtIssuers`, by default GitHub Actions and GitLab.com. The hook creates the AWS mount when `global.broker.aws.enabled` is true.
 - `requiredClaims` contains the claims that each statement of the issuer must contain, for example the repository id. `allowedClaims` limits the values of a claim.
 - `audience` is the audience that a JWT must have.
 - `aws.enabled` enables the AWS method. `aws.allowedAccounts` limits the method to a list of accounts.
