@@ -21,33 +21,33 @@
 
 # Why drover
 
-Rancher provides centralised authentication, authorization, project management, and self-service for its users. A tenant is a member of one or more Rancher projects. A tenant has rights in the namespaces of those projects only.
+Rancher provides centralised authentication, authorization, project management, and self-service for its users. Users are members of one or more Rancher projects. Users have access to their own namespaces inside those projects.
 
-The Rancher UI and rancher-cli show a tenant the namespaces of its projects. Through the Kubernetes API, a namespace list needs the right to list all namespaces of the cluster. A tenant does not have that right. Client applications that use the Kubernetes API, for example kubectl and k9s, thus do not show the namespaces of a tenant.
+drover adds the following features:
 
-drover adds these features for the tenants of the Rancher projects:
+- Allow users to list (only) their namespaces with kubectl, e.g. `kubectl get namespaces`
+- Optionally, allow users to request resources across all their namespaces, e.g. `kubectl get configmaps --all-namespaces`
+- Automatically propagate project labels and annotations to the namespaces of the project
+- Provide a mechanism to furnish short-lived kubectl tokens to non-human entities, such as CI workflows (see [drover-login-action](https://github.com/evil8io/drover-login-action))
+- Provide a set of policies that enhance the isolation of multiple tenants
 
-- A tenant lists the namespaces of its projects through the Kubernetes API. Client applications such as kubectl and k9s then show these namespaces.
-- Each namespace gets a configured set of labels and annotations of its project.
-- A client outside the cluster, for example a CI job, gets a short-lived token for a project without a stored secret.
-- Kyverno isolates the tenants from each other with a baseline of policies.
+# Components
 
-# What drover does
-
-The goal of drover is to improve the developer experience with Kubernetes clusters that Rancher manages. drover does this with a set of Helm charts:
+drover comes as a set of helm-charts:
 
 | Chart | Location | Management Cluster | Workload Cluster | Description |
 | --- | --- | --- | --- | --- |
-| drover | [charts/drover](https://github.com/evil8io/charts/tree/main/charts/drover) | ✅ | ❌ | A set of services that improve the developer experience. |
-| drover-policies | [charts/drover-policies](https://github.com/evil8io/charts/tree/main/charts/drover-policies) | ✅ | ✅ | A strict baseline of Kyverno policies. With these policies, Kyverno isolates tenants, and it forces a secure configuration for workloads. |
+| drover | [charts/drover](https://github.com/evil8io/charts/tree/main/charts/drover) | ✅ | ❌ | Services and Kyverno policies |
+| drover-policies | [charts/drover-policies](https://github.com/evil8io/charts/tree/main/charts/drover-policies) | ✅ | ✅ | Kyverno policies |
 
 ## Services
 
 | Service | Subcommand | Function | Docs |
 | --- | --- | --- | --- |
-| API filter | `api-filter` | A reverse proxy in front of Rancher. It lets users list their project namespaces with kubectl. It also limits the `--all-namespaces` flag to their project namespaces. | [docs/api-filter.md](docs/api-filter.md) |
-| Project sync | `project-sync` | A service that copies a configured set of labels and annotations from a Rancher project to the namespaces of that project. With `--service-accounts`, it also keeps three ServiceAccounts per project, one per project role. With `--openbao-address` as well, it writes the OpenBao config for the [short-lived credentials](#short-lived-credentials). | [docs/project-sync.md](docs/project-sync.md) |
-| Token rotation | `rotate-token` | A command that rotates the API token of a Rancher service user of drover. With `--password-secret`, it also writes the password hash of that user. It reads the password from a file. A CronJob runs the command. | [docs/rotate-token.md](docs/rotate-token.md) |
+| API filter | `api-filter` | Reverse proxy in front of Rancher.<br>Allows users to list their project namespaces with kubectl.<br>Limits the `--all-namespaces` flag to allowed project namespaces. | [docs/api-filter.md](docs/api-filter.md) |
+| OpenBao | N/A | Facilitates short-lived access tokens. | [chart README](https://github.com/evil8io/charts/tree/main/charts/drover#short-lived-credentials) |
+| Project sync | `project-sync` | Propagates project metadata.<br>Automatically programs OpenBao for each Rancher cluster and project. | [docs/project-sync.md](docs/project-sync.md) |
+| Token rotation | `rotate-token` | Rotates Rancher credentials used by drover itself. | [docs/rotate-token.md](docs/rotate-token.md) |
 
 ## Example
 
@@ -71,20 +71,6 @@ NAMESPACE   NAME               DATA   AGE
 shire       kube-root-ca.crt   1      15s
 gondor      kube-root-ca.crt   1      10s
 ```
-
-## Short-lived credentials
-
-A client outside the cluster, for example a CI job, needs a Kubernetes credential to work in the namespaces of a project. With drover, the client does not need a stored secret:
-
-1. The client logs in to [OpenBao](https://openbao.org) with the identity that it already has: the JWT of its CI system, or its AWS IAM role.
-2. OpenBao returns a token of a ServiceAccount of the project. With the default values of the chart, the token is valid for 15 minutes.
-3. The client uses the token through Rancher, for example with kubectl or helm.
-
-In an annotation of the Rancher project, a project owner lists the identities that can log in, each with a project role.
-
-- Helm installs OpenBao from the [drover chart](https://github.com/evil8io/charts/tree/main/charts/drover). The README of the chart contains the values and the format of the annotation.
-- [drover-login-action](https://github.com/evil8io/drover-login-action) is a GitHub Action that does these steps in a workflow.
-- The OpenBao objects that `project-sync` writes are in [docs/project-sync.md](docs/project-sync.md).
 
 ## Contributing
 
