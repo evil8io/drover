@@ -19,28 +19,35 @@
 
 **drover** is a set of extensions for [Rancher](https://github.com/rancher/rancher).
 
-# What's the problem with Rancher?
+# Why drover
 
-Rancher provides centralised authentication, authorization, project management, and self-service for its users. However, Rancher does not have some convenience features. Without these features, Rancher is not complete as a multi-tenant Kubernetes platform. For example, Rancher does not have a set of policies that isolate tenants from each other sufficiently.
+Rancher provides centralised authentication, authorization, project management, and self-service for its users. Users are members of one or more Rancher projects. Users have access to their own namespaces inside those projects.
 
-Similarly, the native client applications that engineers use, for example kubectl, k9s, and openlens, do not work well. The reason is that Rancher lists project namespaces only through its own UI and rancher-cli. Rancher does not list project namespaces through the Kubernetes API.
+drover adds the following features:
 
-# What drover does
+- Allow users to list (only) their namespaces with kubectl, e.g. `kubectl get namespaces`
+- Allow users to request resources across all their namespaces, e.g. `kubectl get configmaps --all-namespaces`
+- Automatically propagate project labels and annotations to the namespaces of the project
+- Provide a mechanism to furnish short-lived kubectl tokens to non-human entities, such as CI workflows (see [drover-login-action](https://github.com/evil8io/drover-login-action))
+- Provide a set of policies that enhance the isolation of multiple tenants
 
-The goal of drover is to improve the developer experience with Kubernetes clusters that Rancher manages. drover does this with a set of Helm charts:
+# Components
+
+drover comes as a set of helm-charts:
 
 | Chart | Location | Management Cluster | Workload Cluster | Description |
 | --- | --- | --- | --- | --- |
-| drover | [charts/drover](https://github.com/evil8io/charts/tree/main/charts/drover) | ✅ | ❌ | A set of services that improve the developer experience. |
-| drover-policies | [charts/drover-policies](https://github.com/evil8io/charts/tree/main/charts/drover-policies) | ✅ | ✅ | A strict baseline of Kyverno policies. With these policies, Kyverno isolates tenants, and it forces a secure configuration for workloads. |
+| drover | [charts/drover](https://github.com/evil8io/charts/tree/main/charts/drover) | ✅ | ❌ | Services and Kyverno policies |
+| drover-policies | [charts/drover-policies](https://github.com/evil8io/charts/tree/main/charts/drover-policies) | ✅ | ✅ | Kyverno policies |
 
 ## Services
 
 | Service | Subcommand | Function | Docs |
 | --- | --- | --- | --- |
-| API filter | `api-filter` | A reverse proxy in front of Rancher. It lets users list their project namespaces with kubectl. It also limits the `--all-namespaces` flag to their project namespaces. | [docs/api-filter.md](docs/api-filter.md) |
-| Project sync | `project-sync` | A service that copies a configured set of labels and annotations from a Rancher project to the namespaces of that project. | [docs/project-sync.md](docs/project-sync.md) |
-| Token rotation | `rotate-token` | A command that rotates the API token of a Rancher service user of drover. With `--password-secret`, it also writes the password hash of that user. It reads the password from a file. A CronJob runs the command. | [docs/rotate-token.md](docs/rotate-token.md) |
+| API filter | `api-filter` | Reverse proxy in front of Rancher.<br>Allows users to list their project namespaces with kubectl.<br>Limits the `--all-namespaces` flag to allowed project namespaces. | [docs/api-filter.md](docs/api-filter.md) |
+| OpenBao | N/A | Facilitates short-lived access tokens. | [chart README](https://github.com/evil8io/charts/tree/main/charts/drover#short-lived-credentials) |
+| Project sync | `project-sync` | Propagates project metadata.<br>Automatically programs OpenBao for each Rancher cluster and project. | [docs/project-sync.md](docs/project-sync.md) |
+| Token rotation | `rotate-token` | Rotates Rancher credentials used by drover itself. | [docs/rotate-token.md](docs/rotate-token.md) |
 
 ## Example
 
