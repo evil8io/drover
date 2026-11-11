@@ -19,7 +19,13 @@
 
 **drover** is a set of extensions for [Rancher](https://github.com/rancher/rancher).
 
-Rancher provides centralised authentication, authorization, project management, and self-service for its users. drover adds these features for the tenants of the Rancher projects:
+# Why drover
+
+Rancher provides centralised authentication, authorization, project management, and self-service for its users. A tenant is a member of one or more Rancher projects. A tenant has rights in the namespaces of those projects only.
+
+The Rancher UI and rancher-cli show a tenant the namespaces of its projects. Through the Kubernetes API, a namespace list needs the right to list all namespaces of the cluster. A tenant does not have that right. Client applications that use the Kubernetes API, for example kubectl and k9s, thus do not show the namespaces of a tenant.
+
+drover adds these features for the tenants of the Rancher projects:
 
 - A tenant lists the namespaces of its projects through the Kubernetes API. Client applications such as kubectl and k9s then show these namespaces.
 - Each namespace gets a configured set of labels and annotations of its project.
