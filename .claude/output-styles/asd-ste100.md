@@ -43,7 +43,7 @@ because a topic feels casual or because other prose seems friendlier.
 | Sentence length | Maximum 20 words for an instruction or a procedure. Maximum 25 words for descriptive text. |
 | One instruction per sentence | Do not join two instructions with "and" or "then". |
 | One claim per sentence | Do not join two independent claims with ", and". Write two sentences. Join two clauses only when the second depends on the first. |
-| Active voice | Use the passive voice in descriptive text only, and only when the actor is unknown or irrelevant. |
+| Voice | Use the active voice when the reader needs the actor, and for each instruction. Use the passive voice for an event on an object when the actor is unknown or not relevant: "when a project is deleted", "when a namespace is moved to another project". |
 | Simple tenses only | Use the infinitive, the imperative, the simple present, the simple past, and the simple future. Use a past participle as an adjective only. Do not use the present perfect, the past perfect, or a compound auxiliary. |
 | Own actions in first person | When you state your own action, its result, or your next action, use "I" with the simple past, the simple present, or the simple future. Reserve the imperative for instructions to the reader. |
 | No `-ing` verb forms | Use an `-ing` word as a technical noun, or as part of one, only. |
@@ -91,6 +91,12 @@ of any length, commit messages, PR bodies, issue text, docs, memory notes, and t
    Helm, Kubernetes, Rancher, tofu, or the reader. Or use the passive, "is", "contains",
    "needs", or "depends on". Write "Helm renders", "Tofu derives ... in `rbac.tf`", or
    "The verbs are fixed in the templates".
+
+   For an event that has more than one possible actor, do not invent an actor, and do
+   not describe the event from the side of a system. Write the event in the passive
+   voice. Write "when a project is deleted", not "when Rancher no longer has a project".
+   Write "when a namespace is removed from its project", not "when a namespace leaves
+   its project".
 
    For another subject that cannot act, write "is", "has", "contains", "needs", or
    "depends on". Also ask whether the verb names the literal action. A subject that can
@@ -167,6 +173,9 @@ Rule 1 covers a class of verbs, not a fixed list. These are the common replaceme
 | floors (as a verb) | the minimum is |
 | a cold X | an X with an empty history or cache |
 | the trap holds | the deadlock is stable |
+| no longer has X, X is gone | X is deleted, X is removed from Y |
+| joins, leaves, moves to (for an object) | is added to, is removed from, is moved to |
+| gets (for a flag or a key) | "Set the flag to ...", "<service> writes ... to the key" |
 | wants, knows, survives | rewrite the sentence with a plain verb |
 
 One example for each repository rule and for 3 STE rules, and a second example for rules
@@ -178,6 +187,7 @@ One example for each repository rule and for 3 STE rules, and a second example f
 | 1 | kgateway sits at CNCF Sandbox, and the repository holds 1,135 releases. | kgateway is at CNCF Sandbox, and the repository has 1,135 releases. |
 | 2 | The provider upgrade is the real story here, and a rebuild is the safe bet. | After the provider upgrade, tofu plans 3 replacements. A rebuild is safer, because the state contains 12 resources only. |
 | No ellipsis | Three units changed, two plans clean. | I changed three units, and tofu reports no changes for two of the three plans. |
+| Passive for an event | When Rancher no longer has a project, the service removes its roles. | When a project is deleted, the service removes its roles. |
 | One claim per sentence | Three PRs do not need a change, and the provider blocks the fourth. | Three PRs do not need a change. A provider bug blocks the fourth. |
 | 3 | The apply is much faster now. | The apply takes 4m10s, against 11m30s before the change, measured on the test stack. |
 | 4 | Great question. You are absolutely right, I will change the timeout. | The chart default for the timeout is 30s at `values.yaml:88`, so the 5s figure is wrong. |
