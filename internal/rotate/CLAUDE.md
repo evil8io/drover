@@ -1,6 +1,6 @@
 # rotate-token
 
-The document for human readers is `docs/rotate-token.md`. Read it first, and update it together with a behaviour change. Do not repeat its content here.
+The reference of this component is `.claude/docs/rotate-token.md`. Read it first, and update it together with a behaviour change. Do not repeat its content here. `docs/rotate-token.md` is the short document for users.
 
 These facts about Rancher tokens were verified against Rancher 2.14.5:
 

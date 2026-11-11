@@ -31,7 +31,8 @@ Write a rule in the imperative. Give the reason for the rule. Delete a line when
 
 ## Docs
 
-- `docs/<subcommand>.md` is the document of a component for human readers. Read it before you change that component. Update it in the same pull request when one of these items of the component changes:
+- `docs/<subcommand>.md` is the document of a component for users. Keep it short. It contains the purpose of the component, its mechanisms at a high level, and the limits that a user sees. Do not put a request sequence, a flag table, a log field, or a metric table in it. Update it only when one of those three subjects changes.
+- `.claude/docs/<subcommand>.md` is the reference of a component. Read it before you change that component. Update it in the same pull request when one of these items of the component changes:
   - the behaviour
   - a flag
   - a permission
