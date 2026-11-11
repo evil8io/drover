@@ -40,21 +40,38 @@ A ServiceAccount token of a downstream cluster also works, when Rancher accepts 
 
 ## Requirements
 
-- A Rancher service user with `get`, `list`, and `watch` on `namespaces` in every cluster, and an API token of that user in a mounted file (`--token-file`).
-- `--upstream` set to the Rancher Service inside the cluster. The public Rancher hostname does not work, because the Gateway routes the filtered paths on that hostname back to the filter.
-- These routes on the Rancher hostname, per cluster:
+**Rancher**
 
-  | Match | Method | Path | Target |
-  | --- | --- | --- | --- |
-  | `Exact` | GET | `/k8s/clusters/<id>/api/v1/namespaces` | api-filter |
-  | `Exact` | POST | `/k8s/clusters/<id>/apis/authorization.k8s.io/v1/selfsubjectaccessreviews` | api-filter |
-  | `PathPrefix` | GET | `/k8s/clusters/<id>/api/v1` | api-filter (fan-out only) |
-  | `PathPrefix` | GET | `/k8s/clusters/<id>/apis` | api-filter (fan-out only) |
-  | `PathPrefix` | GET | `/k8s/clusters/<id>/api/v1/namespaces` | Rancher (fan-out only) |
+- A Rancher service user with `get`, `list`, and `watch` on `namespaces` in every downstream cluster. A `cluster-owner` binding also works.
+- An API token of that user in a mounted file (`--token-file`). Rancher tokens expire, so something has to renew it; that is what [rotate-token](rotate-token.md) is for.
+- Network access from the filter to the Rancher Service inside the cluster (`--upstream`). The public Rancher hostname does not work, because the Gateway routes the filtered paths on that hostname back to the filter. For an `https` upstream with a private certificate, the filter needs the CA of Rancher (`--upstream-ca-file`).
 
-  The last route keeps namespaced reads, `exec`, `attach`, `portforward`, and log streams on Rancher. Watches and those streams stay open for minutes, so the routes need a long or unlimited request timeout.
+**A Gateway API controller in front of Rancher**
 
-The [drover chart](https://github.com/evil8io/charts/tree/main/charts/drover) creates the service user, the token, and the routes.
+The Rancher hostname must be served by a Gateway API implementation. An Ingress controller is not enough, because the routes below match on the HTTP method. The controller must support:
+
+- `HTTPRoute` rules with a method match and with `Exact` and `PathPrefix` path matches, in the standard precedence (exact before prefix, longer prefix before shorter).
+- Long-running, unbuffered responses and websocket upgrades. Watches, `exec`, and log streams stay open for minutes, so the routes need a long or unlimited request timeout.
+- A backend in another namespace (`ReferenceGrant`), if the filter and Rancher run in different namespaces.
+
+One set of routes is needed per downstream cluster:
+
+| Match | Method | Path | Target |
+| --- | --- | --- | --- |
+| `Exact` | GET | `/k8s/clusters/<id>/api/v1/namespaces` | api-filter |
+| `Exact` | POST | `/k8s/clusters/<id>/apis/authorization.k8s.io/v1/selfsubjectaccessreviews` | api-filter |
+| `PathPrefix` | GET | `/k8s/clusters/<id>/api/v1` | api-filter (fan-out only) |
+| `PathPrefix` | GET | `/k8s/clusters/<id>/apis` | api-filter (fan-out only) |
+| `PathPrefix` | GET | `/k8s/clusters/<id>/api/v1/namespaces` | Rancher (fan-out only) |
+
+The last route keeps namespaced reads, `exec`, `attach`, `portforward`, and log streams on Rancher.
+
+**For ServiceAccount callers**
+
+- Rancher 2.9.0 or later, with a `ClusterProxyConfig` that has `enabled: true` for the cluster.
+- A ClusterRoleBinding for the ServiceAccount to a role that grants `get` on `namespaces` with the allowed namespaces in `resourceNames`. [project-sync](project-sync.md) creates these for the project ServiceAccounts.
+
+The [drover chart](https://github.com/evil8io/charts/tree/main/charts/drover) takes care of the service user, the token and its rotation, the routes for every cluster, and the `ClusterProxyConfig`. It needs Kyverno for the last two.
 
 ## Running it
 

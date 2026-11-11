@@ -31,7 +31,11 @@ With `--password-secret`, a run first writes the hash of the password from `--cr
 
 ## Requirements
 
-- The files `username` and `password` of the service user in `--credentials-dir`.
-- `get` and `patch` on the token Secret (`--token-secret`). With `--password-secret`, also `get` and `patch` on that Secret. Both Secrets must exist before the first run.
+- Rancher reachable on an `https` URL (`--rancher-url`), and its CA for a private certificate (`--rancher-ca-file`).
+- A local Rancher user for the service user, with its `username` and `password` as files in `--credentials-dir`.
+- A Kubernetes ServiceAccount for the pod with `get` and `patch` on the token Secret (`--token-secret`). With `--password-secret`, also `get` and `patch` on that Secret, which Rancher keeps in the namespace `cattle-local-user-passwords`. Both Secrets must exist before the first run.
+- Something that runs the command on a schedule shorter than `--renew-before`, usually a CronJob.
+
+The [drover chart](https://github.com/evil8io/charts/tree/main/charts/drover) creates the users, the Secrets, the RBAC, and the CronJob. It needs external-secrets to generate the passwords.
 
 `drover rotate-token --help` lists every flag with its default. The command writes JSON logs to stderr, and never logs a token or the password. The details of each step are in [.claude/docs/rotate-token.md](../.claude/docs/rotate-token.md).

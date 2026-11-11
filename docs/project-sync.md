@@ -111,11 +111,32 @@ If you trust the ServiceAccount tokens of a cluster as an issuer, bind the claim
 
 ## Requirements
 
-- A Rancher service user of its own, with an API token in a mounted file (`--token-file`). Do not share the user of the api-filter: project-sync needs far wider rights, and the api-filter sits on the request path of every tenant.
-- For project metadata, that user needs `get`, `list`, `watch`, and `patch` on `namespaces` in every cluster, and `list`, `watch`, and `patch` on Rancher projects. The other jobs add rights to create namespaces, ServiceAccounts, roles, and bindings.
-- For the short-lived tokens, OpenBao needs a Kubernetes auth mount that project-sync can log in to, with a policy for the mounts, roles, and policies that the service writes.
+**Always**
 
-The [drover chart](https://github.com/evil8io/charts/tree/main/charts/drover) sets all of this up, including OpenBao itself. The exact permission lists and the OpenBao policy are in [.claude/docs/project-sync.md](../.claude/docs/project-sync.md).
+- A Rancher service user of its own, with an API token in a mounted file (`--token-file`). Do not share the user of the api-filter: project-sync needs far wider rights, and the api-filter sits on the request path of every tenant. Rancher tokens expire, so [rotate-token](rotate-token.md) has to renew this one too.
+- Network access to Rancher (`--rancher-url`), and the CA of Rancher for an `https` URL (`--rancher-ca-file`).
+- For that user: `get`, `list`, `watch`, and `patch` on `namespaces` in every downstream cluster, and `list`, `watch`, and `patch` on Rancher projects in the `local` cluster.
+- An admission policy that stops tenants from writing labels and annotations under `managed.drover.evil8.io/`. project-sync trusts its own keys under that prefix. The [drover-policies chart](https://github.com/evil8io/charts/tree/main/charts/drover-policies) has this policy.
+
+**For service accounts**
+
+- More rights for the service user, in every cluster: all verbs on `namespaces`, create Rancher projects, manage ServiceAccounts, RoleBindings, and ClusterRoleBindings, and `bind` on the roles it hands out (`admin`, `edit`, `view`, `create-ns`, and every role of `--bind-cluster-role` and `--bind-role`).
+- For the tokens of these ServiceAccounts to work through Rancher: Rancher 2.9.0 or later, with a `ClusterProxyConfig` that has `enabled: true` for each cluster.
+- The [api-filter](api-filter.md), if the ServiceAccounts should be able to list their namespaces.
+
+**For short-lived tokens**
+
+- An OpenBao server that project-sync can reach (`--openbao-address`), and that can reach Rancher on an `https` URL (`--openbao-rancher-url`). OpenBao verifies that certificate; for a private CA, the Rancher setting `cacerts` must contain it.
+- A Kubernetes auth mount in OpenBao with a role for the ServiceAccount of the project-sync pod (`--openbao-auth-path`, `--openbao-role`, `--openbao-jwt-file`), and an ACL policy that lets that role manage the secrets engine mounts, their roles, and the policies under the mount prefix.
+- More rights for the Rancher service user: create tokens of the ServiceAccounts, manage Roles, and `get` on Rancher clusters and on the Rancher setting `cacerts`.
+
+**For login roles**
+
+- A JWT auth mount at `auth/jwt/<issuer>` for every issuer in the rules file, already configured for that issuer. For AWS identities, an AWS auth mount at `auth/aws`.
+- The ACL policy of project-sync extended to the roles of those auth mounts.
+- A route from the clients (CI runners, cloud workloads) to OpenBao and to Rancher.
+
+The [drover chart](https://github.com/evil8io/charts/tree/main/charts/drover) sets all of this up, including OpenBao itself. The exact permission lists and the OpenBao policies are in [.claude/docs/project-sync.md](../.claude/docs/project-sync.md).
 
 ## Running it
 
