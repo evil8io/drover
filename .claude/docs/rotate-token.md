@@ -9,22 +9,20 @@ The command runs once. A run does these steps:
 1. The command reads the token from the Secret.
 2. The command asks Rancher for the expiry time of the token. When the time until the token expires is longer than `--renew-before`, the token is valid, and the run ends with no change.
 3. To get a new token, the command logs in to Rancher as the service user.
-4. The command uses the login session to create the new token. The login is only a first step, because Rancher ignores the TTL of a login token.
+4. The command uses the login session to create the new token.
 5. The command patches the Secret.
 6. The command deletes the old tokens.
 7. The command logs out to end the session.
 
-The command accepts only an https URL for `--rancher-url`, because it sends the password in the body of the login request. The command never follows a redirect, and it never sends the password a second time. A redirect response fails the run, except in the `logout` step, which only logs a warning.
+The command accepts only an https URL for `--rancher-url`, because it sends the password in the body of the login request. The command never follows a redirect. A redirect response fails the run, except in the `logout` step, which only logs a warning.
 
-Rancher reduces a TTL above its own maximum and returns no error. For this reason, the command logs a warning when the TTL in the response of Rancher differs from the requested TTL. When Rancher reduces the TTL to less than `--renew-before` plus 1 hour, the run completes the rotation and then exits with code 1. The reason is that the new token then rotates again within 1 hour.
-
-The run does not rotate a token that expires inside `--renew-before` when the token is younger than 5 minutes. The run then exits with code 1, and it does not change the token. A pod reads the mounted Secret with a delay after the patch. A second rotation in that delay deletes the token that the pod reads. For example, a retry of the Job after a reduced TTL finds such a token.
+Rancher reduces a TTL above its own maximum and returns no error. For this reason, the command logs a warning when the TTL in the response of Rancher differs from the requested TTL.
 
 The run keeps the new token and the token that it read from the Secret. It deletes the other tokens with the `--description` value, except the newest tokens up to a total of `--keep` tokens. It also deletes the login tokens of earlier runs, which have the description `<description> login`.
 
-When `--password-secret` is set to a Secret, a run first writes the password hash into that Secret. Rancher reads the hash when a local user logs in. Rancher gives that Secret the name of the User object, and the Secret is in the namespace `cattle-local-user-passwords`. When the Secret already contains the current hash, the run does not change the Secret. The ServiceAccount needs the `get` and `patch` permissions on that one Secret.
+When `--password-secret` is set to a Secret, a run first writes the password hash into that Secret. Rancher reads the hash when a local user logs in. Rancher gives that Secret the name of the User object, and the Secret is in the namespace `cattle-local-user-passwords`. The ServiceAccount needs the `get` and `patch` permissions on that one Secret.
 
-When the password step fails, the run does not stop. The token steps still run. The run then exits with code 1 and reports the error of the password step.
+After a failed password step, the run exits with code 1 and reports the error of that step.
 
 Usually, a CronJob runs the command, because most runs find a valid token and exit with code 0.
 
