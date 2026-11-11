@@ -26,7 +26,7 @@ Rancher provides centralised authentication, authorization, project management, 
 drover adds the following features:
 
 - Allow users to list (only) their namespaces with kubectl, e.g. `kubectl get namespaces`
-- Optionally, allow users to request resources across all their namespaces, e.g. `kubectl get configmaps --all-namespaces`
+- Allow users to request resources across all their namespaces, e.g. `kubectl get configmaps --all-namespaces`
 - Automatically propagate project labels and annotations to the namespaces of the project
 - Provide a mechanism to furnish short-lived kubectl tokens to non-human entities, such as CI workflows (see [drover-login-action](https://github.com/evil8io/drover-login-action))
 - Provide a set of policies that enhance the isolation of multiple tenants
