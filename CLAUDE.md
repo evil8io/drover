@@ -7,14 +7,14 @@ Write a rule in the imperative. Give the reason for the rule. Delete a line when
 ## Public repository
 
 - This repository is public. Do not write a company name, a customer name, an environment name, or an issue tracker ID anywhere. This rule applies to code, comments, commit messages, branch names, and pull request text. Link an issue from the tracker to the pull request by hand. The domain `drover.evil8.io` in the key prefixes is the one exception, because the GitHub organisation is already in the module path.
-- Put every key of drover itself under the prefix `managed.drover.evil8.io/`, for example `managed.drover.evil8.io/synced-labels`. The keys that project-sync copies from a Rancher project to its namespaces are keys of the project, not of drover, and they keep their names. Through a policy of the chart, the API server denies a write of a tenant to a key under that prefix, on every kind. The API server does not protect a key under another prefix. Put a key that a user writes for drover under the prefix `drover.evil8.io/`, for example the trust annotation. Do not put a key that a user writes under the managed prefix, because the API server then denies the write.
+- Put every key of drover itself under the prefix `managed.drover.evil8.io/`, for example `managed.drover.evil8.io/synced-labels`. The keys that project-sync copies from a Rancher project to its namespaces are keys of the project, not of drover, and they keep their names. Through a policy of the chart, the API server denies a write of a tenant to a key under that prefix, on every kind. The API server does not protect a key under another prefix. Put a key that a user writes for drover under the prefix `drover.evil8.io/`, for example the trust annotation. Do not put a key that a user writes under the managed prefix, because the API server denies the write.
 
 ## Wiring
 
 - The Helm chart is not in this repository. It is `charts/drover` in the public [evil8io/charts](https://github.com/evil8io/charts) repository. The chart in that repository is synced from a private source. Do not add a chart here. A release of this repository is deployed only after the `appVersion` of that chart is bumped.
 - The image entrypoint is the binary. The subcommand and the flags are passed to the binary as arguments from the chart.
-- The api-filter and `project-sync` authenticate as two Rancher service users. Each of the two components authenticates through its own token file. The api-filter is on the request path of every tenant, and it needs only the namespace list. With `--service-accounts`, `project-sync` writes namespaces and bindings. Keep the two users separate, so that the api-filter never uses the rights of `project-sync` for a tenant request.
-- `rotate-token` runs once per service user, and only `rotate-token` writes each token Secret. The other components read the token file each time that they use the token, so a rotation needs no restart. Keep that division of work.
+- The api-filter and `project-sync` authenticate as two Rancher service users. Each of the two components authenticates through its own token file. The api-filter is on the request path of every tenant. It needs only the namespace list. With `--service-accounts`, `project-sync` writes namespaces and bindings. Keep the two users separate, so that the api-filter never uses the rights of `project-sync` for a tenant request.
+- `rotate-token` runs once per service user. Only `rotate-token` writes each token Secret. The other components read the token file each time that they use the token, so a rotation does not need a restart. Keep that division of work.
 - The tests in this repository are unit tests only. The integration tests run in the private repository from which the chart is deployed. A change that a unit test cannot cover needs a live check with a real client. Name the client in the pull request.
 
 ## Components
@@ -25,7 +25,7 @@ Write a rule in the imperative. Give the reason for the rule. Delete a line when
 | `project-sync` | `internal/projectsync` | `internal/projectsync/CLAUDE.md` |
 | `rotate-token` | `internal/rotate` | `internal/rotate/CLAUDE.md` |
 
-`internal/rancherclient` has the HTTP transport to Rancher of `api-filter` and `project-sync`, and the trace and metric wrapper of that transport. `rotate-token` uses only the wrapper, with its own transport from `internal/rotate/client.go`. `internal/telemetry` is the shared setup for logging, tracing, and metrics.
+`internal/rancherclient` contains the HTTP transport to Rancher of `api-filter` and `project-sync`, and the trace and metric wrapper of that transport. `rotate-token` uses only the wrapper, with its own transport from `internal/rotate/client.go`. `internal/telemetry` is the shared setup for logging, tracing, and metrics.
 
 - Name the cluster attribute of a metric `drover.cluster`, not `cluster`. A metrics backend that promotes the resource attribute `cluster` adds it only to a data point without an attribute `cluster`. So the cluster of the telemetry pipeline is missing from a data point that has the attribute `cluster`.
 
@@ -45,7 +45,7 @@ Write a rule in the imperative. Give the reason for the rule. Delete a line when
 
 These facts were verified against Rancher 2.14.6. The facts about the API surface of each component are in the `CLAUDE.md` and in the document of that component.
 
-- In the Rancher cluster, `rancher.<namespace>` is in the certificate that Rancher serves, and `rancher.<namespace>.svc` is not in that certificate.
+- In the Rancher cluster, `rancher.<namespace>` is in the certificate that Rancher serves. `rancher.<namespace>.svc` is not in that certificate.
 - The CA of that certificate is in the key `tls.crt` of the Secret `tls-rancher`, in the Rancher namespace. `tls-rancher-internal-ca` is a different CA. A client cannot verify the certificate with that CA.
 - When a binding grants `list` on `namespaces` to `system:cattle:authenticated`, the native list succeeds. The api-filter then never filters, because it acts on a 403 only. Look for such a binding first when a tenant sees every namespace.
 
@@ -60,8 +60,8 @@ Do not propose these designs again:
 
 | Design | Reason |
 | --- | --- |
-| A proxy between the cluster agent and the API server | On a managed cluster, no certificate for the proxy is valid against the cluster CA. The proxy is also on the critical path of Rancher. |
-| A bare path rewrite of the namespace list to Steve | Steve is the Rancher API server in the cluster agent. Steve has no `labelSelector`, and it has no watch. |
+| A proxy between the cluster agent and the API server | On a managed cluster, a certificate for the proxy is not valid against the cluster CA. The proxy is also on the critical path of Rancher. |
+| A bare path rewrite of the namespace list to Steve | Steve is the Rancher API server in the cluster agent. Steve does not have a `labelSelector`. Steve also does not have a watch. |
 | A `--clusters` allow list on `api-filter` | The route set is dynamic. Kyverno creates one HTTPRoute per Rancher Cluster object from a policy in the chart. |
 | A principal or user filter | A directory search inside the organisation is accepted, because a project owner adds members as a self-service task. |
 | Admin tokens for the api-filter, or a daily rotation schedule | The api-filter uses one service user with one token. The token rotation is check-and-renew, so a frequent run is cheap, and a missed run is harmless. The default schedule of the chart is every 10 minutes. |
