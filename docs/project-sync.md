@@ -50,7 +50,7 @@ With `--openbao-address`, project-sync configures the Kubernetes secrets engine 
 - Each cluster has its own mount, `kubernetes/<cluster id>`. The mount has a role and an ACL policy for each project role of each project. To change the `kubernetes` part, set `--openbao-mount-prefix`.
 - OpenBao connects to a cluster through the Rancher proxy. For this connection, project-sync gives OpenBao a ServiceAccount token. project-sync replaces that token when half of its lifetime remains.
 - A credential is valid for 15 minutes by default. A client can request a maximum of 2 hours. The flags are `--openbao-credential-ttl` and `--openbao-credential-max-ttl`.
-- When Rancher no longer has a project or a cluster, project-sync removes its roles, its policies, and its mount from OpenBao.
+- When a project or a cluster is removed from Rancher, project-sync removes its roles, its policies, and its mount from OpenBao.
 
 A client requests a token with this command:
 
