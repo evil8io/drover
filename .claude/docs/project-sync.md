@@ -1,0 +1,511 @@
+# project-sync
+
+This file is the reference of project-sync: the permissions, the request sequences, the flags, the log lines, and the metrics. The short document for users is `docs/project-sync.md`.
+
+This service copies labels and annotations of a Rancher project to every namespace of that project, because Rancher does not copy them. The `--labels` and `--annotations` flags are the allow list of keys. When a namespace has a different value for a key, the service overwrites that value with the value of the project.
+
+The service polls Rancher at every `--interval`, in a reconcile run. It also keeps one namespace watch per cluster open, so that a new namespace gets its keys within a few seconds. It keeps one project watch open too. When a label, an annotation, or the display name of a project changes, the namespaces of the project get the change within seconds. One replica is enough, because every reconcile run is a full reconcile.
+
+The service also writes the namespace count of each project into an annotation of the Project object. See [The namespace count](#the-namespace-count).
+
+Status 403 for the namespace list of a cluster means that the service user does not have the right to list namespaces on that cluster. The service then writes a warning with the cluster id and continues with the next cluster.
+
+With `--service-accounts`, the service also keeps three ServiceAccounts per project of a tenant, one per project role. A CI job of a project authenticates with a token of such a ServiceAccount, through the Rancher proxy. See [Service accounts](#service-accounts).
+
+With `--openbao-address` as well, the service writes the OpenBao state that follows from the Rancher objects. This state contains a mount of the Kubernetes secrets engine per cluster, with the config of that mount. It also contains a role and an ACL policy per project role. OpenBao then creates short-lived tokens of these ServiceAccounts. See [OpenBao config](#openbao-config).
+
+With `--trust-file` as well, the service writes an OpenBao login role for each valid trust statement in an annotation of a project. An outside workload, for example a CI job, then logs in to OpenBao with the rights of a project role. See [Login roles](#login-roles).
+
+## Requirements
+
+1. The service needs a Rancher service user with `get`, `list`, `watch`, and `patch` on `namespaces`, in every cluster whose namespaces the service syncs. With a `cluster-owner` binding, the user also has these rights.
+2. The same service user needs `list`, `watch`, and `patch` on `projects` of `management.cattle.io`, cluster-wide, in the Rancher cluster. The Rancher cluster is the cluster that Rancher itself runs in. Its cluster id is `local`. The user gets these rights from a `ClusterRoleTemplateBinding` on that cluster, with a role template that has those three verbs. The user does not get them from the bindings on the other clusters.
+
+   Without `list` and `watch`, Rancher answers a request of the project watch with status 403. The service then writes one warning per attempt, with the backoff between attempts. The periodic reconcile run continues without the project watch.
+
+   The service writes the [namespace count](#the-namespace-count) of a project with the `patch` right. With `--trust-file`, it also writes the [status annotation](#the-status-annotation) with this right.
+3. The service needs an API token of that service user, in a Secret that the service mounts.
+4. With `--service-accounts`, the same service user also needs these rights in every cluster, and in the Rancher cluster through a `ClusterRoleTemplateBinding`:
+   - every verb on `namespaces`, and `create` and `manage-namespaces` on `projects` of `management.cattle.io`. With these rights, the user has every rule of the Rancher ClusterRoles `<project>-namespaces-edit` and `<project>-namespaces-readonly`, so it can bind them without `bind`.
+   - `get`, `list`, `watch`, `create`, and `delete` on `serviceaccounts`.
+   - `get`, `list`, `watch`, `create`, `update`, and `delete` on `rolebindings` and `clusterrolebindings`.
+   - `bind` on the ClusterRoles `admin`, `edit`, `view`, and `create-ns`, with `resourceNames`. Do not grant `bind` on every ClusterRole, because that right is equal to the rights of a cluster admin.
+   - `bind` on each ClusterRole of `--bind-cluster-role`, and `bind` on each Role of `--bind-role`, with `resourceNames`. The API server allows the create of a binding only when the creator has `bind` on the role, or every rule of the role.
+
+   Give the service its own service user. The API filter is on the request path of every tenant. The service user of the API filter needs only the rights for the namespace list.
+5. With `--openbao-address`, the same service user also needs these rights in every cluster, and in the Rancher cluster through a `ClusterRoleTemplateBinding`:
+   - `create` on `serviceaccounts/token`, with the `resourceNames` `openbao`, `project-owner`, `project-member`, and `read-only`.
+   - `get`, `list`, `watch`, `create`, `update`, and `delete` on `roles`.
+
+   With these rights and the `get` right on `serviceaccounts`, the user has every rule of the Role `drover-openbao`. The user can therefore create and bind that Role without `escalate` and without `bind`. The user also needs `get` on `settings` of `management.cattle.io`, to read the Rancher setting `cacerts`. The GlobalRole `user-base` includes this right.
+
+   The user also needs `get` on `clusters` of `management.cattle.io`, cluster-wide, in the Rancher cluster. Add this rule to the role template of the `ClusterRoleTemplateBinding` of item 2. Without this right, Rancher answers 403, and the service keeps the OpenBao state of a removed cluster.
+6. With `--openbao-address`, OpenBao needs a Kubernetes auth mount at `--openbao-auth-path`, with the role `--openbao-role` for the ServiceAccount of the pod of the service. That role needs the ACL policy that follows. This policy is for the default prefix `kubernetes`. None of the paths needs the `sudo` capability. A LIST request also matches a path without the slash at its end.
+
+   ```hcl
+   path "sys/mounts" {
+     capabilities = ["read"]
+   }
+   path "sys/mounts/kubernetes/+" {
+     capabilities = ["read", "update", "delete"]
+   }
+   path "kubernetes/+/config" {
+     capabilities = ["read", "update"]
+   }
+   path "kubernetes/+/roles/*" {
+     capabilities = ["create", "read", "update", "delete", "list"]
+   }
+   path "sys/policies/acl" {
+     capabilities = ["list"]
+   }
+   path "sys/policies/acl/kubernetes-*" {
+     capabilities = ["read", "update", "delete"]
+   }
+   ```
+
+   OpenBao connects to each cluster through the Rancher proxy, with a ServiceAccount token of that cluster. Rancher accepts such a token only for a cluster with `enabled: true` in its `ClusterProxyConfig`. See [the API filter document](api-filter.md).
+7. With `--trust-file`, the ACL policy of item 6 also needs the paths that follow. OpenBao also needs a JWT auth mount at `auth/jwt/<issuer>` for each issuer of the rules file. For the AWS method, OpenBao needs an AWS auth mount at `auth/aws`. The service does not create these auth mounts.
+
+   ```hcl
+   path "auth/jwt/+/role/*" {
+     capabilities = ["create", "read", "update", "delete", "list"]
+   }
+   path "auth/jwt/+/role" {
+     capabilities = ["list"]
+   }
+   path "auth/aws/role/*" {
+     capabilities = ["create", "read", "update", "delete", "list"]
+   }
+   path "auth/aws/roles" {
+     capabilities = ["list"]
+   }
+   ```
+
+## Configuration
+
+Start the service with `drover project-sync [flags]`.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--rancher-url` | (required) | URL of Rancher. Use `http://` or `https://`. The path must be empty or `/`. |
+| `--rancher-ca-file` | | PEM bundle that the service uses to verify an `https` URL. |
+| `--rancher-insecure-skip-verify` | `false` | When `true`, the service does not verify the certificate of an `https` Rancher URL. |
+| `--token-file` | (required) | File with the API token of the Rancher service user. |
+| `--labels` | | Comma-separated label keys of a project to copy. |
+| `--annotations` | | Comma-separated annotation keys of a project to copy. |
+| `--name-label` | | Label key on the namespace that gets the display name of the project. |
+| `--name-annotation` | | Annotation key on the namespace that gets the display name of the project. |
+| `--service-accounts` | `false` | When `true`, the service keeps three ServiceAccounts per project, one per project role. |
+| `--bind-cluster-role` | | A ClusterRole that every project ServiceAccount gets through a ClusterRoleBinding. Repeat the flag for each ClusterRole. The flag needs `--service-accounts`. The ClusterRole must not grant `get` on `namespaces` without `resourceNames`. See [Service accounts](#service-accounts). |
+| `--bind-role` | | A Role, as `<namespace>/<name>`, that every project ServiceAccount gets through a RoleBinding in that namespace. Repeat the flag for each Role. The flag needs `--service-accounts`. |
+| `--openbao-address` | | URL of OpenBao. Use `http://` or `https://`. The path must be empty or `/`. When the value is empty, the OpenBao config is off. |
+| `--openbao-auth-path` | `kubernetes` | Kubernetes auth mount of OpenBao that the service logs in to. |
+| `--openbao-role` | `project-sync` | Role of that auth mount. |
+| `--openbao-jwt-file` | | File with the ServiceAccount token of the pod, for the login. This flag is required with `--openbao-address`. |
+| `--openbao-mount-prefix` | `kubernetes` | Path prefix of the secrets engine mounts. The config of a cluster is at `<prefix>/<cluster id>/config`. The value must not have an uppercase letter, because OpenBao stores a policy name in lowercase. |
+| `--openbao-rancher-url` | | URL of Rancher that OpenBao uses. Use `https://`. The path must be empty or `/`. This flag is required with `--openbao-address`. |
+| `--openbao-token-ttl` | `24h` | Requested lifetime of the token of a cluster. The minimum is `10m`. The API server can shorten the lifetime. |
+| `--openbao-credential-ttl` | `15m` | Default lifetime of a credential of a project role. This value is the `token_default_ttl` of the role in OpenBao for that project role. The minimum is `10m`, because the API server rejects a TokenRequest with a shorter lifetime. |
+| `--openbao-credential-max-ttl` | `2h` | Longest lifetime of a credential of a project role. This value is the `token_max_ttl` of the role in OpenBao for that project role. It must not be shorter than `--openbao-credential-ttl`. |
+| `--trust-file` | | JSON file of the trust rules. With a file, the service writes the OpenBao login roles of the trust annotations. See [Login roles](#login-roles). When the value is empty, the login roles are off. |
+| `--interval` | `60s` | Time between two reconcile runs. |
+| `--patch-rate` | `10` | Limit per second for the requests to Rancher that the watches of one cluster send, together. A value of `0` or less selects `10`. The value must be a finite number. |
+| `--listen` | `:8080` | Address that the service listens on. |
+| `--log-level` | `info` | The value is one of `debug`, `info`, `warn`, or `error`. |
+| `--otlp-endpoint` | `$OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint, as `host:port` or as a URL. When the value is empty, telemetry is off. |
+| `--otlp-traces` | `true` | When `true`, the service sends traces to the OTLP endpoint. |
+| `--otlp-metrics` | `true` | When `true`, the service sends metrics to the OTLP endpoint. |
+| `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | Value of the `service.name` resource attribute. With an empty value, `--service-name=`, the service sets no `service.name`, so that a collector can derive it. The OpenTelemetry SDK still takes a `service.name` from `OTEL_SERVICE_NAME` or `OTEL_RESOURCE_ATTRIBUTES`. |
+
+The flags need at least one label key, annotation key, name label key, or name annotation key, or `--service-accounts`. Every `--openbao-` flag needs `--service-accounts`. `--trust-file` needs `--openbao-address` and `--service-accounts`. A key must be a valid Kubernetes label or annotation key. A key is not valid when its prefix is `cattle.io`, `kubernetes.io`, or `k8s.io`, or a subdomain of one of them. The reason is that Rancher and Kubernetes own those domains. A key under `managed.drover.evil8.io` is not valid either, because the service writes its own keys under that domain.
+
+The keys of `--labels` and `--name-label`, joined with commas, must not be longer than 4096 bytes. The same limit applies to the keys of `--annotations` and `--name-annotation`. The reason is the limit of an ownership annotation, see [Design](#design).
+
+The `--name-annotation` value is the raw display name of the project. The `--name-label` value is a sanitised copy of the display name. The service replaces every character outside `[A-Za-z0-9._-]` with `-`, and cuts the result to 63 characters. It then removes the characters that are not alphanumeric from the start and the end of the result. When the sanitised name is empty, the service writes no label, and it writes one warning line for that project in that reconcile run.
+
+A name key is the key of `--name-label` or `--name-annotation`. The service writes only the display name to a name key. That key can also be a key of `--labels` or `--annotations`. The service then still writes the display name to it, never a label or an annotation of the Project object. A namespace can therefore have no name key, because the display name has no valid label value, or because the namespace is in no project.
+
+The service also starts when there is no token file. It skips the reconcile runs until the file contains a token. It writes one warning when the file has no token, and one info line when the file has a token again.
+
+The service answers `GET /healthz` with status 200 and the body `ok`.
+
+## Ownership of a key
+
+The service records the keys that it set on a namespace in two annotations of that namespace, `managed.drover.evil8.io/synced-labels` and `managed.drover.evil8.io/synced-annotations`. These two annotations are the ownership annotations. The value of each annotation is a comma-separated list of keys.
+
+The service removes a key in one of these lists when the project of the namespace no longer has that key. The service thus removes the keys of the old project from a namespace that moves to another project. From a namespace in no project, it removes every key of the lists, and the two ownership annotations. The service reads the project of a namespace from the annotation `field.cattle.io/projectId`, the project annotation. It does not use the label of the same name, the project label, because Rancher keeps that label when a namespace leaves its project.
+
+A key outside these lists belongs to the tenant, and the service never removes it. The lists are on the namespace, so a tenant can edit them. The service therefore removes only a key of `--labels`, `--annotations`, `--name-label`, or `--name-annotation`. It ignores every other key of the lists. The service does not accept a key under `managed.drover.evil8.io` in `--labels`, `--annotations`, `--name-label`, and `--name-annotation`, because it writes its own keys under that domain.
+
+## The namespace count
+
+The service writes the namespace count of each project into the annotation `managed.drover.evil8.io/namespace-count` of the Project object. The namespace count is the number of namespaces of the project. The admission policy of the chart denies a write of a tenant to each key under `managed.drover.evil8.io`. The service writes the namespace count in every mode, also without `--service-accounts`. It writes the namespace count of every project, also of the System project, the Default project, and the account project.
+
+A namespace counts for a project when its project annotation `field.cattle.io/projectId` has the value `<cluster id>:<project>` of that project, with the id of the cluster of the namespace. A namespace in `Terminating` counts until the API server deletes it, or until it leaves its project. The service writes the namespace count at these times:
+
+- In each reconcile run, after the namespace list of a cluster. The run writes the namespace count of each project of that cluster whose annotation has another value.
+- Within seconds after a namespace event. The worker of the cluster writes the namespace count of each project that the namespace joined or left, when the annotation has another value.
+
+The service compares the namespace count with the annotation value in its copy of the project. A project without the annotation therefore gets the namespace count in the next reconcile run. A project without namespaces gets the value `"0"`. The service treats an annotation value of more than 20 bytes as absent, and it replaces that value. After an upgrade to a release with the namespace count, the first reconcile run patches every project once.
+
+The service keeps the namespaces of each project in memory, in the namespace sets. The reconcile run builds the namespace sets of a cluster again from its namespace list. The service keeps each change of the worker during that list request, and applies these changes again on top of the list. A change of the annotation starts no namespace list and no namespace patch. When the count of a project event differs from the count in the namespace sets, the project watch writes the namespace count again, with a token of the rate limiter of the cluster. This corrects an event that the project watch gets after a later write of the worker, and a manual edit of the annotation.
+
+The service writes the annotation with a JSON merge patch of only that key. The request is `PATCH /k8s/clusters/local/apis/management.cattle.io/v3/namespaces/<cluster id>/projects/<project>`. A 404 or a 409 answer is not an error. A failed patch in a reconcile run counts as an error of the run. The next reconcile run repeats a failed patch of the worker or of the project watch.
+
+The annotation value can differ from the number of namespaces in these cases:
+
+- The annotation value changes some seconds after a namespace create or delete. The namespace watch gets only the namespaces with the project label, and Rancher sets that label about three seconds after the create. The worker also waits for a token of the rate limiter of the cluster.
+- After a start of the service, the worker writes no namespace count for a cluster before the first namespace list of that cluster. The same applies to a cluster that returns to the project list.
+- While the service is down, the annotation value does not change.
+
+The admission policy of the chart reads the annotation on a Project DELETE. It denies the delete when the value is not `"0"`. A deployment tool that reads back every annotation of a Project shows this key as drift. Configure the tool to ignore the key.
+
+The service writes these log lines for the namespace count:
+
+| Line | Level | Fields |
+| --- | --- | --- |
+| `the namespace count is written` | info | `cluster`, `project`, `count` |
+| `the namespace count patch failed` | warn | `cluster`, `project`, `error` |
+| `the namespace count patch is skipped` | debug | `cluster`, `project`, `error` |
+
+## Design
+
+The service polls `GET /v3/projects` at every interval. With one list per interval, the service gets every project that the service user can see, because Rancher filters that list by RBAC. The service takes the set of clusters from the `clusterId` of those projects, so it needs no cluster list of its own. One reconcile run syncs at most 8 clusters at the same time.
+
+The reconcile run lists every namespace of a cluster, also a namespace without the project label. It thus finds a namespace that left its project and no longer has the project label. It lists in pages of 500, with the `limit` and `continue` parameters of the Kubernetes API. When a `continue` token is too old, the API server answers with status 410. The service then starts the list again from the first page, once. The service decodes each page as a stream, one namespace at a time.
+
+For each namespace, the service keeps in memory only the keys that it reads for the sync. These are the project label, the project annotation, the two ownership annotations, and the keys of `--labels`, `--annotations`, `--name-label`, and `--name-annotation`. The service keeps the metadata under other keys in memory only while it decodes that namespace. A tenant can fill an ownership annotation up to the size limit of the API server for annotations, 256 KiB. The service therefore treats an ownership annotation above 4096 bytes as absent, because a list that the service writes is a short list of keys. The service replaces that annotation in the next patch, when the new list of keys is not empty.
+
+The service also lists the projects in pages of 500. For each project, it keeps only the keys of `--labels` and `--annotations`, and the [namespace count](#the-namespace-count) annotation. With `--trust-file`, it also keeps the two annotations of the [login roles](#login-roles).
+
+The service reads at most 4 MiB of one item of any list, and it sets no limit on a page. This limit is above the default object limit of etcd, 1.5 MiB. Many large namespaces of one tenant on one page thus do not stop the list of the cluster. When a namespace is larger, the reconcile run fails for that cluster only, with an error that contains the limit in bytes. When a project is larger, the whole reconcile run fails. When an item of another list is larger, only the work that needs that list fails.
+
+The service also keeps one namespace watch per cluster open, on `GET /k8s/clusters/<id>/api/v1/namespaces?watch=true`. The watch selects only the namespaces with the project label. Rancher sets that label about three seconds after the namespace is created, so the service acts on an `ADDED` event and on a `MODIFIED` event. When the project label is removed from a namespace, the namespace is no longer in the selection. The API server then sends a `DELETED` event for it, with the namespace from before the change. Unless the namespace is in deletion, the service reads the namespace again and handles its current state. When the read fails, the service drops the event, and the next reconcile run handles the namespace.
+
+When a stream ends without an error after at least 10 s, the service starts a new stream at once. After an error, or after a stream shorter than 10 s, the service waits for a backoff first. The backoff doubles from 1 s up to 30 s, and it returns to 1 s after a stream of at least 10 s. After status 410, or after an `ERROR` event with the code 410, the service starts the stream again without a resource version. After an `ERROR` event with another code, the service writes a warning, and it starts the stream again from the last resource version. The periodic reconcile run still handles a missed event, a dropped watch, and a new cluster.
+
+The watch puts the namespace of an event into the patch queue of its cluster, with the namespace name as the key. One worker per cluster patches the namespaces of that queue, one at a time. After a second event of a namespace, the queue contains only the second event for that namespace. For several events on one namespace before its patch, the worker thus sends one patch.
+
+The worker and the lister of a cluster share one rate limiter, with `--patch-rate` tokens per second. Each request of the worker or the lister to Rancher takes one token. A namespace that needs no request takes no token. So when the watch starts without a resource version, the `ADDED` event of a namespace in the wanted state does not wait for the limiter. A namespace event that changes the namespace count of a project sends 1 patch of that project, and a move between two projects sends 2. One project event sends 1 request for the namespace list. With `--service-accounts`, it sends 3 more requests when every account object exists, and 8 more with `--openbao-address`. The burst is equal to the rate, with a minimum of 1.
+
+A patch of a namespace that no longer exists, or of a namespace in `Terminating`, is not an error. The service skips it, and the next reconcile run repeats the work.
+
+The service also keeps one project watch open, on `GET /k8s/clusters/local/apis/management.cattle.io/v3/projects?watch=true`, with the same timeout and backoff as the namespace watch. The watch decodes a Project object into the same fields that the service reads from the project list. These are the project id, the cluster id, the display name, the allow-listed labels and annotations, the namespace count annotation, and the two annotations of the login roles. When the watch starts again without a resource version, it gets the full project list again, as an `ADDED` event per project. For each such event, the service only compares the project with its copy in memory, so the service sends no request because of the restart.
+
+The service skips a project of a cluster that the last reconcile run did not see. The next reconcile run handles that project. The service thus syncs a new cluster only in the next reconcile run, as it did before the project watch was added. The service skips a Project object whose `metadata.namespace` differs from its `spec.clusterName`, and it writes a warning. The service also skips a project whose name is not a valid label value, because no namespace can have that name in its project label.
+
+When a project changes, the service updates the copy of the project that it keeps from the last reconcile run. It then puts the project name on the project queue of the cluster. After a second event of the same project, the queue contains only the second event for that project. For several events on one project before the lister takes it, the lister thus sends one list.
+
+One lister per cluster takes a project from the project queue. It lists the namespaces of the cluster with the label selector `field.cattle.io/projectId=<name>`, in pages of 500, as the reconcile run does. It puts each such namespace on the patch queue of the cluster, with the origin `project`. When the queue has a waiting item of a namespace, the lister keeps that item, because its list can be older than that item. The worker of the cluster then patches these namespaces as it patches the namespaces that the namespace watch finds.
+
+When the display name changes, the service first clears the name cache of the worker, so that the worker computes the new label value. When a list fails, the service writes a warning, and the next reconcile run repeats the work. For status 403, the service writes the same warning as for a failed namespace list of the reconcile run.
+
+A project owner can edit the labels, the annotations, and the display name of their own project. The values that the service copies are tenant input, as they were with the reconcile run. The project watch only shortens the delay before the namespaces of a project get a change. The queue and the shared rate limiter of a cluster limit the requests from many project edits in a short time. The project watch never starts a reconcile run. The service logs project ids and key names, never a display name or a value.
+
+## Service accounts
+
+With `--service-accounts`, the service keeps these objects in every cluster that the reconcile run syncs:
+
+1. One account project, with the display name `drover`, the label `managed.drover.evil8.io/account-project: "true"`, and the service user in the annotation `field.cattle.io/creatorId`. Rancher then binds the service user as the owner of the project, and no tenant gets a role in it. The service creates the project when the cluster does not have an account project.
+2. Per tenant project, the account namespace `drover-<cluster id>-<project>` in the account project, for example `drover-c-m-4x2kq7bd-p-n52j9`. `<project>` is the name of the project. Two clusters can have a project with the same name, so the name contains the cluster id.
+3. In the account namespace, the ServiceAccounts `project-owner`, `project-member`, and `read-only`. The user name of such a ServiceAccount is `system:serviceaccount:drover-<cluster id>-<project>:<role>`.
+4. In every namespace of the tenant project, the RoleBindings `drover-project-owner`, `drover-project-member`, and `drover-read-only`, to the ClusterRoles `admin`, `edit`, and `view`.
+5. Per project role, the ClusterRoleBinding `drover-<cluster id>-<project>-<role>-namespaces`, to the Rancher ClusterRole `<project>-namespaces-edit` for `project-owner` and `project-member`, and to `<project>-namespaces-readonly` for `read-only`. Rancher keeps the `resourceNames` of these ClusterRoles equal to the namespaces of the project. The API filter uses these `resourceNames` to answer a namespace list of the ServiceAccount.
+6. For `project-owner` and `project-member`, the ClusterRoleBinding `drover-<cluster id>-<project>-<role>-create-ns`, to the Rancher ClusterRole `create-ns`.
+7. Per project role and per `--bind-cluster-role`, the ClusterRoleBinding `drover-<cluster id>-<project>-<role>-clusterrole-<name>` to that ClusterRole. Per project role and per `--bind-role`, the RoleBinding `drover-<cluster id>-<project>-<role>-role-<name>` in the namespace of the flag, to that Role. An operator gives every project ServiceAccount the same extra rights with these flags, for example the read of the platform objects that every tenant may see. The service does not read the roles, because a binding to a role that does not exist is valid. When a flag value is removed, the next reconcile run deletes its bindings. When the namespace of a `--bind-role` does not exist in a cluster, each reconcile run writes one warning for that cluster and counts one error. A bound ClusterRole must not grant `get` on `namespaces` without `resourceNames`. The API filter reads the `resourceNames` of that verb from the ClusterRoleBindings of a ServiceAccount for its namespace list, and a rule without names makes the filter deny every namespace list of every project ServiceAccount. See [the API filter document](api-filter.md).
+
+Every ServiceAccount and every binding has the labels `managed.drover.evil8.io/tenant-project: <project>` and `managed.drover.evil8.io/role: <role>`, and every binding has one subject. The account namespace has the label `managed.drover.evil8.io/tenant-project: <project>`, without `managed.drover.evil8.io/role`. The account namespace is the owner of the bindings, so the garbage collector deletes them together with the namespace.
+
+A tenant project is a project that is not the System project, the Default project, or an account project. The service finds the System project and the Default project by the labels `authz.management.cattle.io/system-project` and `authz.management.cattle.io/default-project`. A project whose account namespace name is longer than 63 characters also gets no accounts. For such a project, each reconcile run writes the debug line `the project gets no accounts, because the name of its account namespace is too long`, with the fields `cluster` and `project`.
+
+The ServiceAccounts get the Kubernetes rights of a project role through `admin`, `edit`, and `view`. They do not get the extra rules of the Rancher role templates. Examples are the rules for the monitoring resources and the rule to read nodes. An operator adds such rules through `--bind-cluster-role` and `--bind-role`.
+
+The service applies these rules:
+
+- When a namespace joins a project, the service creates the three RoleBindings in it. When a namespace moves to another project, the service changes the subjects and the owner of its RoleBindings to those of the new project. When the new project has no account namespace yet, the service deletes the RoleBindings of the old project. When a namespace leaves its project, the service deletes the RoleBindings. The namespace watch starts this work within seconds, also for a namespace that a user deletes and creates again with the same name.
+- For a new project, the service creates the account namespace, the ServiceAccounts, and the ClusterRoleBindings within seconds, through the project watch.
+- The reconcile run corrects a binding that differs, and it creates an object again when the object does not exist. A tenant can edit or delete the RoleBindings in its namespaces, and the next reconcile run restores them.
+- The service uses an account namespace only in an account project. A tenant can create a namespace with the name `drover-<cluster id>-<project>` first, in its own project. The service then writes a warning, gives the project no accounts, and deletes the bindings of the project.
+- When an account project is deleted, its namespaces are in no project, because Rancher deletes only the namespaces with the annotation `field.cattle.io/creatorId`. The reconcile run then creates a new account project. It moves such a namespace into the new account project when the namespace is the owner of a ClusterRoleBinding of the service.
+- The reconcile run deletes an account namespace whose project no longer exists, after Rancher answers 404 for that project. It deletes the bindings of the project first. When a binding delete fails, the service keeps the namespace until the next reconcile run. The run also deletes such a namespace in no project, but only when the namespace is the owner of a ClusterRoleBinding of the service.
+- After an upgrade from a release with the account namespace name `drover-<project>`, the account namespaces of that form stay, with their ServiceAccounts and their bindings. The service does not read that name form. A token of such a ServiceAccount has the rights of these bindings until the bindings are gone. Remove the objects of the old form by hand, in this order:
+  1. Delete the bindings of the old form. These are the ClusterRoleBindings, and the RoleBindings in the namespaces of `--bind-role`, with the label `managed.drover.evil8.io/tenant-project: <project>` and a name that starts with `drover-<project>-`.
+  2. Delete the namespace `drover-<project>`.
+
+  Do not delete the namespace first. A tenant with `create-ns` can create a namespace with that name again before the garbage collector deletes the bindings. That tenant then gets the rights of the bindings.
+- To make every token of a ServiceAccount invalid, delete the ServiceAccount. The next reconcile run creates it again. Do not delete the account namespace for this. The subject of a binding contains the namespace and the name of its ServiceAccount. The garbage collector deletes the bindings only some time after the namespace is deleted. Until then, a tenant who creates a namespace with that name gets the rights of the bindings.
+
+## OpenBao config
+
+With `--openbao-address`, the service keeps these objects in every cluster that the reconcile run syncs, also in the Rancher cluster:
+
+1. The namespace `drover-openbao` in the account project, with the label `managed.drover.evil8.io/role: openbao`.
+2. In that namespace, the ServiceAccount `openbao`, with the same label.
+3. In every account namespace `drover-<cluster id>-<project>`, the Role `drover-openbao`. Its rules are `get` on `serviceaccounts` and `create` on `serviceaccounts/token`, both with the `resourceNames` `project-owner`, `project-member`, and `read-only`.
+4. In every account namespace, the RoleBinding `drover-openbao` to that Role, with only one subject, `drover-openbao/openbao`. The namespace `drover-openbao` is the owner of the RoleBinding, so the garbage collector deletes the RoleBinding together with that namespace.
+
+The Role and the RoleBinding have the labels `managed.drover.evil8.io/tenant-project: <project>` and `managed.drover.evil8.io/role: openbao`. The service applies these rules:
+
+- The service uses the namespace `drover-openbao` only in an account project, as it does with an account namespace. A reconcile run trusts such a namespace after it checks that the namespace is in an account project. A tenant can create a namespace with that name first, in its own project. The service then writes a warning, writes no config for that cluster, and deletes every RoleBinding `drover-openbao` in the cluster.
+- The service moves a namespace `drover-openbao` that is in no project into the account project. It does this only when the namespace is the owner of a RoleBinding `drover-openbao` in an account namespace.
+- When a project gets no accounts, the service deletes the RoleBinding `drover-openbao` of the project together with its other bindings. The service does the same when the reconcile run deletes the account namespace of the project.
+- For a new or changed project, the service writes the Role and the RoleBinding within seconds, through the project watch, together with the ServiceAccounts. The project watch writes them only after a reconcile run trusted the namespace `drover-openbao` of that cluster. The reason is that the RoleBinding needs the uid of that namespace as its owner. Until then, the next reconcile run creates them. Before each such write, the service reads the namespace. When the uid or the project of the namespace is not the one that the reconcile run trusted, the project watch writes no OpenBao object until the next reconcile run.
+- The reconcile run corrects a Role or a RoleBinding that differs, and it creates such an object again when the object does not exist.
+- The service deletes none of these objects when `--openbao-address` is set to an empty value. It deletes the OpenBao state of a removed cluster, as [Mounts, roles, and policies](#mounts-roles-and-policies) describes.
+- To make the token in OpenBao invalid, delete the ServiceAccount `openbao`. The next reconcile run creates it again and writes a new token. Do not delete the namespace `drover-openbao` for this. The reason is the same as in [Service accounts](#service-accounts).
+
+The service writes the config of a cluster in three steps:
+
+1. Before the work on the first cluster, it gets a client token of OpenBao. It logs in with `POST <address>/v1/auth/<auth path>/login`, with the role and the content of the file in `--openbao-jwt-file`, only when it has no kept client token. It reads the file at every login, because the kubelet replaces the token. The service keeps the client token for the reconcile run and the project watch, until a fifth of its lifetime remains. After a 403 answer, the service logs in again and repeats the request, at most once per reconcile run. The project watch uses the same limit. After that login, a 403 answer is the error of the request.
+2. It requests a token of `drover-openbao/openbao` with the TokenRequest API, through the Rancher proxy. The request is `POST /k8s/clusters/<cluster id>/api/v1/namespaces/drover-openbao/serviceaccounts/openbao/token`. The request contains `spec.expirationSeconds` from `--openbao-token-ttl`, and no audiences. The API server can shorten the lifetime, for example to 24 hours on EKS, so the service uses `status.expirationTimestamp` from the answer.
+3. It sends `POST <address>/v1/<prefix>/<cluster id>/config`, with the client token in the header `X-Vault-Token`. The body is `{"kubernetes_host": "<openbao rancher url>/k8s/clusters/<cluster id>", "kubernetes_ca_cert": "<rancher ca>", "service_account_jwt": "<token>", "disable_local_ca_jwt": true}`.
+
+The Kubernetes secrets engine of OpenBao cannot skip the TLS verification of `kubernetes_host`. When `kubernetes_ca_cert` is not empty, the engine verifies Rancher only with that field. When the field is empty, the engine verifies Rancher with the root certificates of the system. The service therefore reads the Rancher setting `cacerts` with `GET /v3/settings/cacerts`, once per reconcile run that has a cluster to keep. It sends the value of that setting as `kubernetes_ca_cert`. Rancher puts the CA chain of a private certificate into that setting, and leaves it empty for a public certificate.
+
+The service always sends the field. When the value is empty, OpenBao thus removes a CA that the service wrote earlier. When the read fails, the service writes an error line, and the reconcile run writes nothing to OpenBao. The service does this so that it does not remove the CA of a private certificate.
+
+OpenBao keeps the token that the service writes, and it never renews that token. The service therefore keeps in memory, per cluster, the expiry of the token of the last successful write. The reconcile run writes the config of a cluster again when one of these conditions is true:
+
+- Less than half of the lifetime of that token remains.
+- The ServiceAccount `openbao` has a new uid.
+- The Rancher CA differs from the CA of that write.
+- The service created the mount in this reconcile run.
+- A read of `<prefix>/<cluster id>/config` gets 404, or a `kubernetes_host`, `kubernetes_ca_cert`, or `disable_local_ca_jwt` that differs. The service reads the config at most once per 10 minutes after the last read or write. It then writes the line `the OpenBao config is missing or differs`, with the field `cluster`.
+
+The service thus writes a new Rancher CA to OpenBao in the next reconcile run. After a restart, the service has no expiry in memory, so the first reconcile run writes the config of every cluster. After a failed write, the service keeps the old expiry, and the next reconcile run tries again. When an admin disables a mount, or OpenBao loses its storage, the next reconcile run creates the mount and writes the config. The read does not return `service_account_jwt`. So after a restore of an older OpenBao backup, the older token stays until another condition of the list is true.
+
+OpenBao checks the ACL policy before it checks the mount. When the service has `update` on the path and writes under a mount that does not exist, OpenBao answers 404 with the message `no handler for route`. An older OpenBao server answers 400 with the same message. The service treats every 404 answer to such a write as a missing mount. It treats a 400 answer as a missing mount only when the message contains `no handler for route`. The service creates the mount before it writes the config, so it handles this answer only as a fallback.
+
+For this answer, the service writes an info line with the cluster id, and counts the write with the outcome `missing_mount`. It tries again in the next reconcile run. For every other failure, the service writes an error line, and the next reconcile run tries again. The service logs no token and no JWT.
+
+### Mounts, roles, and policies
+
+In each reconcile run, the service starts the work on a cluster with `GET <address>/v1/sys/mounts/<prefix>/<cluster id>`. When the mount does not exist, OpenBao answers 400 with `No secret engine mount at`. The service then enables the mount with `POST <address>/v1/sys/mounts/<prefix>/<cluster id>` and the body `{"type": "kubernetes"}`. A mount of another type is an error.
+
+For every tenant project with a trusted account namespace, and for each project role, the service keeps these objects:
+
+1. The role `<prefix>/<cluster id>/roles/<project>-<role>`, with `service_account_name` set to the project role, `allowed_kubernetes_namespaces` set to `drover-<cluster id>-<project>`, and `token_default_ttl` and `token_max_ttl` from the two credential flags. The service also sends `allowed_kubernetes_namespace_selector`, `kubernetes_role_name`, `generated_role_rules`, and `token_default_audiences` as empty values. The reason is that OpenBao keeps the old value of a field that is not in a write.
+2. The ACL policy `<prefix>-<cluster id>-<project>-<role>`, with every slash of the prefix replaced by a dash. The policy grants `update` on `<prefix>/<cluster id>/creds/<project>-<role>`. Its `allowed_parameters` let a client set only `kubernetes_namespace` and `ttl` in a credential request. A client thus cannot set `audiences`, and every credential is a token for the API server of the cluster. After an upgrade from a release without `allowed_parameters`, the first reconcile run writes every policy once.
+
+The names are the same as the names of the earlier operator objects, so a client keeps its paths and policies. The service applies these rules:
+
+- The project watch writes the roles and the policies of a new or changed project within seconds, together with its ServiceAccounts and its Role `drover-openbao`. It does not read an object before it writes it. It skips an object that the service read or wrote in the last 10 minutes. The service thus sends no repeated OpenBao writes when many project events arrive in a short time.
+- Each reconcile run lists the roles of every mount and the ACL policies. It creates a role or a policy that does not exist. At most once per 10 minutes, it reads a role or a policy that exists, and it corrects the object when it differs. When the service compares a policy, it ignores the white space around the text of the policy.
+- The reconcile run deletes the policies and the roles of a project that the cluster no longer has. It does this only after it read the full project list, and after Rancher answers 404 for that project. The reason is that the project list of a reconcile run can be older than a new project. The service deletes the policy before the role. The service finds these objects from the role names in the mount of the cluster, and from the names of the ACL policies.
+- A policy name has the form `<prefix>-<cluster id>-<project>-<role>`. From such a name, the service takes as the cluster id the longest id of a cluster of the reconcile run that fits. It takes the rest, up to the role, as the project. The project must be a valid label value. The service thus also deletes a policy without a role, for example a policy that remains after a failed write. The service keeps a policy whose name does not have this form, and a policy of a cluster outside the run.
+- Before the service deletes a policy, it reads the policy. It deletes the policy only when the text is the text that the service writes for that cluster, project, and role. A text without `allowed_parameters` also counts, because earlier releases wrote that text. The service keeps a policy of another writer with a name of the same form. It also keeps a policy of a cluster outside the run whose id starts with the id of a cluster of the run and a dash.
+- Each reconcile run reads `GET <address>/v1/sys/mounts`, and finds the mounts of the Kubernetes secrets engine under the prefix. For a mount of a cluster outside the run, the service reads its config. When `kubernetes_host` is the Rancher URL of that cluster, the service reads `GET /k8s/clusters/local/apis/management.cattle.io/v3/clusters/<cluster id>`. After a 404, the service deletes the policies of that cluster, and then the mount. The delete of a mount also deletes its roles and its config in OpenBao. The service keeps the mount after any other answer, and after an error. It also keeps a mount without such a config, because another writer can own it.
+- When the list of the roles of a mount fails, the service skips the roles of that cluster. It deletes no role of that cluster, but it still deletes a policy of that cluster whose project is gone. When the list of the policies fails, the service skips the policies, and it deletes no OpenBao object. When the list of the mounts fails, the service deletes no mount.
+
+## Login roles
+
+With `--trust-file`, a project owner can let an outside workload, for example a CI job, log in to OpenBao with a project role. The owner writes trust statements into the annotation `drover.evil8.io/trust-policy` of the Project object. A statement is one entry of the JSON document in that annotation.
+
+The service writes one OpenBao login role per valid statement. A login role is a role of the JWT auth method or of the AWS auth method of OpenBao. OpenBao gives the token of a login role the ACL policy of one project role, see [Mounts, roles, and policies](#mounts-roles-and-policies). The service reports the result in the annotation `managed.drover.evil8.io/trust-policy-status`.
+
+The rules file contains both annotation keys, so a deployer can choose other keys. The status key must be under `managed.drover.evil8.io`, because an admission policy of the chart protects that domain against a write of a tenant. The trust key must not be under that domain, because a project owner writes it. The service never copies the two annotations to a namespace. It does not accept them in `--annotations` and `--name-annotation`.
+
+### The trust annotation
+
+The value of the annotation is a JSON document:
+
+```json
+{
+  "statements": [
+    {
+      "name": "deploy-main",
+      "jwt": {
+        "issuer": "github",
+        "claims": {"repository_id": "123456789", "ref": "refs/heads/main"}
+      },
+      "role": "project-member"
+    },
+    {
+      "name": "rotator",
+      "aws": {"arn": "arn:aws:iam::123456789012:role/rotator"},
+      "role": "read-only"
+    }
+  ]
+}
+```
+
+The document has these rules:
+
+- The value has at most 16384 bytes.
+- The document is a JSON object with only the key `statements`. Its value is a list of objects.
+- The list has at most `maxStatements` entries.
+
+A statement has these rules:
+
+- `name` matches `^[a-z0-9]([-a-z0-9]{0,30}[a-z0-9])?$`, and no earlier statement has the same name.
+- The statement has exactly one of `jwt` and `aws`.
+- `jwt.issuer` is an issuer of the rules file. `jwt.claims` is an object that is not empty. Each key is a claim name that is not empty and is not `aud`. Each value is a string that is not empty, or a list of such strings that is not empty. The claims contain every required claim of the issuer. Each value of an allowed claim of the issuer is in the allowed list of that claim.
+- `aws.arn` matches `^arn:aws:iam::[0-9]{12}:role/([A-Za-z0-9+=,.@_-]+/)*[A-Za-z0-9+=,.@_-]+$`. So the ARN has no empty path segment, and it does not end with a slash. When the rules file has allowed accounts, the account of the ARN is one of them. The AWS method is on.
+- `role` is `project-owner`, `project-member`, or `read-only`.
+- A statement, its `jwt` object, and its `aws` object have no other keys.
+
+### The rules file
+
+The service reads the rules from the file of `--trust-file`, at the start and at each reconcile run. When the file is not valid at the start, the service stops. When the file is not valid at a later run, the service writes an error line and keeps the last valid rules. The service ignores a key that it does not know.
+
+```json
+{
+  "annotation": "drover.evil8.io/trust-policy",
+  "statusAnnotation": "managed.drover.evil8.io/trust-policy-status",
+  "maxStatements": 20,
+  "audience": "https://openbao.example.com",
+  "loginTokenTTL": "5m",
+  "jwtIssuers": {
+    "github": {"requiredClaims": ["repository_id"], "allowedClaims": {"ref": ["refs/heads/main"]}},
+    "cluster": {"requiredClaims": ["sub"]}
+  },
+  "aws": {"enabled": true, "allowedAccounts": ["123456789012"]}
+}
+```
+
+| Key | Rule |
+| --- | --- |
+| `annotation`, `statusAnnotation` | Two valid annotation keys. `statusAnnotation` starts with `managed.drover.evil8.io/`, and `annotation` is not under that domain. `statusAnnotation` is not `managed.drover.evil8.io/namespace-count`, the key of the [namespace count](#the-namespace-count). |
+| `maxStatements` | 1 to 100. |
+| `audience` | Not empty. The service binds every JWT login role to this audience. |
+| `loginTokenTTL` | A Go duration from `1m` to `24h`. It is the lifetime of a token of a login role. |
+| `jwtIssuers` | A map from an issuer name to its rules. The name is a lowercase DNS label, because the path of the auth mount, `auth/jwt/<issuer>`, contains it. |
+| `jwtIssuers.<issuer>.requiredClaims` | A list that is not empty. Every statement of the issuer must contain these claims. The first claim is the `user_claim` of every login role of the issuer. |
+| `jwtIssuers.<issuer>.allowedClaims` | Optional. A map from a claim name to a list of allowed values. |
+| `aws.enabled` | When the value is `false`, the service gives every `aws` statement the reason `MethodDisabled`. |
+| `aws.allowedAccounts` | A list of 12-digit account ids. When the list is empty, the service allows every account. |
+
+A statement of an issuer such as `cluster` in the example binds `sub`, and `sub` names a ServiceAccount by namespace and name only. When the namespace does not exist yet, another tenant can create it, with a ServiceAccount of that name. When that matters, also bind the uid of the ServiceAccount, with the claim `/kubernetes.io/serviceaccount/uid`. OpenBao reads a claim name that starts with a slash as a JSON pointer.
+
+The service reads and writes only the auth mount of each issuer of the rules file, and `auth/aws`. When a reload removes an issuer, the roles in the auth mount of that issuer stay in OpenBao. Disable that auth mount in OpenBao, or delete its roles.
+
+### The roles in OpenBao
+
+The name of a login role is `<cluster id>_<project>_<statement name>`, for example `c-m-4x2kq7bd_p-abc12_deploy-main`. An auth mount is not per cluster, and a project name is unique only in its cluster, so the name contains the cluster id. A cluster id and a statement name have no `_`, so the service splits a role name at the first and the last `_`. For a `jwt` statement, the service writes the role `auth/jwt/<issuer>/role/<name>`. For an `aws` statement, the service writes the role `auth/aws/role/<name>`. Each role has these values:
+
+- `token_policies` has only the ACL policy `<prefix>-<cluster id>-<project>-<role>` of the project role of the statement.
+- The token is a batch token without the `default` policy. Its lifetime is `loginTokenTTL`, and it has no renewal.
+- The service binds a JWT role to the audience of the rules file and to the claims of the statement. OpenBao compares the claim values as strings. For each allowed claim of the issuer that the statement does not contain, the service binds the role to the full list of allowed values. A JWT role has no `bound_subject`, no `claim_mappings`, and no `groups_claim`. Its `user_claim_json_pointer` is `false`, and `expiration_leeway`, `not_before_leeway`, and `clock_skew_leeway` are 0.
+- The service binds an AWS role to the ARN, with the `iam` auth type. The service removes the path from the ARN, so `role/team/rotator` becomes `role/rotator`. The reason is that the caller identity of an assumed role has no path.
+
+The service sends every field from which OpenBao can give a token more rights or accept more JWTs, also when the field is empty. OpenBao keeps a field that is not in the body of a write.
+
+### The status annotation
+
+The service writes the status annotation with a JSON merge patch of only that key. The request is `PATCH /k8s/clusters/local/apis/management.cattle.io/v3/namespaces/<cluster id>/projects/<project>`. The keys of the status have this order:
+
+```json
+{
+  "observedHash": "sha256:<hex of the annotation value>",
+  "observedAt": "2026-10-03T12:00:00Z",
+  "statements": [
+    {"name": "deploy-main", "ready": true, "login": {"path": "auth/jwt/github", "role": "c-m-4x2kq7bd_p-abc12_deploy-main"}},
+    {"name": "rotator", "ready": false, "reason": "AccountNotAllowed", "message": "the account is not in the allowed accounts"}
+  ]
+}
+```
+
+When the trust document is not valid under a document rule, the status has the key `error` with a `reason` and a `message`, and no `statements`. The status contains at most `maxStatements` + 1 statements, so that the status does not become larger with a long list of invalid statements. The service cuts the name of a statement at 63 bytes. The reason of a statement is the reason of its first failed check. These are the reasons, in the order of the checks, with their fixed messages:
+
+| Reason | Message |
+| --- | --- |
+| `InvalidName` | `the name is not 1 to 32 lowercase letters, digits, and dashes, with a letter or a digit at each end` |
+| `DuplicateName` | `an earlier statement has the same name` |
+| `InvalidAuth` | `the statement does not have exactly one of jwt and aws, or it has an unknown key` |
+| `UnknownIssuer` | `the JWT issuer is not configured` |
+| `InvalidClaims` | `the claims are not an object of non-empty strings or non-empty string lists, or a claim is aud` |
+| `MissingRequiredClaim` | `a required claim of the issuer is not bound` |
+| `ClaimNotAllowed` | `a bound value is not in the allowed values of its claim` |
+| `InvalidARN` | `the ARN is not the ARN of an IAM role without wildcards` |
+| `AccountNotAllowed` | `the account is not in the allowed accounts` |
+| `MethodDisabled` | `the login method is not enabled` |
+| `InvalidRole` | `the role is not project-owner, project-member, or read-only` |
+| `TooManyStatements` | `the document has more statements than the limit` |
+| `WriteFailed` | `the login role write in OpenBao failed` |
+| `TooLarge` | `the annotation value is larger than 16384 bytes` |
+| `InvalidJSON` | `the annotation value is not valid JSON` |
+| `InvalidDocument` | `the document is not an object with only a statements list of objects` |
+
+The last three reasons are reasons of the document. `MethodDisabled` is also the reason of a statement whose auth mount does not exist in OpenBao.
+
+### Rules of the service
+
+- The project watch, for a project event, and the reconcile run do the same work for a project. They parse the document and write the role of each valid statement. They delete each role that is in the last status and that has no valid statement. They delete only a role of the project itself, in an auth mount of the rules file. They read at most `maxStatements` + 1 entries of the last status, and they delete each role once. Then they write the status. The project watch does this work within seconds, after it writes the OpenBao roles and policies of the project.
+- The reconcile run does this work for every project whose OpenBao roles and policies it keeps. When the project watch gets an event of a project after the project list of the run, the run uses the project of that event. The run skips a project that an event deleted.
+- The reconcile run also lists the roles of each auth mount of the rules file once. It deletes a listed role without a valid statement only when all these conditions are true:
+  - The role name has the form `<cluster id>_<project>_<statement name>`. The project part is a DNS label, and the statement part is a valid statement name. The service takes the cluster and the project from the role name.
+  - The cluster is a cluster of the reconcile run.
+  - The run checked the project, and the project still has the trust value of that check. Or neither the run nor the project watch has the project, and Rancher answers 404 for it. In that case, the service first reads the role. The first entry of its `token_policies` must be a policy of the service for the cluster and the project of the role name, because another writer can use a name of the same form.
+
+  The service keeps every other role. For the roles with another name form, it logs one debug line per run. After an upgrade from a release with the name form `<project>_<statement name>`, the first trust step of a project deletes the old role that the last status names for each ready statement. The trust step accepts that name form only for the project itself, and only when no other cluster has a project with the same name. An old role that no status names stays in OpenBao, and a login with such a role still works.
+- The service skips a write of a role that it wrote with the same body in the last 10 minutes. The reconcile run always writes a role that the list does not have.
+- When an auth mount is missing, the service gives the statement the reason `MethodDisabled`, and it reports no error. The service tries again at the next event or run.
+- When the trust annotation is absent or empty, the project has no login roles. The service then removes the status annotation with a merge patch of `null`.
+- The service writes the status only when it differs from the current value. The service ignores `observedAt` when it compares the values, and `observedAt` is the time of that write. Every message is a fixed text. The project watch ignores a change of the status annotation. Therefore, the project watch starts no new work after a status write.
+- A 404 or a 409 answer to a status patch is not an error.
+- The service logs the project, the index of a statement, a valid statement name, and the reason. It never logs the value of the trust annotation.
+- The project watch takes a token of the rate limiter of the cluster before each OpenBao request of this work.
+
+### Log lines
+
+| Line | Level | Fields |
+| --- | --- | --- |
+| `the trust status is written` | info | `cluster`, `project`, `statements`, `ready` |
+| `the trust statement is not ready` | info | `cluster`, `project`, `index`, `reason`, and `statement` for a valid name |
+| `the trust document is not valid` | info | `cluster`, `project`, `reason` |
+| `the trust status is removed` | info | `cluster`, `project` |
+| `the trust status patch failed` | warn | `cluster`, `project`, `error` |
+| `the OpenBao auth mount does not exist` | info for a role write, debug for the role list of a reconcile run | `mount`, and for a role write also `cluster`, `project`, `statement` |
+| `the OpenBao jwt-role write failed`, and the same line for `aws-role` and for `delete` | error | `cluster`, `name`, `error` |
+| `the OpenBao login role list request failed` | error | `mount`, `error` |
+| `the OpenBao login role read failed` | error | `mount`, `name`, `error` |
+| `the login role has no policy of the service, so the service keeps it` | debug | `mount`, `name` |
+| `the login roles have no name of the service, so the service keeps them` | debug | `count` |
+| `the login role is refreshed` | debug | `cluster`, `project`, `statement`, `mount` |
+| `the trust rules are not valid, so the service keeps the last valid rules` | error | `error` |
+
+The service writes the status lines only when it writes the status. With `--trust-file`, the line `project changed` of the project watch also has the field `trust_changed`.
+
+## Telemetry
+
+When `--otlp-endpoint` is set, the service produces a span named `reconcile` for each reconcile run. It produces a span named `patch_namespace` for each patch request of a namespace. That span has the attributes `drover.cluster`, `drover.origin`, and `k8s.namespace.name`. The `drover.origin` value is `reconcile`, `watch`, or `project`.
+
+With `--openbao-address`, the service also produces a span named `openbao_login` for the OpenBao login. It produces a span named `openbao_config` for the config write of one cluster, with the attribute `drover.cluster`. The service exports these metrics:
+
+| Metric | Kind | Unit | Attributes |
+| --- | --- | --- | --- |
+| `drover.sync.reconciles` | Counter | `1` | `outcome` |
+| `drover.sync.namespaces.patched` | Counter | `1` | `origin` |
+| `drover.sync.errors` | Counter | `1` | |
+| `drover.sync.duration` | Histogram | `s` | |
+| `drover.sync.events` | Counter | `1` | `drover.cluster`, `kind`, `type` |
+| `drover.sync.watches.open` | UpDownCounter | `1` | `drover.cluster`, `kind` |
+| `drover.sync.projects.changed` | Counter | `1` | `drover.cluster` |
+| `drover.sync.accounts.changes` | Counter | `1` | `kind`, `action` |
+| `drover.sync.openbao.writes` | Counter | `1` | `drover.cluster`, `outcome` |
+| `drover.sync.openbao.changes` | Counter | `1` | `kind`, `action` |
+| `drover.sync.trust.statements.ready` | Gauge | `1` | `drover.cluster`, `project`, `statement`, `reason` |
+
+The `kind` attribute of the watch metrics is `namespace` or `project`. For the project watch, `drover.cluster` is always `local`.
+
+The `kind` attribute of `drover.sync.accounts.changes` is `project`, `namespace`, `serviceaccount`, `role`, `rolebinding`, or `clusterrolebinding`. Its `action` attribute is `create`, `update`, `move`, or `delete`. With `--service-accounts`, the summary line of a reconcile run contains the field `accounts_changed`. For every write of an account object, the service writes the line `account object changed`.
+
+The `outcome` attribute of `drover.sync.openbao.writes` is `ok`, `missing_mount`, or `error`. For a failed login, the service counts one `error` for each cluster that needed a write. For a successful write, the service writes the line `the OpenBao config is written`, with the fields `cluster` and `expires`.
+
+The `kind` attribute of `drover.sync.openbao.changes` is `mount`, `role`, `policy`, `jwt-role`, or `aws-role`. Its `action` attribute is `create`, `update`, `delete`, or `write`. The action `delete` of the kind `mount` is the delete of the mount of a removed cluster. The action `write` is a write by the project watch, which does not read the object first. For every change, the service writes the line `OpenBao object changed`.
+
+For `jwt-role` and `aws-role`, the action `create` is a write of a login role that the list of the reconcile run does not have. The action `write` is a write with a changed body. A write of the same body after the 10-minute window is not a change. The service logs it at the debug level, and does not count it.
+
+With `--trust-file`, the service exports `drover.sync.trust.statements.ready` for each project whose OpenBao roles and policies it keeps. Such a project has one data point for each statement of the status that the service computes. So a project has at most `maxStatements` + 1 data points. Two statements with an invalid name and the same reason share one data point.
+
+The value is 1 for a ready statement and 0 for a statement that is not ready. A data point has the attribute `statement` only for a valid statement name, and it has the attribute `reason` only for the value 0. When the status has the key `error`, the project has one data point with the value 0 and no attribute `statement`. The attribute `reason` of that data point is the `reason` of the key `error`. `drover.cluster` is the cluster id of the project, and `project` is the project name.
+
+The service removes data points in these cases:
+
+- The service computes the status of a project, after a project event or in a reconcile run. It then replaces the data points of the project. So it removes the data point of a removed statement, and every data point of a project without the trust annotation.
+- The project watch gets a `DELETED` event for the project. The service then removes the data points of the project.
+- The project list of a reconcile run does not have the project. The run then removes the data points of the project.
+
+A reconcile run keeps the data points of every other project, also when it writes no OpenBao state for the project or its cluster.
+
+The service sets the cardinality limit of its observable gauges to 10000 data points. So the OpenTelemetry SDK exports at most 9999 attribute sets of this gauge per collection. A collection is one read and export of the metrics, every 30 seconds. It puts the values of every later attribute set into one data point with the attribute `otel.metric.overflow` set to `true`. The service reports the data points in the order of cluster id and project name. So that data point has the values of the same projects at each collection.
