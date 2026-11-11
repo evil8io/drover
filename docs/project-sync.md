@@ -9,19 +9,19 @@ project-sync applies the state of the Rancher projects to the clusters that Ranc
 | [Short-lived tokens](#short-lived-tokens) | `--openbao-address` | OpenBao creates short-lived tokens of those ServiceAccounts on request. |
 | [Login roles](#login-roles) | `--trust-file` | A project owner selects the CI jobs and the cloud identities that can request such a token. |
 
-project-sync does a full reconcile run at each `--interval`, 60 seconds by default. It also watches the namespaces and the projects, so most changes arrive in seconds. One replica is sufficient.
+project-sync does a full reconcile run at each `--interval`, 60 seconds by default. It also watches the namespaces and the projects, so project-sync applies most changes in seconds. One replica is sufficient.
 
 ## Project metadata
 
-Rancher does not copy the labels and the annotations of a project to the namespaces of the project. project-sync copies them, for the keys in `--labels` and `--annotations`. Policies, network rules, and dashboards can then use the metadata of a project, for example a cost centre or an owner.
+Rancher does not copy the labels and the annotations of a project to the namespaces of the project. project-sync copies them, for the keys in `--labels` and `--annotations`. The metadata of a project, for example a cost centre or an owner, is then available to policies, network rules, and dashboards.
 
 - **The value of the project has priority.** When a namespace has a different value for a key in the list, project-sync overwrites that value.
 - **Removal.** project-sync removes a key from a namespace when the key is removed from the project. It also removes the key when the namespace is moved to another project. project-sync removes only the keys that it wrote. It records the label keys that it wrote in the annotation `managed.drover.evil8.io/synced-labels` of the namespace, as a comma-separated list. It records the annotation keys in `managed.drover.evil8.io/synced-annotations`.
 - **The display name as an annotation.** Set `--name-annotation` to an annotation key. project-sync then writes the display name of the project to that annotation, on each namespace of the project.
-- **The display name as a label.** Set `--name-label` to a label key. project-sync then writes the display name to that label. A label value permits fewer characters than a display name, so project-sync replaces each character outside `[A-Za-z0-9._-]` with `-`. It also cuts the value to 63 characters. When the display name does not contain a letter or a digit, project-sync does not write the label.
+- **The display name as a label.** Set `--name-label` to a label key. project-sync then writes the display name to that label. Fewer characters are permitted in a label value than in a display name, so project-sync replaces each character outside `[A-Za-z0-9._-]` with `-`. It also cuts the value to 63 characters. When the display name does not contain a letter or a digit, project-sync does not write the label.
 - **Refused keys.** project-sync refuses a key under `cattle.io`, `kubernetes.io`, `k8s.io`, or `managed.drover.evil8.io`.
 
-project-sync also writes the number of namespaces of each project to the annotation `managed.drover.evil8.io/namespace-count` on the Project object. A policy in the drover chart reads this annotation. With that policy, Kyverno denies the delete of a project that still has namespaces. When your deployment tool reports this annotation as drift, configure the tool to ignore the key.
+project-sync also writes the number of namespaces of each project to the annotation `managed.drover.evil8.io/namespace-count` on the Project object. A policy in the drover chart depends on this annotation. With that policy, Kyverno denies the delete of a project that still has namespaces. When your deployment tool reports this annotation as drift, configure the tool to ignore the key.
 
 ## Service accounts
 
@@ -103,30 +103,30 @@ The platform team sets the limits for all projects in the file of `--trust-file`
 }
 ```
 
-- `jwtIssuers` contains the JWT issuers that a statement can use. Each issuer needs a JWT auth mount at `auth/jwt/<issuer>` in OpenBao. The AWS method needs an auth mount at `auth/aws`. project-sync does not create auth mounts. With the drover chart, a Helm hook creates them: one JWT mount for each entry of `global.broker.jwtIssuers`, by default GitHub Actions and GitLab.com. The hook creates the AWS mount when `global.broker.aws.enabled` is true.
-- `requiredClaims` contains the claims that each statement of the issuer must contain, for example the repository id. `allowedClaims` limits the values of a claim.
+- `jwtIssuers` contains the JWT issuers that are permitted in a statement. Each issuer needs a JWT auth mount at `auth/jwt/<issuer>` in OpenBao. The AWS method needs an auth mount at `auth/aws`. project-sync does not create auth mounts. With the drover chart, a Helm hook creates them: one JWT mount for each entry of `global.broker.jwtIssuers`, by default GitHub Actions and GitLab.com. The hook creates the AWS mount when `global.broker.aws.enabled` is true.
+- `requiredClaims` contains the claims that each statement of the issuer must contain, for example the repository id. `allowedClaims` contains the permitted values of a claim.
 - `audience` is the audience that a JWT must have.
-- `aws.enabled` enables the AWS method. `aws.allowedAccounts` limits the method to a list of accounts.
+- Set `aws.enabled` to true to enable the AWS method. The AWS method is limited to the accounts in `aws.allowedAccounts`.
 
 When you add the ServiceAccount tokens of a cluster as an issuer, use the claim `/kubernetes.io/serviceaccount/uid` together with `sub`. The `sub` claim contains only a namespace and a name. Another tenant can create a namespace and a ServiceAccount with those names.
 
 ## Requirements
 
-Each item states if the [drover chart](https://github.com/evil8io/charts/tree/main/charts/drover) satisfies it.
+Each item contains a note on whether the [drover chart](https://github.com/evil8io/charts/tree/main/charts/drover) satisfies it.
 
 **Always**
 
 - A separate Rancher service user for project-sync. Do not use the service user of the api-filter. The api-filter is on the request path of each tenant, so its user must have as few rights as possible. project-sync needs many more rights. With the chart, Helm creates this user.
 - An API token of that user in a mounted file (`--token-file`). A Rancher token expires, so it must be renewed. With the chart, a CronJob runs [rotate-token](rotate-token.md) for this token.
 - A network path to Rancher (`--rancher-url`). With the chart, set the value `rancher.url` to the Rancher Service in the cluster.
-- For an `https` URL with a private certificate, the CA of Rancher (`--rancher-ca-file`). The chart does not mount a CA file. When project-sync cannot verify the certificate, set the value `rancher.insecureSkipVerify`.
+- For an `https` URL with a private certificate, the CA of Rancher (`--rancher-ca-file`). With the chart, a CA file is not mounted. When project-sync cannot verify the certificate, set the value `rancher.insecureSkipVerify`.
 - These rights for the service user: `get`, `list`, `watch`, and `patch` on `namespaces` in each downstream cluster. The user also needs `list`, `watch`, and `patch` on the Rancher projects in the `local` cluster. With the chart, Helm creates the Rancher roles and bindings for these rights.
 - An admission policy that denies a tenant write to a label or an annotation under `managed.drover.evil8.io/`. project-sync trusts its own keys under that prefix. The drover chart does not contain this policy. Install the [drover-policies chart](https://github.com/evil8io/charts/tree/main/charts/drover-policies), which contains it.
 
 **For service accounts**
 
 - More rights for the service user in each cluster. The user needs every verb on `namespaces`, and `create` on Rancher projects. The user also needs the rights to manage ServiceAccounts, RoleBindings, and ClusterRoleBindings. The user also needs `bind` on each role that project-sync binds. These roles are `admin`, `edit`, `view`, `create-ns`, and each role of `--bind-cluster-role` and `--bind-role`. With the chart, Helm adds these rights when `projectSync.serviceAccounts.enabled` is true.
-- Rancher 2.9.0 or later. Without it, Rancher does not accept the tokens of the ServiceAccounts. The chart does not install Rancher.
+- Rancher 2.9.0 or later. Without it, Rancher does not accept the tokens of the ServiceAccounts. The chart does not contain Rancher.
 - A `ClusterProxyConfig` with `enabled: true` for each cluster. With the chart, Kyverno creates it for each downstream cluster.
 - The [api-filter](api-filter.md), when the ServiceAccounts must list their namespaces. The api-filter is part of the chart.
 
@@ -134,7 +134,7 @@ Each item states if the [drover chart](https://github.com/evil8io/charts/tree/ma
 
 - An OpenBao server that project-sync can connect to (`--openbao-address`). With the chart, Helm installs OpenBao when `projectSync.serviceAccounts.enabled` is true.
 - An `https` URL of Rancher that OpenBao can connect to (`--openbao-rancher-url`). With the chart, the URL is the value `global.broker.rancherUrl`, or the first entry of `httpRoute.hostnames`.
-- A certificate on that URL that OpenBao can verify. For a private CA, the Rancher setting `cacerts` must contain the CA. The chart does not write that setting.
+- A certificate on that URL that OpenBao can verify. For a private CA, the Rancher setting `cacerts` must contain the CA. With the chart, that setting is not written.
 - A Kubernetes auth mount in OpenBao, with a role for the ServiceAccount of the project-sync pod. The flags are `--openbao-auth-path`, `--openbao-role`, and `--openbao-jwt-file`. The role needs an ACL policy for the secrets engine mounts, their roles, and the policies under the mount prefix. With the chart, OpenBao creates the auth mount at its first start. A Helm hook writes the role and the policy.
 - More rights for the Rancher service user. The user needs `create` on the tokens of the ServiceAccounts, and the rights to manage Roles. The user also needs `get` on the Rancher clusters and on the Rancher setting `cacerts`. With the chart, Helm adds these rights.
 
