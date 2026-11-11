@@ -1,57 +1,58 @@
 # project-sync
 
-project-sync keeps the clusters that Rancher manages in line with the Rancher projects. It has four jobs. Project metadata and service accounts can each be used alone. The last two build on the one before: short-lived tokens need the service accounts, and login roles need the short-lived tokens.
+project-sync applies the state of the Rancher projects to the clusters that Rancher manages. It has four jobs. You can use the project metadata job and the service accounts job separately. The short-lived tokens need the service accounts. The login roles need the short-lived tokens.
 
 | Job | Flag | Result |
 | --- | --- | --- |
-| [Project metadata](#project-metadata) | `--labels`, `--annotations`, `--name-label`, `--name-annotation` | Every namespace gets the labels, annotations, and display name of its project. |
-| [Service accounts](#service-accounts) | `--service-accounts` | Every project gets three ServiceAccounts, one per project role. |
-| [Short-lived tokens](#short-lived-tokens) | `--openbao-address` | OpenBao can hand out short-lived tokens of those ServiceAccounts. |
-| [Login roles](#login-roles) | `--trust-file` | A project owner decides which CI jobs or cloud identities may get such a token. |
+| [Project metadata](#project-metadata) | `--labels`, `--annotations`, `--name-label`, `--name-annotation` | project-sync copies the labels, the annotations, and the display name of a project to each namespace of the project. |
+| [Service accounts](#service-accounts) | `--service-accounts` | project-sync creates three ServiceAccounts for each project, one for each project role. |
+| [Short-lived tokens](#short-lived-tokens) | `--openbao-address` | OpenBao creates short-lived tokens of those ServiceAccounts on request. |
+| [Login roles](#login-roles) | `--trust-file` | A project owner selects the CI jobs and the cloud identities that can request such a token. |
 
-The service does a full reconcile run every `--interval` (60 seconds by default). It also watches namespaces and projects, so most changes arrive within seconds. One replica is enough.
+project-sync does a full reconcile run at each `--interval`, 60 seconds by default. It also watches the namespaces and the projects, so most changes arrive in seconds. One replica is sufficient.
 
 ## Project metadata
 
-Rancher does not copy the labels and annotations of a project to its namespaces. project-sync does, for the keys you list in `--labels` and `--annotations`. This makes project metadata such as a cost centre or an owner usable in policies, network rules, and dashboards.
+Rancher does not copy the labels and the annotations of a project to the namespaces of the project. project-sync copies them, for the keys in `--labels` and `--annotations`. Policies, network rules, and dashboards can then use the metadata of a project, for example a cost centre or an owner.
 
-- The project wins. If a namespace has a different value for a listed key, the service overwrites it.
-- The service removes a key when the project no longer has it, or when the namespace moves to another project. It only removes keys that it wrote itself; it remembers them in two annotations on the namespace.
-- `--name-annotation` gets the display name of the project. `--name-label` gets a copy that is a valid label value: other characters become `-`, and the value is cut to 63 characters. A display name without a single letter or digit gets no label.
-- Keys under `cattle.io`, `kubernetes.io`, `k8s.io`, and `managed.drover.evil8.io` are refused.
+- **The value of the project has priority.** When a namespace has a different value for a key in the list, project-sync overwrites that value.
+- **Removal.** project-sync removes a key from a namespace when the project no longer has the key. It also removes the key when the namespace moves to another project. project-sync removes only the keys that it wrote. It records those keys in two annotations on the namespace.
+- **The display name as an annotation.** Set `--name-annotation` to an annotation key. project-sync then writes the display name of the project to that annotation, on each namespace of the project.
+- **The display name as a label.** Set `--name-label` to a label key. project-sync then writes the display name to that label. A label value permits fewer characters than a display name, so project-sync replaces each character outside `[A-Za-z0-9._-]` with `-`. It also cuts the value to 63 characters. When the display name does not contain a letter or a digit, project-sync does not write the label.
+- **Refused keys.** project-sync refuses a key under `cattle.io`, `kubernetes.io`, `k8s.io`, or `managed.drover.evil8.io`.
 
-The service also writes the number of namespaces of each project into the annotation `managed.drover.evil8.io/namespace-count` on the Project. A policy in the drover chart uses it to block the delete of a project that still has namespaces. If your deployment tool reports this annotation as drift, tell it to ignore the key.
+project-sync also writes the number of namespaces of each project to the annotation `managed.drover.evil8.io/namespace-count` on the Project object. A policy in the drover chart reads this annotation. With that policy, Kyverno denies the delete of a project that still has namespaces. When your deployment tool reports this annotation as drift, configure the tool to ignore the key.
 
 ## Service accounts
 
-A CI job or another client outside the cluster is not a Rancher user, so it cannot be a member of a project. With `--service-accounts`, every tenant project gets three ServiceAccounts that stand in for the three project roles:
+A CI job, or another client outside the cluster, is not a Rancher user. It thus cannot be a member of a project. With `--service-accounts`, project-sync creates three ServiceAccounts for each tenant project. Each ServiceAccount has the rights of one project role:
 
-| ServiceAccount | Kubernetes role in every namespace of the project |
+| ServiceAccount | Kubernetes role in each namespace of the project |
 | --- | --- |
 | `project-owner` | `admin` |
 | `project-member` | `edit` |
 | `read-only` | `view` |
 
-They live in a namespace `drover-<cluster id>-<project>`, inside a hidden Rancher project called `drover` that no tenant has a role in. All three can list the namespaces of their project, and the owner and the member can create namespaces in it. A token of such a ServiceAccount works through the Rancher proxy, for example with kubectl.
+project-sync creates the ServiceAccounts in the namespace `drover-<cluster id>-<project>`. That namespace is in a hidden Rancher project with the name `drover`. Tenants do not have a role in that project. Each of the three ServiceAccounts can list the namespaces of its project. `project-owner` and `project-member` can also create namespaces in the project. A client can use a token of such a ServiceAccount through the Rancher proxy, for example with kubectl.
 
-Things to know:
+Notes:
 
-- The ServiceAccounts get the plain Kubernetes roles. They do not get the extra rules of the Rancher role templates, such as monitoring resources or reading nodes. Add what you need with `--bind-cluster-role` and `--bind-role`.
-- A role bound with `--bind-cluster-role` must not grant `get` on `namespaces` without `resourceNames`. The api-filter would then refuse every namespace list of every project ServiceAccount.
-- The System project, the Default project, and the hidden `drover` project itself get no ServiceAccounts.
-- The bindings repair themselves. If a tenant edits or deletes one, the next reconcile run restores it.
-- To revoke every token of a ServiceAccount, delete the ServiceAccount; the service creates it again. Do not delete its namespace for this.
+- The ServiceAccounts have the Kubernetes roles only. They do not have the extra rules of the Rancher role templates, for example the rules for monitoring resources or for the read of nodes. Add such rules with `--bind-cluster-role` and `--bind-role`.
+- A role for `--bind-cluster-role` must not grant `get` on `namespaces` without `resourceNames`. With such a rule, the api-filter refuses each namespace list of each project ServiceAccount.
+- project-sync does not create ServiceAccounts for the System project, the Default project, and the hidden `drover` project.
+- In the next reconcile run, project-sync restores a binding that a tenant edited or deleted.
+- To revoke each token of a ServiceAccount, delete the ServiceAccount. project-sync creates it again. Do not delete its namespace for this purpose.
 
 ## Short-lived tokens
 
-With `--openbao-address`, project-sync configures the Kubernetes secrets engine of [OpenBao](https://openbao.org) for every cluster and project, so that OpenBao can create tokens of the project ServiceAccounts on request.
+With `--openbao-address`, project-sync configures the Kubernetes secrets engine of [OpenBao](https://openbao.org) for each cluster and each project. OpenBao can then create a token of a project ServiceAccount on request.
 
-- Each cluster gets its own mount, `kubernetes/<cluster id>`, with a role and an ACL policy per project and project role. `--openbao-mount-prefix` changes the `kubernetes` part.
-- OpenBao reaches a cluster through the Rancher proxy. project-sync gives it a ServiceAccount token for that and replaces the token well before it expires.
-- A credential is valid for 15 minutes by default, and a client can ask for up to 2 hours (`--openbao-credential-ttl`, `--openbao-credential-max-ttl`).
-- When a project or a cluster is removed from Rancher, the service removes its roles, policies, and mount from OpenBao.
+- Each cluster has its own mount, `kubernetes/<cluster id>`. The mount has a role and an ACL policy for each project role of each project. To change the `kubernetes` part, set `--openbao-mount-prefix`.
+- OpenBao connects to a cluster through the Rancher proxy. For this connection, project-sync gives OpenBao a ServiceAccount token. project-sync replaces that token when half of its lifetime remains.
+- A credential is valid for 15 minutes by default. A client can request a maximum of 2 hours. The flags are `--openbao-credential-ttl` and `--openbao-credential-max-ttl`.
+- When Rancher no longer has a project or a cluster, project-sync removes its roles, its policies, and its mount from OpenBao.
 
-A client gets a token with:
+A client requests a token with this command:
 
 ```sh
 bao write kubernetes/<cluster id>/creds/<project>-<role> \
@@ -60,7 +61,7 @@ bao write kubernetes/<cluster id>/creds/<project>-<role> \
 
 ## Login roles
 
-A client still has to log in to OpenBao before it can ask for a token. With `--trust-file`, the project owner controls this: they list the identities they trust in the annotation `drover.evil8.io/trust-policy` on their Rancher project.
+A client must log in to OpenBao before it can request a token. With `--trust-file`, the project owner controls this login. The owner lists the trusted identities in the annotation `drover.evil8.io/trust-policy` on the Rancher project. Each entry of the list is a statement.
 
 ```json
 {
@@ -82,11 +83,11 @@ A client still has to log in to OpenBao before it can ask for a token. With `--t
 }
 ```
 
-For each valid statement, project-sync writes one login role in OpenBao. A `jwt` statement matches the OIDC token of a CI system on the listed claims. An `aws` statement matches an IAM role. Whoever logs in with that role gets a short OpenBao token that can do one thing: request a credential for the named project role.
+project-sync writes one login role in OpenBao for each valid statement. For a `jwt` statement, OpenBao compares the claims in the OIDC token of a CI system with the claims in the statement. For an `aws` statement, OpenBao accepts the IAM role in the statement. A client that logs in with a login role gets an OpenBao token with a short lifetime. With that token, the client can only request a credential for the project role in the statement.
 
-The service reports the result per statement in the annotation `managed.drover.evil8.io/trust-policy-status`, with `ready: true` and the login path, or `ready: false` and a reason such as `UnknownIssuer` or `MissingRequiredClaim`.
+project-sync reports the result of each statement in the annotation `managed.drover.evil8.io/trust-policy-status`. A valid statement has `ready: true` and the login path. A statement that is not valid has `ready: false` and a reason, for example `UnknownIssuer` or `MissingRequiredClaim`.
 
-The platform team sets the boundaries in the file behind `--trust-file`:
+The platform team sets the limits for all projects in the file of `--trust-file`:
 
 ```json
 {
@@ -102,47 +103,48 @@ The platform team sets the boundaries in the file behind `--trust-file`:
 }
 ```
 
-- `jwtIssuers` lists the JWT issuers that a statement may use. Each one needs a JWT auth mount at `auth/jwt/<issuer>` in OpenBao, and the AWS method needs one at `auth/aws`. project-sync does not create auth mounts.
-- `requiredClaims` are claims every statement of that issuer must bind, for example the repository id. `allowedClaims` limits the values of a claim.
-- `audience` is the audience a JWT must have.
-- `aws` turns the AWS method on and can limit it to a list of accounts.
+- `jwtIssuers` contains the JWT issuers that a statement can use. Each issuer needs a JWT auth mount at `auth/jwt/<issuer>` in OpenBao. The AWS method needs an auth mount at `auth/aws`. project-sync does not create auth mounts.
+- `requiredClaims` contains the claims that each statement of the issuer must contain, for example the repository id. `allowedClaims` limits the values of a claim.
+- `audience` is the audience that a JWT must have.
+- `aws.enabled` enables the AWS method. `aws.allowedAccounts` limits the method to a list of accounts.
 
-If you trust the ServiceAccount tokens of a cluster as an issuer, bind the claim `/kubernetes.io/serviceaccount/uid` as well as `sub`. The `sub` claim only holds a namespace and a name, and another tenant could create both.
+When you add the ServiceAccount tokens of a cluster as an issuer, use the claim `/kubernetes.io/serviceaccount/uid` together with `sub`. The `sub` claim contains only a namespace and a name. Another tenant can create a namespace and a ServiceAccount with those names.
 
 ## Requirements
 
 **Always**
 
-- A Rancher service user of its own, with an API token in a mounted file (`--token-file`). Do not share the user of the api-filter: project-sync needs far wider rights, and the api-filter sits on the request path of every tenant. Rancher tokens expire, so [rotate-token](rotate-token.md) has to renew this one too.
-- Network access to Rancher (`--rancher-url`), and the CA of Rancher for an `https` URL (`--rancher-ca-file`).
-- For that user: `get`, `list`, `watch`, and `patch` on `namespaces` in every downstream cluster, and `list`, `watch`, and `patch` on Rancher projects in the `local` cluster.
-- An admission policy that stops tenants from writing labels and annotations under `managed.drover.evil8.io/`. project-sync trusts its own keys under that prefix. The [drover-policies chart](https://github.com/evil8io/charts/tree/main/charts/drover-policies) has this policy.
+- A separate Rancher service user for project-sync, with an API token in a mounted file (`--token-file`). Do not use the service user of the api-filter. The api-filter is on the request path of each tenant, so its user must have as few rights as possible. project-sync needs many more rights. A Rancher token expires, so [rotate-token](rotate-token.md) must also renew this token.
+- A network path to Rancher (`--rancher-url`). For an `https` URL with a private certificate, project-sync needs the CA of Rancher (`--rancher-ca-file`).
+- These rights for the service user: `get`, `list`, `watch`, and `patch` on `namespaces` in each downstream cluster. The user also needs `list`, `watch`, and `patch` on the Rancher projects in the `local` cluster.
+- An admission policy that denies a tenant write to a label or an annotation under `managed.drover.evil8.io/`. project-sync trusts its own keys under that prefix. The [drover-policies chart](https://github.com/evil8io/charts/tree/main/charts/drover-policies) contains this policy.
 
 **For service accounts**
 
-- More rights for the service user, in every cluster: all verbs on `namespaces`, create Rancher projects, manage ServiceAccounts, RoleBindings, and ClusterRoleBindings, and `bind` on the roles it hands out (`admin`, `edit`, `view`, `create-ns`, and every role of `--bind-cluster-role` and `--bind-role`).
-- For the tokens of these ServiceAccounts to work through Rancher: Rancher 2.9.0 or later, with a `ClusterProxyConfig` that has `enabled: true` for each cluster.
-- The [api-filter](api-filter.md), if the ServiceAccounts should be able to list their namespaces.
+- More rights for the service user in each cluster. The user needs every verb on `namespaces`, and `create` on Rancher projects. The user also needs the rights to manage ServiceAccounts, RoleBindings, and ClusterRoleBindings. The user also needs `bind` on each role that project-sync binds. These roles are `admin`, `edit`, `view`, `create-ns`, and each role of `--bind-cluster-role` and `--bind-role`.
+- Rancher 2.9.0 or later, and a `ClusterProxyConfig` with `enabled: true` for each cluster. Without them, Rancher does not accept the tokens of the ServiceAccounts.
+- The [api-filter](api-filter.md), when the ServiceAccounts must list their namespaces.
 
 **For short-lived tokens**
 
-- An OpenBao server that project-sync can reach (`--openbao-address`), and that can reach Rancher on an `https` URL (`--openbao-rancher-url`). OpenBao verifies that certificate; for a private CA, the Rancher setting `cacerts` must contain it.
-- A Kubernetes auth mount in OpenBao with a role for the ServiceAccount of the project-sync pod (`--openbao-auth-path`, `--openbao-role`, `--openbao-jwt-file`), and an ACL policy that lets that role manage the secrets engine mounts, their roles, and the policies under the mount prefix.
-- More rights for the Rancher service user: create tokens of the ServiceAccounts, manage Roles, and `get` on Rancher clusters and on the Rancher setting `cacerts`.
+- An OpenBao server that project-sync can connect to (`--openbao-address`).
+- An `https` URL of Rancher that OpenBao can connect to (`--openbao-rancher-url`). OpenBao verifies the certificate of that URL. For a private CA, the Rancher setting `cacerts` must contain the CA.
+- A Kubernetes auth mount in OpenBao, with a role for the ServiceAccount of the project-sync pod. The flags are `--openbao-auth-path`, `--openbao-role`, and `--openbao-jwt-file`. The role needs an ACL policy for the secrets engine mounts, their roles, and the policies under the mount prefix.
+- More rights for the Rancher service user. The user needs `create` on the tokens of the ServiceAccounts, and the rights to manage Roles. The user also needs `get` on the Rancher clusters and on the Rancher setting `cacerts`.
 
 **For login roles**
 
-- A JWT auth mount at `auth/jwt/<issuer>` for every issuer in the rules file, already configured for that issuer. For AWS identities, an AWS auth mount at `auth/aws`.
-- The ACL policy of project-sync extended to the roles of those auth mounts.
-- A route from the clients (CI runners, cloud workloads) to OpenBao and to Rancher.
+- A JWT auth mount at `auth/jwt/<issuer>` for each issuer in the file of `--trust-file`, with the configuration of that issuer. For AWS identities, an AWS auth mount at `auth/aws`.
+- An ACL policy for project-sync that also includes the roles of those auth mounts.
+- A network path from the clients, for example CI runners, to OpenBao and to Rancher.
 
-The [drover chart](https://github.com/evil8io/charts/tree/main/charts/drover) sets all of this up, including OpenBao itself. The exact permission lists and the OpenBao policies are in [.claude/docs/project-sync.md](../.claude/docs/project-sync.md).
+Helm creates all these objects from the [drover chart](https://github.com/evil8io/charts/tree/main/charts/drover), also OpenBao. The permission lists and the OpenBao policies are in [.claude/docs/project-sync.md](../.claude/docs/project-sync.md).
 
-## Running it
+## How to run it
 
 ```sh
 drover project-sync --rancher-url https://rancher.cattle-system --token-file /var/run/drover/token \
   --labels example.com/cost-center --name-annotation example.com/project-name
 ```
 
-`drover project-sync --help` lists every flag with its default. The service serves `/healthz`, writes JSON logs to stderr, and exports OpenTelemetry traces and `drover.sync.*` metrics when `--otlp-endpoint` is set. It never logs a token, a display name, or the content of a trust annotation.
+`drover project-sync --help` shows each flag with its default. project-sync answers on `/healthz`. It writes JSON logs to stderr. With `--otlp-endpoint`, it also sends OpenTelemetry traces and the `drover.sync.*` metrics. project-sync does not log a token, a display name, or the content of a trust annotation.
