@@ -47,7 +47,7 @@ Each item states if the [drover chart](https://github.com/evil8io/charts/tree/ma
 **Rancher**
 
 - A Rancher service user with `get`, `list`, and `watch` on `namespaces` in each downstream cluster. A `cluster-owner` binding also gives these rights. With the chart, Helm creates this user and its Rancher roles.
-- An API token of that user in a mounted file (`--token-file`). A Rancher token expires, so a job must renew it. With the chart, a CronJob runs [rotate-token](rotate-token.md) for this token.
+- An API token of that user in a mounted file (`--token-file`). A Rancher token expires, so it must be renewed. With the chart, a CronJob runs [rotate-token](rotate-token.md) for this token.
 - A network path from the api-filter to the Rancher Service in the cluster (`--upstream`). With the chart, set the value `rancher.url` to that Service. Do not use the public Rancher hostname. On that hostname, the Gateway sends the filtered paths back to the api-filter.
 - For an `https` upstream with a private certificate, the CA of Rancher (`--upstream-ca-file`). The chart does not mount a CA file. When the api-filter cannot verify the certificate, set the value `rancher.insecureSkipVerify`.
 

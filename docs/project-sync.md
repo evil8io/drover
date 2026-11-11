@@ -16,7 +16,7 @@ project-sync does a full reconcile run at each `--interval`, 60 seconds by defau
 Rancher does not copy the labels and the annotations of a project to the namespaces of the project. project-sync copies them, for the keys in `--labels` and `--annotations`. Policies, network rules, and dashboards can then use the metadata of a project, for example a cost centre or an owner.
 
 - **The value of the project has priority.** When a namespace has a different value for a key in the list, project-sync overwrites that value.
-- **Removal.** project-sync removes a key from a namespace when the project no longer has the key. It also removes the key when the namespace moves to another project. project-sync removes only the keys that it wrote. It records the label keys that it wrote in the annotation `managed.drover.evil8.io/synced-labels` of the namespace, as a comma-separated list. It records the annotation keys in `managed.drover.evil8.io/synced-annotations`.
+- **Removal.** project-sync removes a key from a namespace when the key is removed from the project. It also removes the key when the namespace is moved to another project. project-sync removes only the keys that it wrote. It records the label keys that it wrote in the annotation `managed.drover.evil8.io/synced-labels` of the namespace, as a comma-separated list. It records the annotation keys in `managed.drover.evil8.io/synced-annotations`.
 - **The display name as an annotation.** Set `--name-annotation` to an annotation key. project-sync then writes the display name of the project to that annotation, on each namespace of the project.
 - **The display name as a label.** Set `--name-label` to a label key. project-sync then writes the display name to that label. A label value permits fewer characters than a display name, so project-sync replaces each character outside `[A-Za-z0-9._-]` with `-`. It also cuts the value to 63 characters. When the display name does not contain a letter or a digit, project-sync does not write the label.
 - **Refused keys.** project-sync refuses a key under `cattle.io`, `kubernetes.io`, `k8s.io`, or `managed.drover.evil8.io`.
@@ -40,7 +40,7 @@ Notes:
 - The ServiceAccounts have the Kubernetes roles only. They do not have the extra rules of the Rancher role templates, for example the rules for monitoring resources or for the read of nodes. Add such rules with `--bind-cluster-role` and `--bind-role`.
 - A role for `--bind-cluster-role` must not grant `get` on `namespaces` without `resourceNames`. With such a rule, the api-filter refuses each namespace list of each project ServiceAccount.
 - project-sync does not create ServiceAccounts for the System project, the Default project, and the hidden `drover` project.
-- In the next reconcile run, project-sync restores a binding that a tenant edited or deleted.
+- In the next reconcile run, project-sync restores a binding that was edited or deleted.
 - To revoke each token of a ServiceAccount, delete the ServiceAccount. project-sync creates it again. Do not delete its namespace for this purpose.
 
 ## Short-lived tokens
@@ -117,7 +117,7 @@ Each item states if the [drover chart](https://github.com/evil8io/charts/tree/ma
 **Always**
 
 - A separate Rancher service user for project-sync. Do not use the service user of the api-filter. The api-filter is on the request path of each tenant, so its user must have as few rights as possible. project-sync needs many more rights. With the chart, Helm creates this user.
-- An API token of that user in a mounted file (`--token-file`). A Rancher token expires, so a job must renew it. With the chart, a CronJob runs [rotate-token](rotate-token.md) for this token.
+- An API token of that user in a mounted file (`--token-file`). A Rancher token expires, so it must be renewed. With the chart, a CronJob runs [rotate-token](rotate-token.md) for this token.
 - A network path to Rancher (`--rancher-url`). With the chart, set the value `rancher.url` to the Rancher Service in the cluster.
 - For an `https` URL with a private certificate, the CA of Rancher (`--rancher-ca-file`). The chart does not mount a CA file. When project-sync cannot verify the certificate, set the value `rancher.insecureSkipVerify`.
 - These rights for the service user: `get`, `list`, `watch`, and `patch` on `namespaces` in each downstream cluster. The user also needs `list`, `watch`, and `patch` on the Rancher projects in the `local` cluster. With the chart, Helm creates the Rancher roles and bindings for these rights.
