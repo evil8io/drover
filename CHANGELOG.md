@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.31.0](https://github.com/evil8io/drover/compare/v0.30.1...v0.31.0) (2026-11-12)
+
+
+### Features
+
+* **project-sync:** export the source identity and the role of each trust statement as a gauge ([#174](https://github.com/evil8io/drover/issues/174)) ([f25a8f3](https://github.com/evil8io/drover/commit/f25a8f3f3cca2ca6db880d2013f56e14cd6d50ee))
+
 ## [0.30.1](https://github.com/evil8io/drover/compare/v0.30.0...v0.30.1) (2026-11-01)
 
 
