@@ -70,6 +70,10 @@ type Config struct {
 	// writes an OpenBao login role for each valid statement of the trust
 	// annotation of a project. It needs OpenBao. Empty turns it off.
 	TrustFile string
+	// TrustStatementsInfo exports the gauge drover.sync.trust.statements.info,
+	// with the source identity and the project role of each valid statement.
+	// It needs TrustFile.
+	TrustStatementsInfo bool
 	// Interval is the time between two runs. Zero selects 60 s.
 	Interval time.Duration
 	// PatchRate bounds the requests to Rancher per second that the watches of
@@ -185,6 +189,9 @@ func New(cfg Config) (*Syncer, error) {
 	if cfg.TrustFile != "" && cfg.OpenBao == nil {
 		return nil, errors.New("the trust rules need the OpenBao config")
 	}
+	if cfg.TrustStatementsInfo && cfg.TrustFile == "" {
+		return nil, errors.New("the trust statements info needs the trust rules")
+	}
 	keys := slices.Concat(cfg.Labels, cfg.Annotations)
 	for _, key := range []string{cfg.NameLabel, cfg.NameAnnotation} {
 		if key != "" {
@@ -236,7 +243,7 @@ func New(cfg Config) (*Syncer, error) {
 	if meterProvider == nil {
 		meterProvider = otel.GetMeterProvider()
 	}
-	m, err := newMetrics(meterProvider)
+	m, err := newMetrics(meterProvider, cfg.TrustStatementsInfo)
 	if err != nil {
 		return nil, fmt.Errorf("build the sync metrics: %w", err)
 	}

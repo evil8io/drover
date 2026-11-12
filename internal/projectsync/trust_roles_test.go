@@ -947,11 +947,203 @@ func TestReconcileLeavesTheMountOfARemovedIssuer(t *testing.T) {
 
 // newTrustGaugeSetup returns a trust setup whose meter provider has a manual
 // reader.
-func newTrustGaugeSetup(t *testing.T, fake *accountsFake) (*openbaoSetup, *sdkmetric.ManualReader) {
+func newTrustGaugeSetup(t *testing.T, fake *accountsFake, opts ...func(*Config)) (*openbaoSetup, *sdkmetric.ManualReader) {
 	t.Helper()
 	reader := sdkmetric.NewManualReader()
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	return newTrustSetup(t, fake, func(cfg *Config) { cfg.MeterProvider = provider }), reader
+	return newTrustSetup(t, fake, append([]func(*Config){withReader(reader)}, opts...)...), reader
+}
+
+func withReader(reader *sdkmetric.ManualReader) func(*Config) {
+	return func(cfg *Config) { cfg.MeterProvider = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)) }
+}
+
+func withTrustInfo(cfg *Config) { cfg.TrustStatementsInfo = true }
+
+// trustInfo returns the attributes of each data point of
+// drover.sync.trust.statements.info of the project name, sorted by statement.
+// It reports an error for a data point whose value is not 1.
+func trustInfo(t *testing.T, reader *sdkmetric.ManualReader, name string) []map[string]string {
+	t.Helper()
+	var data metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &data); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	gauge, _ := findGauge(t, data, "drover.sync.trust.statements.info")
+	var out []map[string]string
+	for _, point := range gauge.DataPoints {
+		if project, _ := point.Attributes.Value("project"); project.AsString() != name {
+			continue
+		}
+		if point.Value != 1 {
+			t.Errorf("value of the info point %s = %d, want 1", point.Attributes.Encoded(attribute.DefaultEncoder()), point.Value)
+		}
+		attrs := make(map[string]string, point.Attributes.Len())
+		for _, kv := range point.Attributes.ToSlice() {
+			attrs[string(kv.Key)] = kv.Value.AsString()
+		}
+		out = append(out, attrs)
+	}
+	slices.SortFunc(out, func(a, b map[string]string) int { return strings.Compare(a["statement"], b["statement"]) })
+	return out
+}
+
+// infoAttrs returns the attributes of an info point of a statement of p-alpha
+// in c-1, with more.
+func infoAttrs(statement, role string, more map[string]string) map[string]string {
+	out := map[string]string{"drover.cluster": "c-1", "project": "p-alpha", "statement": statement, "role": role}
+	for key, value := range more {
+		out[key] = value
+	}
+	return out
+}
+
+func TestReconcileExportsNoTrustInfoWithoutTheFlag(t *testing.T) {
+	t.Parallel()
+	fake := newAccountsFake(t)
+	fake.addProject("p-alpha", trusted(twoStatements))
+	setup, reader := newTrustGaugeSetup(t, fake)
+
+	setup.syncer.reconcile(context.Background())
+
+	var data metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &data); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	if _, ok := findGauge(t, data, "drover.sync.trust.statements.info"); ok {
+		t.Error("the info gauge is exported, want no gauge without the flag")
+	}
+	m := setup.syncer.metrics
+	m.trustMu.Lock()
+	defer m.trustMu.Unlock()
+	if points := m.trust[projectRef{cluster: acctCluster, name: "p-alpha"}]; len(points.ready) != 2 || points.info != nil {
+		t.Errorf("stored points = %+v, want 2 ready points and no info points", points)
+	}
+}
+
+func TestReconcileExportsTheTrustInfoOfEachValidStatement(t *testing.T) {
+	t.Parallel()
+	deployInfo := infoAttrs("deploy", "project-member", map[string]string{
+		"method": "jwt", "issuer": "github", "claims": `{"repository_id":"123456789","ref":["refs/heads/main","refs/heads/release"]}`,
+	})
+	limited := func(name string) string {
+		return `{"name":"` + name + `","jwt":{"issuer":"github","claims":{"repository_id":"1","ref":"refs/heads/main"}},"role":"read-only"}`
+	}
+	limitedInfo := func(name string) map[string]string {
+		return infoAttrs(name, "read-only", map[string]string{"method": "jwt", "issuer": "github", "claims": `{"repository_id":"1","ref":"refs/heads/main"}`})
+	}
+
+	tests := []struct {
+		name     string
+		document string
+		info     []map[string]string
+		ready    []string
+	}{
+		{
+			"jwt statement with the allowed claims of the issuer", oneStatement,
+			[]map[string]string{deployInfo},
+			[]string{"drover.cluster=c-1,project=p-alpha,statement=deploy 1"},
+		},
+		{
+			"list claim",
+			`{"statements":[{"name":"deploy","jwt":{"issuer":"github","claims":{"repository_id":"2","ref":["refs/heads/release","refs/heads/main"]}},"role":"project-owner"}]}`,
+			[]map[string]string{infoAttrs("deploy", "project-owner", map[string]string{
+				"method": "jwt", "issuer": "github", "claims": `{"repository_id":"2","ref":["refs/heads/release","refs/heads/main"]}`,
+			})},
+			[]string{"drover.cluster=c-1,project=p-alpha,statement=deploy 1"},
+		},
+		{
+			"aws statement", `{"statements":[` + rotatorStatement + `]}`,
+			[]map[string]string{infoAttrs("rotator", "read-only", map[string]string{"method": "aws", "arn": "arn:aws:iam::123456789012:role/rotator"})},
+			[]string{"drover.cluster=c-1,project=p-alpha,statement=rotator 1"},
+		},
+		{
+			"rejected statement",
+			`{"statements":[` + deployStatement + `,{"name":"bad","jwt":{"issuer":"github","claims":{"repository_id":"1"}},"role":"admin"}]}`,
+			[]map[string]string{deployInfo},
+			[]string{
+				"drover.cluster=c-1,project=p-alpha,reason=InvalidRole,statement=bad 0",
+				"drover.cluster=c-1,project=p-alpha,statement=deploy 1",
+			},
+		},
+		{
+			"statement past the limit",
+			`{"statements":[` + limited("s1") + `,` + limited("s2") + `,` + limited("s3") + `,` + limited("s4") + `]}`,
+			[]map[string]string{limitedInfo("s1"), limitedInfo("s2"), limitedInfo("s3")},
+			[]string{
+				"drover.cluster=c-1,project=p-alpha,reason=TooManyStatements,statement=s4 0",
+				"drover.cluster=c-1,project=p-alpha,statement=s1 1",
+				"drover.cluster=c-1,project=p-alpha,statement=s2 1",
+				"drover.cluster=c-1,project=p-alpha,statement=s3 1",
+			},
+		},
+		{
+			"document error", `{"statements": [{"name": "secret-value"`,
+			nil,
+			[]string{"drover.cluster=c-1,project=p-alpha,reason=InvalidJSON 0"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fake := newAccountsFake(t)
+			fake.addProject("p-alpha", trusted(tt.document))
+			setup, reader := newTrustGaugeSetup(t, fake, withTrustInfo)
+
+			setup.syncer.reconcile(context.Background())
+
+			if got := trustInfo(t, reader, "p-alpha"); !reflect.DeepEqual(got, tt.info) {
+				t.Errorf("info points =\n%v\nwant\n%v", got, tt.info)
+			}
+			if got := trustReadiness(t, reader, "p-alpha"); !slices.Equal(got, tt.ready) {
+				t.Errorf("ready points =\n%v\nwant\n%v", got, tt.ready)
+			}
+			if logs := setup.logs.String(); strings.Contains(logs, "123456789\"") || strings.Contains(logs, "refs/heads") {
+				t.Errorf("the logs have a claim value:\n%s", logs)
+			}
+		})
+	}
+}
+
+func TestReconcileExportsTheTrustInfoOfAStatementThatOpenBaoDoesNotHave(t *testing.T) {
+	t.Parallel()
+	deployInfo := []map[string]string{infoAttrs("deploy", "project-member", map[string]string{
+		"method": "jwt", "issuer": "github", "claims": `{"repository_id":"123456789","ref":["refs/heads/main","refs/heads/release"]}`,
+	})}
+
+	tests := []struct {
+		name  string
+		setup func(*testing.T, *accountsFake, *sdkmetric.ManualReader) *openbaoSetup
+		ready string
+	}{
+		{"missing auth mount", func(t *testing.T, fake *accountsFake, reader *sdkmetric.ManualReader) *openbaoSetup {
+			setup := newOpenBaoSetup(t, fake, withTrust(trustRulesPath), withReader(reader), withTrustInfo)
+			setup.bao.addAuthMount(awsAuthPath)
+			return setup
+		}, "drover.cluster=c-1,project=p-alpha,reason=MethodDisabled,statement=deploy 0"},
+		{"failed write", func(t *testing.T, fake *accountsFake, reader *sdkmetric.ManualReader) *openbaoSetup {
+			setup := newTrustSetup(t, fake, withReader(reader), withTrustInfo)
+			setup.bao.fail(githubMount+"/role/c-1_p-alpha_deploy", http.StatusInternalServerError)
+			return setup
+		}, "drover.cluster=c-1,project=p-alpha,reason=WriteFailed,statement=deploy 0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fake := newAccountsFake(t)
+			fake.addProject("p-alpha", trusted(oneStatement))
+			reader := sdkmetric.NewManualReader()
+			setup := tt.setup(t, fake, reader)
+
+			setup.syncer.reconcile(context.Background())
+
+			if got := trustReadiness(t, reader, "p-alpha"); !slices.Equal(got, []string{tt.ready}) {
+				t.Errorf("ready points = %v, want [%s]", got, tt.ready)
+			}
+			if got := trustInfo(t, reader, "p-alpha"); !reflect.DeepEqual(got, deployInfo) {
+				t.Errorf("info points =\n%v\nwant\n%v", got, deployInfo)
+			}
+		})
+	}
 }
 
 // trustReadiness returns the data points of drover.sync.trust.statements.ready of

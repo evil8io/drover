@@ -39,6 +39,7 @@ type projectSyncConfig struct {
 	boundRoles         []projectsync.BoundRole
 	openbao            *projectsync.OpenBaoConfig
 	trustFile          string
+	trustInfo          bool
 	interval           time.Duration
 	patchRate          float64
 	logLevel           slog.Level
@@ -73,22 +74,23 @@ func runProjectSync(args []string) int {
 	}()
 
 	syncer, err := projectsync.New(projectsync.Config{
-		RancherURL:         cfg.rancherURL,
-		CAFile:             cfg.caFile,
-		InsecureSkipVerify: cfg.insecureSkipVerify,
-		TokenFile:          cfg.tokenFile,
-		Labels:             cfg.labels,
-		Annotations:        cfg.annotations,
-		NameLabel:          cfg.nameLabel,
-		NameAnnotation:     cfg.nameAnnotation,
-		ServiceAccounts:    cfg.serviceAccounts,
-		BoundRoles:         cfg.boundRoles,
-		OpenBao:            cfg.openbao,
-		TrustFile:          cfg.trustFile,
-		Interval:           cfg.interval,
-		PatchRate:          cfg.patchRate,
-		Logger:             logger,
-		Version:            version,
+		RancherURL:          cfg.rancherURL,
+		CAFile:              cfg.caFile,
+		InsecureSkipVerify:  cfg.insecureSkipVerify,
+		TokenFile:           cfg.tokenFile,
+		Labels:              cfg.labels,
+		Annotations:         cfg.annotations,
+		NameLabel:           cfg.nameLabel,
+		NameAnnotation:      cfg.nameAnnotation,
+		ServiceAccounts:     cfg.serviceAccounts,
+		BoundRoles:          cfg.boundRoles,
+		OpenBao:             cfg.openbao,
+		TrustFile:           cfg.trustFile,
+		TrustStatementsInfo: cfg.trustInfo,
+		Interval:            cfg.interval,
+		PatchRate:           cfg.patchRate,
+		Logger:              logger,
+		Version:             version,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -124,6 +126,7 @@ func runProjectSync(args []string) int {
 		"bound_roles", boundRoleNames(cfg.boundRoles),
 		"openbao_address", openbaoAddress(cfg.openbao),
 		"trust_file", cfg.trustFile,
+		"trust_statements_info", cfg.trustInfo,
 	)
 
 	syncDone := make(chan struct{})
@@ -213,6 +216,8 @@ func parseProjectSyncConfig(args []string, output io.Writer, getenv func(string)
 		"longest lifetime of a credential of a project role that OpenBao creates")
 	flags.StringVar(&cfg.trustFile, "trust-file", "",
 		"JSON file of the trust rules, for the OpenBao login roles of the project trust annotation; empty turns it off")
+	flags.BoolVar(&cfg.trustInfo, "trust-statements-info", false,
+		"export the gauge drover.sync.trust.statements.info, with the JWT claims or the role ARN and the project role of each valid trust statement")
 	flags.DurationVar(&cfg.interval, "interval", 60*time.Second, "time between two runs")
 	flags.Float64Var(&cfg.patchRate, "patch-rate", 10,
 		"requests to Rancher per second that the watches of one cluster send, together")
@@ -270,6 +275,9 @@ func parseProjectSyncConfig(args []string, output io.Writer, getenv func(string)
 	}
 	if cfg.trustFile != "" && cfg.openbao == nil {
 		return projectSyncConfig{}, errors.New("-trust-file needs -openbao-address and -service-accounts")
+	}
+	if cfg.trustInfo && cfg.trustFile == "" {
+		return projectSyncConfig{}, errors.New("-trust-statements-info needs -trust-file")
 	}
 	return cfg, nil
 }

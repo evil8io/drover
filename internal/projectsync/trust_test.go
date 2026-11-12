@@ -199,6 +199,7 @@ func TestNewChecksTheTrustRules(t *testing.T) {
 		want string
 	}{
 		{"without OpenBao", Config{ServiceAccounts: true, TrustFile: trustRulesPath}, "the trust rules need the OpenBao config"},
+		{"info without rules", Config{ServiceAccounts: true, OpenBao: openbao, TrustStatementsInfo: true}, "the trust statements info needs the trust rules"},
 		{"missing file", Config{ServiceAccounts: true, OpenBao: openbao, TrustFile: missing}, "read the trust rules file"},
 		{"trust key copied", Config{ServiceAccounts: true, OpenBao: openbao, TrustFile: trustRulesPath, Annotations: []string{trustKey}}, "copies to a namespace"},
 		{"status key copied", Config{ServiceAccounts: true, OpenBao: openbao, TrustFile: trustRulesPath, NameAnnotation: trustStatusKey}, "writes its own keys under that domain"},
