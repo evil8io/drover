@@ -593,16 +593,21 @@ func notReady(name, reason string) statementStatus {
 	return statementStatus{Name: statusName(name), Reason: reason, Message: trustMessages[reason]}
 }
 
-// statusName cuts an invalid name to maxStatusName bytes, at a rune boundary.
+// statusName cuts an invalid name to maxStatusName bytes.
 func statusName(name string) string {
-	if len(name) <= maxStatusName {
-		return name
+	return cutAtRune(name, maxStatusName)
+}
+
+// cutAtRune cuts value to at most limit bytes, at a rune boundary.
+func cutAtRune(value string, limit int) string {
+	if len(value) <= limit {
+		return value
 	}
-	cut := maxStatusName
-	for cut > 0 && !utf8.RuneStart(name[cut]) {
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
 		cut--
 	}
-	return name[:cut]
+	return value[:cut]
 }
 
 // sameTrustStatus reports whether the status current equals want. It ignores

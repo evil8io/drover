@@ -305,6 +305,23 @@ func TestParseProjectSyncConfigTrustFile(t *testing.T) {
 	}
 }
 
+func TestParseProjectSyncConfigTrustStatementsInfo(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := parseProjectSyncConfig(openbaoArgs("--trust-file", "/etc/drover/trust.json", "--trust-statements-info"), io.Discard, noEnvironment)
+	if err != nil {
+		t.Fatalf("parseProjectSyncConfig: %v", err)
+	}
+	if !cfg.trustInfo {
+		t.Error("trust statements info = false, want true")
+	}
+
+	_, err = parseProjectSyncConfig(openbaoArgs("--trust-statements-info"), io.Discard, noEnvironment)
+	if err == nil || !strings.Contains(err.Error(), "-trust-statements-info needs -trust-file") {
+		t.Errorf("error = %v, want one about -trust-statements-info", err)
+	}
+}
+
 func TestParseProjectSyncConfigBoundRoles(t *testing.T) {
 	t.Parallel()
 

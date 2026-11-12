@@ -142,21 +142,28 @@ func (s *Syncer) loginBody(rules *trustRules, cluster, project string, item trus
 		}
 	}
 	issuer := rules.issuers[item.jwt.issuer]
-	claims := maps.Clone(item.jwt.claims)
-	for claim, allowed := range issuer.allowed {
-		if _, ok := claims[claim]; !ok {
-			claims[claim] = slices.Clone(allowed)
-		}
-	}
 	return jwtLoginRole{
 		RoleType:        "jwt",
 		BoundAudiences:  []string{rules.audience},
-		BoundClaims:     claims,
+		BoundClaims:     item.jwt.boundClaims(issuer),
 		BoundClaimsType: "string",
 		UserClaim:       issuer.required[0],
 		ClaimMappings:   map[string]string{},
 		loginToken:      token,
 	}
+}
+
+// boundClaims returns the bound claims of the login role of j: the claims of
+// j, and the allowed values of each allowed claim of issuer that j does not
+// bind.
+func (j *jwtTrust) boundClaims(issuer trustIssuer) map[string]any {
+	claims := maps.Clone(j.claims)
+	for claim, allowed := range issuer.allowed {
+		if _, ok := claims[claim]; !ok {
+			claims[claim] = slices.Clone(allowed)
+		}
+	}
+	return claims
 }
 
 // withoutPath returns the role ARN without the path of the role. The caller
@@ -261,12 +268,14 @@ func (s *Syncer) keepTrust(ctx context.Context, run *trustRun, cluster, name str
 	var result trustResult
 	want := make(map[loginKey]bool)
 	var status *trustStatus
+	var statements []trustStatement
 	if item.trust.present() {
 		status = &trustStatus{ObservedHash: item.trust.hash}
 		doc := parseTrustValue(item.trust, run.rules)
 		if doc.reason != "" {
 			status.Error = newTrustReason(doc.reason)
 		} else {
+			statements = doc.statements
 			entries := make([]statementStatus, 0, min(len(doc.statements), run.rules.maxStatements+1))
 			for index, statement := range doc.statements {
 				entry := s.keepLogin(ctx, run, cluster, name, statement, want, &result)
@@ -294,7 +303,7 @@ func (s *Syncer) keepTrust(ctx context.Context, run *trustRun, cluster, name str
 	}
 
 	// The project watch can change or delete the project during the step.
-	s.metrics.setTrust(cluster, name, status, func() bool {
+	s.metrics.setTrust(cluster, name, status, statements, run.rules, func() bool {
 		live, ok := s.projectsOf(cluster)[name]
 		return ok && live.trust == item.trust
 	})
@@ -496,7 +505,7 @@ func (s *Syncer) keepProjectTrust(ctx context.Context, token, cluster, name stri
 	s.keepTrust(ctx, run, cluster, name, item)
 }
 
-// dropGoneTrustPoints removes the data points of the trust gauge of each
+// dropGoneTrustPoints removes the data points of the trust gauges of each
 // project that the snapshot does not have.
 func (s *Syncer) dropGoneTrustPoints() {
 	s.metrics.pruneTrust(func(ref projectRef) bool {

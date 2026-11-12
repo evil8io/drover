@@ -108,6 +108,7 @@ Start the service with `drover project-sync [flags]`.
 | `--openbao-credential-ttl` | `15m` | Default lifetime of a credential of a project role. This value is the `token_default_ttl` of the role in OpenBao for that project role. The minimum is `10m`, because the API server rejects a TokenRequest with a shorter lifetime. |
 | `--openbao-credential-max-ttl` | `2h` | Longest lifetime of a credential of a project role. This value is the `token_max_ttl` of the role in OpenBao for that project role. It must not be shorter than `--openbao-credential-ttl`. |
 | `--trust-file` | | JSON file of the trust rules. With a file, the service writes the OpenBao login roles of the trust annotations. See [Login roles](#login-roles). When the value is empty, the login roles are off. |
+| `--trust-statements-info` | `false` | When `true`, the service exports the gauge `drover.sync.trust.statements.info`. See [Telemetry](#telemetry). |
 | `--interval` | `60s` | Time between two reconcile runs. |
 | `--patch-rate` | `10` | Limit per second for the requests to Rancher that the watches of one cluster send, together. For a value of `0` or less, the service uses `10`. The value must be a finite number. |
 | `--listen` | `:8080` | Address that the service listens on. |
@@ -117,7 +118,7 @@ Start the service with `drover project-sync [flags]`.
 | `--otlp-metrics` | `true` | When `true`, the service sends metrics to the OTLP endpoint. |
 | `--service-name` | `$OTEL_SERVICE_NAME`, or `drover` | Value of the `service.name` resource attribute. With an empty value, `--service-name=`, the service does not set a `service.name`, so that a collector can derive it. The OpenTelemetry SDK still takes a `service.name` from `OTEL_SERVICE_NAME` or `OTEL_RESOURCE_ATTRIBUTES`. |
 
-The flags need at least one label key, annotation key, name label key, or name annotation key, or `--service-accounts`. Every `--openbao-` flag needs `--service-accounts`. `--trust-file` needs `--openbao-address` and `--service-accounts`.
+The flags need at least one label key, annotation key, name label key, or name annotation key, or `--service-accounts`. Every `--openbao-` flag needs `--service-accounts`. `--trust-file` needs `--openbao-address` and `--service-accounts`. `--trust-statements-info` needs `--trust-file`.
 
 A key must be a valid Kubernetes label or annotation key. A key is not valid when its prefix is `cattle.io`, `kubernetes.io`, or `k8s.io`, or a subdomain of one of them. The reason is that Rancher and Kubernetes own those domains. A key under `managed.drover.evil8.io` is not valid either, because the service writes its own keys under that domain.
 
@@ -493,6 +494,7 @@ With `--openbao-address`, the service also produces a span named `openbao_login`
 | `drover.sync.openbao.writes` | Counter | `1` | `drover.cluster`, `outcome` |
 | `drover.sync.openbao.changes` | Counter | `1` | `kind`, `action` |
 | `drover.sync.trust.statements.ready` | Gauge | `1` | `drover.cluster`, `project`, `statement`, `reason` |
+| `drover.sync.trust.statements.info` | Gauge | `1` | `drover.cluster`, `project`, `statement`, `role`, `method` (`jwt` or `aws`), `issuer` and `claims` for `jwt`, `arn` for `aws` |
 
 The `kind` attribute of the watch metrics is `namespace` or `project`. For the project watch, `drover.cluster` is always `local`.
 
@@ -508,6 +510,8 @@ With `--trust-file`, the service exports `drover.sync.trust.statements.ready` fo
 
 The value is 1 for a ready statement and 0 for a statement that is not ready. A data point has the attribute `statement` only for a valid statement name. It has the attribute `reason` only for the value 0. When the status contains the key `error`, the project has one data point with the value 0 and without the attribute `statement`. The attribute `reason` of that data point is the `reason` of the key `error`. `drover.cluster` is the cluster id of the project, and `project` is the project name.
 
+With `--trust-statements-info`, the service exports `drover.sync.trust.statements.info` with the value 1 for each valid statement, also when the statement is not ready. `claims` contains the bound claims of the login role as a JSON object, with the required claims of the issuer first. The service cuts `claims` and `arn` at 2048 bytes. With this flag, the service sends the claims and the role ARNs of the tenants to the metrics backend.
+
 The service removes data points in these cases:
 
 - The service computes the status of a project, after a project event or in a reconcile run. It then replaces the data points of the project. So it removes the data point of a removed statement, and every data point of a project without the trust annotation.
@@ -516,4 +520,4 @@ The service removes data points in these cases:
 
 A reconcile run keeps the data points of every other project, also when it does not write OpenBao state for the project or its cluster.
 
-The service sets the cardinality limit of its observable gauges to 10000 data points. So the OpenTelemetry SDK exports at most 9999 attribute sets of this gauge per collection. A collection is one read and export of the metrics, every 30 seconds. It puts the values of every later attribute set into one data point with the attribute `otel.metric.overflow` set to `true`. The service reports the data points in the order of cluster id and project name. So that data point has the values of the same projects at each collection.
+The service sets the cardinality limit of its observable gauges to 10000 data points. So the OpenTelemetry SDK exports at most 9999 attribute sets of each gauge per collection. A collection is one read and export of the metrics, every 30 seconds. It puts the values of every later attribute set into one data point with the attribute `otel.metric.overflow` set to `true`. The service reports the data points in the order of cluster id and project name. So that data point has the values of the same projects at each collection.

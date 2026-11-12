@@ -3,7 +3,9 @@ package projectsync
 import (
 	"context"
 	"slices"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -147,13 +149,13 @@ func TestTrustGaugeOverflowsTheSameProjectsAtEachCollection(t *testing.T) {
 	t.Parallel()
 	reader := sdkmetric.NewManualReader()
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader), sdkmetric.WithCardinalityLimit(3))
-	m, err := newMetrics(provider)
+	m, err := newMetrics(provider, false)
 	if err != nil {
 		t.Fatalf("build the metrics: %v", err)
 	}
 	statements := []statementStatus{{Name: "deploy", Ready: true}}
 	for _, name := range []string{"p-f", "p-c", "p-a", "p-e", "p-b", "p-d"} {
-		m.setTrust(acctCluster, name, &trustStatus{Statements: &statements}, func() bool { return true })
+		m.setTrust(acctCluster, name, &trustStatus{Statements: &statements}, nil, nil, func() bool { return true })
 	}
 
 	want := []string{"overflow", "p-a", "p-b"}
@@ -176,6 +178,101 @@ func TestTrustGaugeOverflowsTheSameProjectsAtEachCollection(t *testing.T) {
 		if !slices.Equal(got, want) {
 			t.Fatalf("points = %v, want %v", got, want)
 		}
+	}
+}
+
+// countProjectPoints returns the count of data points of the gauge metric for
+// the project name.
+func countProjectPoints(t *testing.T, data metricdata.ResourceMetrics, metric, name string) int {
+	t.Helper()
+	gauge, _ := findGauge(t, data, metric)
+	count := 0
+	for _, point := range gauge.DataPoints {
+		if project, _ := point.Attributes.Value("project"); project.AsString() == name {
+			count++
+		}
+	}
+	return count
+}
+
+// TestTrustInfoPointsAreRemovedWithTheReadyPoints checks that each remove of
+// the data points of a project removes the points of both trust gauges, and
+// keeps the points of another project.
+func TestTrustInfoPointsAreRemovedWithTheReadyPoints(t *testing.T) {
+	t.Parallel()
+	rules := fixtureRules(t)
+	statements := parseTrust(twoStatements, rules).statements
+	entries := []statementStatus{{Name: "deploy", Ready: true}, {Name: "rotator", Ready: true}}
+	status := &trustStatus{Statements: &entries}
+	always := func() bool { return true }
+
+	tests := []struct {
+		name   string
+		remove func(*metrics)
+	}{
+		{"nil status", func(m *metrics) { m.setTrust(acctCluster, "p-alpha", nil, nil, rules, always) }},
+		{"forgetTrust", func(m *metrics) { m.forgetTrust(acctCluster, "p-alpha") }},
+		{"pruneTrust", func(m *metrics) { m.pruneTrust(func(ref projectRef) bool { return ref.name == "p-alpha" }) }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			reader := sdkmetric.NewManualReader()
+			m, err := newMetrics(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)), true)
+			if err != nil {
+				t.Fatalf("build the metrics: %v", err)
+			}
+			for _, name := range []string{"p-alpha", "p-beta"} {
+				m.setTrust(acctCluster, name, status, statements, rules, always)
+			}
+			tt.remove(m)
+
+			var data metricdata.ResourceMetrics
+			if err := reader.Collect(context.Background(), &data); err != nil {
+				t.Fatalf("collect metrics: %v", err)
+			}
+			for _, metric := range []string{"drover.sync.trust.statements.ready", "drover.sync.trust.statements.info"} {
+				if got := countProjectPoints(t, data, metric, "p-alpha"); got != 0 {
+					t.Errorf("%s points of the removed project = %d, want 0", metric, got)
+				}
+				if got := countProjectPoints(t, data, metric, "p-beta"); got != 2 {
+					t.Errorf("%s points of the other project = %d, want 2", metric, got)
+				}
+			}
+		})
+	}
+}
+
+func TestClaimsAttribute(t *testing.T) {
+	t.Parallel()
+	// Each "€" has three bytes, so byte 2048 of long is inside a rune.
+	long := `{"ab":"` + strings.Repeat("€", 1000)
+
+	tests := []struct {
+		name   string
+		claims map[string]any
+		first  []string
+		want   string
+	}{
+		{"the first claims, then the other keys sorted", map[string]any{"a": "x", "repository_id": "1", "event_name": []string{"pull_request", "pull_request_target"}}, []string{"repository_id"}, `{"repository_id":"1","a":"x","event_name":["pull_request","pull_request_target"]}`},
+		{"list values in their order", map[string]any{"ref": []string{"refs/heads/release", "refs/heads/main"}}, nil, `{"ref":["refs/heads/release","refs/heads/main"]}`},
+		{"a value with the separators of the form", map[string]any{"a": `x","b":"y`, "c": "<a&b>\n"}, nil, `{"a":"x\",\"b\":\"y","c":"<a&b>\n"}`},
+		{"a first claim that is not bound", map[string]any{"a": "x"}, []string{"repository_id"}, `{"a":"x"}`},
+		{"no claims", nil, nil, `{}`},
+		{"cut at a rune boundary", map[string]any{"ab": strings.Repeat("€", 1000)}, nil, long[:2047]},
+		{"a long claim after the first claim", map[string]any{"a": strings.Repeat("x", 3000), "repository_id": "1"}, []string{"repository_id"}, (`{"repository_id":"1","a":"` + strings.Repeat("x", 3000))[:maxInfoAttribute]},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := claimsAttribute(tt.claims, tt.first)
+			if got != tt.want {
+				t.Errorf("claimsAttribute = %q (%d bytes), want %q (%d bytes)", got, len(got), tt.want, len(tt.want))
+			}
+			if len(got) > maxInfoAttribute || !utf8.ValidString(got) {
+				t.Errorf("claimsAttribute has %d bytes, valid UTF-8 = %v; want at most %d bytes of valid UTF-8", len(got), utf8.ValidString(got), maxInfoAttribute)
+			}
+		})
 	}
 }
 

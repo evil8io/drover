@@ -3,8 +3,10 @@ package projectsync
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +38,11 @@ const (
 	// kindNamespace and kindProject name the objects of a watch.
 	kindNamespace = "namespace"
 	kindProject   = "project"
+
+	// maxInfoAttribute is the byte limit of the attributes claims and arn. A
+	// metrics backend rejects a data point with an attribute value above its
+	// limit. 2048 is the default of max_label_value_length in Grafana Mimir.
+	maxInfoAttribute = 2048
 )
 
 // metrics has the instruments that record the outcome of a reconcile run.
@@ -51,20 +58,31 @@ type metrics struct {
 	openbao    metric.Int64Counter
 	openbaoSet metric.Int64Counter
 
-	// trustMu guards trust, the data points of the trust gauge by project.
-	trustMu sync.Mutex
-	trust   map[projectRef][]trustPoint
+	// trustMu guards trust, the data points of the trust gauges by project.
+	// trustInfo turns on the info gauge.
+	trustMu   sync.Mutex
+	trust     map[projectRef]trustGauges
+	trustInfo bool
 }
 
-// trustPoint is one data point of the trust gauge.
+// trustGauges are the data points of one project: ready for the gauge
+// drover.sync.trust.statements.ready, and info for the gauge
+// drover.sync.trust.statements.info.
+type trustGauges struct {
+	ready []trustPoint
+	info  []trustPoint
+}
+
+// trustPoint is one data point of a trust gauge.
 type trustPoint struct {
 	value int64
 	attrs attribute.Set
 }
 
 // newMetrics creates the instruments of the syncer, on the meter that
-// provider gives for meterName.
-func newMetrics(provider metric.MeterProvider) (*metrics, error) {
+// provider gives for meterName. trustInfo adds the info gauge of the trust
+// statements.
+func newMetrics(provider metric.MeterProvider, trustInfo bool) (*metrics, error) {
 	meter := provider.Meter(meterName)
 
 	reconciles, err := meter.Int64Counter("drover.sync.reconciles",
@@ -140,12 +158,30 @@ func newMetrics(provider metric.MeterProvider) (*metrics, error) {
 		accounts:   accounts,
 		openbao:    openbao,
 		openbaoSet: openbaoSet,
-		trust:      make(map[projectRef][]trustPoint),
+		trust:      make(map[projectRef]trustGauges),
+		trustInfo:  trustInfo,
 	}
-	if _, err := meter.Int64ObservableGauge("drover.sync.trust.statements.ready",
+	ready, err := meter.Int64ObservableGauge("drover.sync.trust.statements.ready",
 		metric.WithDescription("The readiness of each trust statement of a project. The value is 1 for a ready statement and 0 for a statement that is not ready."),
-		metric.WithUnit("1"),
-		metric.WithInt64Callback(m.observeTrust)); err != nil {
+		metric.WithUnit("1"))
+	if err != nil {
+		return nil, err
+	}
+	gauges := []metric.Observable{ready}
+	var info metric.Int64ObservableGauge
+	if trustInfo {
+		info, err = meter.Int64ObservableGauge("drover.sync.trust.statements.info",
+			metric.WithDescription("The source identity and the project role of each valid trust statement of a project. The value is always 1."),
+			metric.WithUnit("1"))
+		if err != nil {
+			return nil, err
+		}
+		gauges = append(gauges, info)
+	}
+	if _, err := meter.RegisterCallback(func(_ context.Context, observer metric.Observer) error {
+		m.observeTrust(observer, ready, info)
+		return nil
+	}, gauges...); err != nil {
 		return nil, err
 	}
 	return m, nil
@@ -222,35 +258,46 @@ func (m *metrics) openbaoChanged(ctx context.Context, kind, action string) {
 		attribute.String("action", action)))
 }
 
-// observeTrust reports the data points of every project to the trust gauge,
-// sorted by cluster and project. Past its cardinality limit, the SDK puts each
-// new attribute set into one overflow data point. So observeTrust reports the same
-// projects below that limit at each collection.
-func (m *metrics) observeTrust(_ context.Context, observer metric.Int64Observer) error {
+// observeTrust reports the data points of every project to the ready gauge,
+// and to the info gauge when info is not nil, sorted by cluster and project.
+// Past its cardinality limit, the SDK puts each new attribute set into one
+// overflow data point. So observeTrust reports the same projects below that
+// limit at each collection.
+func (m *metrics) observeTrust(observer metric.Observer, ready, info metric.Int64ObservableGauge) {
 	m.trustMu.Lock()
 	defer m.trustMu.Unlock()
 	refs := slices.SortedFunc(maps.Keys(m.trust), func(a, b projectRef) int {
 		return cmp.Or(cmp.Compare(a.cluster, b.cluster), cmp.Compare(a.name, b.name))
 	})
 	for _, ref := range refs {
-		for _, point := range m.trust[ref] {
+		for _, point := range m.trust[ref].ready {
 			// The data points of two statements with an invalid name and the
 			// same reason have the same attributes, so the SDK keeps the last
 			// value.
-			observer.Observe(point.value, metric.WithAttributeSet(point.attrs))
+			observer.ObserveInt64(ready, point.value, metric.WithAttributeSet(point.attrs))
+		}
+		if info == nil {
+			continue
+		}
+		for _, point := range m.trust[ref].info {
+			observer.ObserveInt64(info, point.value, metric.WithAttributeSet(point.attrs))
 		}
 	}
-	return nil
 }
 
 // setTrust stores the data points of the trust status of the project name of
-// cluster. For a nil status, it removes the data points. It does nothing when
-// current returns false. It holds the lock of the data points from the call of
-// current to the store. So the check is still true at the store.
-func (m *metrics) setTrust(cluster, name string, status *trustStatus, current func() bool) {
-	var points []trustPoint
+// cluster. statements are the parsed statements of that status, and rules are
+// the rules of the parse. For a nil status, it removes the data points. It
+// does nothing when current returns false. It holds the lock of the data
+// points from the call of current to the store. So the check is still true at
+// the store.
+func (m *metrics) setTrust(cluster, name string, status *trustStatus, statements []trustStatement, rules *trustRules, current func() bool) {
+	var points trustGauges
 	if status != nil {
-		points = trustPoints(cluster, name, status)
+		points.ready = trustPoints(cluster, name, status)
+		if m.trustInfo {
+			points.info = infoPoints(cluster, name, statements, rules)
+		}
 	}
 	ref := projectRef{cluster: cluster, name: name}
 	m.trustMu.Lock()
@@ -308,4 +355,74 @@ func trustPoints(cluster, name string, status *trustStatus) []trustPoint {
 		out = append(out, point(item.Ready, item.Name, item.Reason))
 	}
 	return out
+}
+
+// infoPoints returns one data point of the info gauge per valid statement of
+// statements. The parser gives a reason to each statement past maxStatements,
+// so a project has at most maxStatements info points.
+func infoPoints(cluster, name string, statements []trustStatement, rules *trustRules) []trustPoint {
+	var out []trustPoint
+	for _, item := range statements {
+		if item.reason != "" {
+			continue
+		}
+		attrs := []attribute.KeyValue{
+			attribute.String("drover.cluster", cluster),
+			attribute.String("project", name),
+			attribute.String("statement", item.name),
+			attribute.String("role", item.role),
+		}
+		if item.aws != nil {
+			attrs = append(attrs, attribute.String("method", "aws"), attribute.String("arn", cutAtRune(withoutPath(item.aws.arn), maxInfoAttribute)))
+		} else {
+			issuer := rules.issuers[item.jwt.issuer]
+			attrs = append(attrs,
+				attribute.String("method", "jwt"),
+				attribute.String("issuer", item.jwt.issuer),
+				attribute.String("claims", claimsAttribute(item.jwt.boundClaims(issuer), issuer.required)))
+		}
+		out = append(out, trustPoint{value: 1, attrs: attribute.NewSet(attrs...)})
+	}
+	return out
+}
+
+// claimsAttribute returns claims as a JSON object, cut to maxInfoAttribute
+// bytes. The claims of first are at the start, and the other claims follow,
+// sorted by key. A tenant writes the other claims, so with them at the start,
+// a long claim of the tenant removes a required claim from the result. The
+// form is JSON, because a claim key or value can contain every separator of a
+// plain list.
+func claimsAttribute(claims map[string]any, first []string) string {
+	keys := slices.Clone(first)
+	for _, key := range slices.Sorted(maps.Keys(claims)) {
+		if !slices.Contains(first, key) {
+			keys = append(keys, key)
+		}
+	}
+	var out strings.Builder
+	encoder := json.NewEncoder(&out)
+	encoder.SetEscapeHTML(false)
+	write := func(value any) {
+		// The encoder cannot fail on a string or a string list.
+		_ = encoder.Encode(value)
+	}
+	separator := "{"
+	for _, key := range keys {
+		value, ok := claims[key]
+		if !ok {
+			continue
+		}
+		out.WriteString(separator)
+		write(key)
+		out.WriteString(":")
+		write(value)
+		separator = ","
+	}
+	if separator == "{" {
+		return "{}"
+	}
+	out.WriteString("}")
+	// The encoder adds a line break after each value. It escapes a line break
+	// inside a string.
+	return cutAtRune(strings.ReplaceAll(out.String(), "\n", ""), maxInfoAttribute)
 }
