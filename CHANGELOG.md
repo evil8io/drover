@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.31.1](https://github.com/evil8io/drover/compare/v0.31.0...v0.31.1) (2026-11-25)
+
+
+### Miscellaneous Chores
+
+* **deps:** update actions/setup-go digest to d8cbb80 ([#178](https://github.com/evil8io/drover/issues/178)) ([b5622cc](https://github.com/evil8io/drover/commit/b5622cca93f55d7f800bb8992f25375980ce1d80))
+* **deps:** update amannn/action-semantic-pull-request digest to 66e7292 ([#179](https://github.com/evil8io/drover/issues/179)) ([82358a1](https://github.com/evil8io/drover/commit/82358a18a38c41cece226c763ada1cc875ffb671))
+* **deps:** update dataaxiom/ghcr-cleanup-action digest to ac45a8c ([#180](https://github.com/evil8io/drover/issues/180)) ([4d7fdc1](https://github.com/evil8io/drover/commit/4d7fdc1e3c93bd5b845e99436939fefbe08aa231))
+
 ## [0.31.0](https://github.com/evil8io/drover/compare/v0.30.1...v0.31.0) (2026-11-12)
 
 
